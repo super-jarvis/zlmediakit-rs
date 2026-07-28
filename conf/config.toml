@@ -1,0 +1,33 @@
+# ZLMediaKit-RS Configuration File
+
+# General settings
+[general]
+flow_threshold = 1024
+stream_none_reader_delay = 10
+
+# RTMP server
+[rtmp]
+enabled = true
+port = 1935
+ssl = false
+
+# RTSP server
+[rtsp]
+enabled = true
+port = 554
+ssl = false
+tcp_mode = true
+
+# HTTP server
+[http]
+enabled = true
+port = 80
+ssl = false
+dir_root = true
+
+# Record settings
+[record]
+app = "record"
+hls = false
+mp4 = false
+flv = false

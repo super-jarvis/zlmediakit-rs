@@ -1,0 +1,10 @@
+[package]
+name = "zlmediakit-codec"
+description = "Codec parsers for H264/H265/AAC/G711/OPUS"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

@@ -1,0 +1,64 @@
+use bytes::{BufMut, BytesMut};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::debug;
+
+const C0C1_SIZE: usize = 1536;
+const C2_SIZE: usize = 1536;
+
+pub struct RtmpHandshake;
+
+impl RtmpHandshake {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub async fn server_handshake<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+        stream: &mut S,
+    ) -> anyhow::Result<()> {
+        let mut c0c1 = vec![0u8; 1 + C0C1_SIZE];
+        stream.read_exact(&mut c0c1).await?;
+
+        if c0c1[0] != 0x03 {
+            anyhow::bail!("Invalid RTMP version: {}", c0c1[0]);
+        }
+
+        let c1_time = u32::from_be_bytes([c0c1[1], c0c1[2], c0c1[3], c0c1[4]]);
+        let c1_version = u32::from_be_bytes([c0c1[5], c0c1[6], c0c1[7], c0c1[8]]);
+
+        debug!("C1 time={}, version={}", c1_time, c1_version);
+
+        let mut s0s1 = BytesMut::with_capacity(1 + C0C1_SIZE);
+        s0s1.put_u8(0x03);
+
+        let s1_time = 0u32;
+        let s1_version = 0x00090000; // version 9.0.0
+        s0s1.put_u32(s1_time);
+        s0s1.put_u32(s1_version);
+        let mut random = vec![0u8; 1528];
+        {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            for b in &mut random {
+                *b = rng.gen();
+            }
+        }
+        s0s1.extend_from_slice(&random);
+        stream.write_all(&s0s1).await?;
+
+        let mut s2 = BytesMut::with_capacity(C2_SIZE);
+        s2.extend_from_slice(&c0c1[1..]);
+        stream.write_all(&s2).await?;
+
+        let mut c2 = vec![0u8; C2_SIZE];
+        stream.read_exact(&mut c2).await?;
+
+        debug!("RTMP handshake completed");
+        Ok(())
+    }
+}
+
+impl Default for RtmpHandshake {
+    fn default() -> Self {
+        Self::new()
+    }
+}

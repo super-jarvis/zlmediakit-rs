@@ -1,0 +1,23 @@
+[package]
+name = "zlmediakit-core"
+description = "Core media framework for zlmediakit-rs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+dashmap.workspace = true
+arc-swap.workspace = true
+parking_lot.workspace = true
+futures.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+rand.workspace = true
+toml.workspace = true

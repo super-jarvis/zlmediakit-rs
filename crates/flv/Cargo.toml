@@ -1,0 +1,12 @@
+[package]
+name = "zlmediakit-flv"
+description = "FLV muxer/demuxer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zlmediakit-core = { path = "../core" }
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
