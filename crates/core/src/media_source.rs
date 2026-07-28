@@ -1,4 +1,4 @@
-use crate::media_frame::{MediaFrame, MediaInfo};
+use crate::media_frame::{FrameType, MediaFrame, MediaInfo};
 use crate::gop_cache::GopCache;
 use crate::session::SessionId;
 use crate::Result;
@@ -7,6 +7,66 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::info;
+use bytes::Bytes;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_broadcast_delivery() {
+        let source = Arc::new(MediaSource::new("test".into(), "vhost".into(), "app".into(), "stream".into()));
+        let source_clone = source.clone();
+
+        // Publisher sends frames
+        tokio::spawn(async move {
+            for i in 0..100 {
+                let is_key = i == 0 || i % 10 == 0;
+                let frame = MediaFrame::new_video(0, crate::media_frame::CodecId::H264,
+                    i as u32, i as u64, i as u64,
+                    Bytes::from(vec![0x17, if is_key { 1 } else { 1 }, 0x00, 0x00, 0x00]),
+                    is_key);
+                source_clone.publish_and_cache(frame).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        // Late subscriber (after 200ms = ~20 frames)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut rx = source.subscribe();
+        let timeout = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(timeout);
+
+        let mut received = 0u32;
+        loop {
+            tokio::select! {
+                result = rx.recv() => {
+                    match result {
+                        Ok(frame) => {
+                            received += 1;
+                            eprintln!("RECV: frame {} key={}", received, frame.key_frame);
+                            if received >= 5 {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            eprintln!("Lagged by {}", n);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                _ = &mut timeout => {
+                    eprintln!("TIMEOUT: only received {} frames", received);
+                    panic!("Timeout waiting for frames, got only {}", received);
+                }
+            }
+        }
+
+        assert!(received >= 5, "Should have received at least 5 frames, got {}", received);
+    }
+}
 
 pub type SourceId = String;
 
@@ -82,7 +142,10 @@ impl MediaSource {
             let mut cache = self.gop_cache.write().await;
             cache.cache_frame(&frame);
         }
-        let _ = self.frame_tx.send(frame);
+        let receivers = self.frame_tx.receiver_count();
+        let result = self.frame_tx.send(frame.clone());
+        info!("publish_and_cache: type={:?} key={} receivers={} send_result={:?}",
+            frame.frame_type, frame.key_frame, receivers, result.is_ok());
     }
 
     pub async fn get_cached_config_frames(&self) -> Vec<MediaFrame> {

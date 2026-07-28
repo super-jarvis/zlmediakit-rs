@@ -604,12 +604,14 @@ pub fn start_hls_task(source: Arc<MediaSource>, segments: Arc<RwLock<VecDeque<Hl
 
         let mut rx = source.subscribe();
 
-        info!("HLS task started for {}", source.url());
+        info!("HLS task started for {}, entering recv loop", source.url());
 
+        let mut recv_count: u64 = 0;
         loop {
             match rx.recv().await {
                 Ok(frame) => {
-                    debug!("HLS frame: type={:?} key={} ts={}", frame.frame_type, frame.key_frame, frame.timestamp);
+                    info!("HLS recv frame: type={:?} key={} config={} ts={}",
+                        frame.frame_type, frame.key_frame, frame.config_frame, frame.timestamp);
                     if let Some((idx, data)) = muxer.push_frame(frame) {
                         let seg = HlsSegment {
                             index: idx,
@@ -621,11 +623,11 @@ pub fn start_hls_task(source: Arc<MediaSource>, segments: Arc<RwLock<VecDeque<Hl
                         if segs.len() > 6 {
                             segs.pop_front();
                         }
-                        debug!("HLS segment {} generated ({} total)", idx, segs.len());
+                        info!("HLS segment {} generated ({} total)", idx, segs.len());
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    debug!("HLS task lagged by {} frames, continuing", n);
+                    warn!("HLS task lagged by {} frames, continuing", n);
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     warn!("HLS task broadcast channel closed for {}", source.url());

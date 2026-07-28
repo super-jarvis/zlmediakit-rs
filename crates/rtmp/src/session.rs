@@ -50,6 +50,7 @@ impl RtmpSession {
         info!("RTMP handshake completed from {}", self.peer_addr);
 
         let mut buf = [0u8; 65536];
+        let mut total_bytes = 0u64;
         loop {
             let stream = match self.stream.as_mut() {
                 Some(s) => s,
@@ -61,7 +62,9 @@ impl RtmpSession {
                     break;
                 }
                 Ok(n) => {
+                    total_bytes += n as u64;
                     let messages = self.msg_parser.feed(&buf[..n]);
+                    info!("RTMP read: {} bytes (total={}), {} messages", n, total_bytes, messages.len());
                     for msg in messages {
                         if let Err(e) = self.handle_message(msg).await {
                             warn!("RTMP message error: {}", e);
