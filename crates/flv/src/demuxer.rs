@@ -83,7 +83,15 @@ impl FlvDemuxer {
                     Bytes::new()
                 };
 
-                MediaFrame::new_video(0, codec, timestamp, timestamp as u64, timestamp as u64, data, is_key)
+                MediaFrame::new_video(
+                    0,
+                    codec,
+                    timestamp,
+                    timestamp as u64,
+                    timestamp as u64,
+                    data,
+                    is_key,
+                )
             }
             0x08 => {
                 if payload.is_empty() {
@@ -105,7 +113,14 @@ impl FlvDemuxer {
                     Bytes::new()
                 };
 
-                MediaFrame::new_audio(1, codec, timestamp, timestamp as u64, timestamp as u64, data)
+                MediaFrame::new_audio(
+                    1,
+                    codec,
+                    timestamp,
+                    timestamp as u64,
+                    timestamp as u64,
+                    data,
+                )
             }
             _ => {
                 return self.parse_tag();

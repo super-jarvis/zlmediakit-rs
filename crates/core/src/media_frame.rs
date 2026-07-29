@@ -146,11 +146,7 @@ impl MediaFrame {
         }
     }
 
-    pub fn new_metadata(
-        track_id: u32,
-        timestamp: u32,
-        data: Bytes,
-    ) -> Self {
+    pub fn new_metadata(track_id: u32, timestamp: u32, data: Bytes) -> Self {
         Self {
             track_id,
             frame_type: FrameType::Metadata,

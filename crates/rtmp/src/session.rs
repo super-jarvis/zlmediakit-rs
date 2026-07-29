@@ -6,6 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
+use zlmediakit_core::auth::StreamAuth;
+use zlmediakit_core::event_bus::{Event, EventBus};
 use zlmediakit_core::media_frame::{CodecId, FrameType, MediaFrame};
 use zlmediakit_core::media_source::{MediaSource, MediaSourceManager};
 
@@ -15,6 +17,8 @@ pub struct RtmpSession {
     msg_parser: RtmpMessageParser,
     msg_encoder: RtmpMessageEncoder,
     source_manager: Arc<MediaSourceManager>,
+    event_bus: Arc<EventBus>,
+    auth: Arc<StreamAuth>,
     source: Option<Arc<MediaSource>>,
     app: String,
     stream_name: String,
@@ -27,6 +31,8 @@ impl RtmpSession {
         stream: TcpStream,
         peer_addr: String,
         source_manager: Arc<MediaSourceManager>,
+        event_bus: Arc<EventBus>,
+        auth: Arc<StreamAuth>,
     ) -> Self {
         Self {
             stream: Some(stream),
@@ -34,6 +40,8 @@ impl RtmpSession {
             msg_parser: RtmpMessageParser::new(),
             msg_encoder: RtmpMessageEncoder::new(),
             source_manager,
+            event_bus,
+            auth,
             source: None,
             app: String::new(),
             stream_name: String::new(),
@@ -64,7 +72,12 @@ impl RtmpSession {
                 Ok(n) => {
                     total_bytes += n as u64;
                     let messages = self.msg_parser.feed(&buf[..n]);
-                    info!("RTMP read: {} bytes (total={}), {} messages", n, total_bytes, messages.len());
+                    info!(
+                        "RTMP read: {} bytes (total={}), {} messages",
+                        n,
+                        total_bytes,
+                        messages.len()
+                    );
                     for msg in messages {
                         if let Err(e) = self.handle_message(msg).await {
                             warn!("RTMP message error: {}", e);
@@ -98,12 +111,14 @@ impl RtmpSession {
                 debug!("Set chunk size: {}", size);
             }
             RtmpMessage::WindowAckSize(size) => {
-                self.send_msg(&RtmpMessage::WindowAckSize(size)).await?;
+                // Client acknowledged its receive window. We do NOT re-negotiate
+                // the chunk size here: chunk size is negotiated once in
+                // handle_connect (SetChunkSize) and applied to the encoder. The
+                // server's *parser* reads the client's 128-byte send chunks and
+                // must keep using that size; changing it here would desync
+                // server-side parsing of client messages.
                 self.send_msg(&RtmpMessage::SetPeerBandwidth(size, 2))
                     .await?;
-                self.send_msg(&RtmpMessage::SetChunkSize(4096))
-                    .await?;
-                self.msg_parser.set_chunk_size(4096);
             }
             RtmpMessage::Amf0Command { data, .. } => {
                 let values = AmfDecoder::decode(&data)?;
@@ -114,7 +129,10 @@ impl RtmpSession {
                             if let Some(AmfValue::String(key)) = values.get(1) {
                                 info!("releaseStream key: {}", key);
                                 self.parse_stream_key(key);
-                                info!("After parse_stream_key: app={}, stream={}", self.app, self.stream_name);
+                                info!(
+                                    "After parse_stream_key: app={}, stream={}",
+                                    self.app, self.stream_name
+                                );
                             }
                         }
                         "FCPublish" => debug!("RTMP FCPublish"),
@@ -167,8 +185,7 @@ impl RtmpSession {
                 debug!("UserControl event: {}", event_type);
                 if event_type == 6 {
                     if data.len() >= 4 {
-                        let seq =
-                            u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                        let seq = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
                         self.send_msg(&RtmpMessage::Ack(seq)).await?;
                     }
                 }
@@ -181,10 +198,9 @@ impl RtmpSession {
                 data,
             } => {
                 if self.is_publisher {
-                    if let Some(ref source) = self.source {
-                        if data.len() >= 2 {
-                            debug!("RTMP video first 4 bytes: {:02x?}, is_config={}", &data[..std::cmp::min(4, data.len())], (data[0] & 0x0F) == 7 && (data[1] & 0x0F) == 0);
-                        }
+                    if let (Some(ref source), Some(data)) =
+                        (&self.source, normalize_enhanced_video(&data))
+                    {
                         let (codec, key_frame, is_config) = parse_video_rtmp_packet(&data);
                         if is_config && source.info.read().await.tracks.is_empty() {
                             source.info.write().await.tracks.push(
@@ -195,8 +211,8 @@ impl RtmpSession {
                                         height: 480,
                                         fps: 25.0,
                                         key_frame: false,
-                                    }
-                                )
+                                    },
+                                ),
                             );
                         }
                         let mut frame = MediaFrame::new_video(
@@ -260,32 +276,51 @@ impl RtmpSession {
                 }
             }
         } else {
-            info!("connect: no object found at index 2 or 1, values[1]={:?}", values.get(1));
+            info!(
+                "connect: no object found at index 2 or 1, values[1]={:?}",
+                values.get(1)
+            );
         }
 
-        self.send_msg(&RtmpMessage::WindowAckSize(2500000))
-            .await?;
+        self.send_msg(&RtmpMessage::WindowAckSize(2500000)).await?;
         self.send_msg(&RtmpMessage::SetPeerBandwidth(2500000, 2))
             .await?;
-        self.send_msg(&RtmpMessage::SetChunkSize(4096))
-            .await?;
-        self.msg_parser.set_chunk_size(4096);
+        // Negotiate a larger chunk size with the client. This tells the client
+        // to *read* our messages at 4096-byte chunks, so the encoder must emit
+        // at the same size. The server's own *parser* stays at the client's
+        // send chunk size (128) — never change it here.
+        self.send_msg(&RtmpMessage::SetChunkSize(4096)).await?;
         self.msg_encoder.set_chunk_size(4096);
 
         let server_props = vec![
-            ("fmsVer".to_string(), AmfValue::String("FMS/3,0,1,123".to_string())),
+            (
+                "fmsVer".to_string(),
+                AmfValue::String("FMS/3,0,1,123".to_string()),
+            ),
             ("capabilities".to_string(), AmfValue::Number(31.0)),
         ];
 
         let info_props = vec![
             ("level".to_string(), AmfValue::String("status".to_string())),
-            ("code".to_string(), AmfValue::String("NetConnection.Connect.Success".to_string())),
-            ("description".to_string(), AmfValue::String("Connection succeeded.".to_string())),
+            (
+                "code".to_string(),
+                AmfValue::String("NetConnection.Connect.Success".to_string()),
+            ),
+            (
+                "description".to_string(),
+                AmfValue::String("Connection succeeded.".to_string()),
+            ),
             ("objectEncoding".to_string(), AmfValue::Number(0.0)),
-            ("data".to_string(), AmfValue::Object(vec![
-                ("version".to_string(), AmfValue::String("FMS/3,0,1,123".to_string())),
-                ("capabilities".to_string(), AmfValue::Number(31.0)),
-            ])),
+            (
+                "data".to_string(),
+                AmfValue::Object(vec![
+                    (
+                        "version".to_string(),
+                        AmfValue::String("FMS/3,0,1,123".to_string()),
+                    ),
+                    ("capabilities".to_string(), AmfValue::Number(31.0)),
+                ]),
+            ),
         ];
 
         self.send_msg(&RtmpMessage::Amf0Command {
@@ -296,15 +331,13 @@ impl RtmpSession {
                 AmfValue::Number(1.0),
                 AmfValue::Object(server_props),
                 AmfValue::Object(info_props),
-            ]).freeze(),
+            ])
+            .freeze(),
         })
         .await?;
 
         let info_props = vec![
-            (
-                "level".to_string(),
-                AmfValue::String("status".to_string()),
-            ),
+            ("level".to_string(), AmfValue::String("status".to_string())),
             (
                 "code".to_string(),
                 AmfValue::String("NetConnection.Connect.Success".to_string()),
@@ -313,10 +346,7 @@ impl RtmpSession {
                 "description".to_string(),
                 AmfValue::String("Connection succeeded.".to_string()),
             ),
-            (
-                "objectEncoding".to_string(),
-                AmfValue::Number(0.0),
-            ),
+            ("objectEncoding".to_string(), AmfValue::Number(0.0)),
         ];
 
         self.send_msg(&RtmpMessage::Amf0Command {
@@ -392,22 +422,73 @@ impl RtmpSession {
             warn!("No stream name provided for publish");
         }
 
-        let source = self.source_manager.get_or_create(
+        let (stream_base, sign) = Self::split_stream_sign(&self.stream_name);
+        self.stream_name = stream_base;
+
+        if !self.auth.check(
             "__defaultVhost__",
             &self.app,
             &self.stream_name,
-        );
+            "pub",
+            &sign,
+        ) {
+            warn!(
+                "RTMP publish rejected (auth): {}/{}",
+                self.app, self.stream_name
+            );
+            let status_obj = AmfValue::Object(vec![
+                ("level".to_string(), AmfValue::String("error".to_string())),
+                (
+                    "code".to_string(),
+                    AmfValue::String("NetStream.Publish.NotAllowed".to_string()),
+                ),
+                (
+                    "description".to_string(),
+                    AmfValue::String("auth failed".to_string()),
+                ),
+            ]);
+            self.send_msg(&RtmpMessage::Amf0Command {
+                stream_id: self.stream_id,
+                timestamp: 0,
+                data: AmfEncoder::encode(&[
+                    AmfValue::String("onStatus".to_string()),
+                    AmfValue::Number(0.0),
+                    AmfValue::Null,
+                    status_obj,
+                ])
+                .freeze(),
+            })
+            .await?;
+            return Ok(());
+        }
+
+        let source =
+            self.source_manager
+                .get_or_create("__defaultVhost__", &self.app, &self.stream_name);
 
         source.info.write().await.tracks.clear();
 
         self.source = Some(source.clone());
 
+        // Notify the recorder supervisor (and any future hooks) that a stream
+        // has started publishing.
+        self.event_bus.publish(Event::StreamPublish {
+            source_id: source.id.clone(),
+            vhost: "__defaultVhost__".to_string(),
+            app: self.app.clone(),
+            stream: self.stream_name.clone(),
+        });
+
         let status_obj = AmfValue::Object(vec![
             ("level".to_string(), AmfValue::String("status".to_string())),
-            ("code".to_string(), AmfValue::String("NetStream.Publish.Start".to_string())),
-            ("description".to_string(), AmfValue::String(format!(
-                "Publishing on {}/{}", self.app, self.stream_name
-            ))),
+            (
+                "code".to_string(),
+                AmfValue::String("NetStream.Publish.Start".to_string()),
+            ),
+            (
+                "description".to_string(),
+                AmfValue::String(format!("Publishing on {}/{}", self.app, self.stream_name)),
+            ),
         ]);
 
         self.send_msg(&RtmpMessage::Amf0Command {
@@ -418,8 +499,10 @@ impl RtmpSession {
                 AmfValue::Number(0.0),
                 AmfValue::Null,
                 status_obj,
-            ]).freeze(),
-        }).await?;
+            ])
+            .freeze(),
+        })
+        .await?;
 
         info!("RTMP publish started: {}/{}", self.app, self.stream_name);
         Ok(())
@@ -443,8 +526,51 @@ impl RtmpSession {
 
         // Keep self.stream_id from createStream (already set)
 
-        self.send_msg(&RtmpMessage::UserControl(0, self.stream_id.to_be_bytes().to_vec()))
+        let (stream_base, sign) = Self::split_stream_sign(&self.stream_name);
+        self.stream_name = stream_base;
+
+        if !self.auth.check(
+            "__defaultVhost__",
+            &self.app,
+            &self.stream_name,
+            "play",
+            &sign,
+        ) {
+            warn!(
+                "RTMP play rejected (auth): {}/{}",
+                self.app, self.stream_name
+            );
+            let status_obj = AmfValue::Object(vec![
+                ("level".to_string(), AmfValue::String("error".to_string())),
+                (
+                    "code".to_string(),
+                    AmfValue::String("NetStream.Play.NotAllowed".to_string()),
+                ),
+                (
+                    "description".to_string(),
+                    AmfValue::String("auth failed".to_string()),
+                ),
+            ]);
+            self.send_msg(&RtmpMessage::Amf0Command {
+                stream_id: self.stream_id,
+                timestamp: 0,
+                data: AmfEncoder::encode(&[
+                    AmfValue::String("onStatus".to_string()),
+                    AmfValue::Number(0.0),
+                    AmfValue::Null,
+                    status_obj,
+                ])
+                .freeze(),
+            })
             .await?;
+            return Ok(());
+        }
+
+        self.send_msg(&RtmpMessage::UserControl(
+            0,
+            self.stream_id.to_be_bytes().to_vec(),
+        ))
+        .await?;
 
         let source = self
             .source_manager
@@ -455,10 +581,7 @@ impl RtmpSession {
                 self.source = Some(source.clone());
 
                 let reset_status = AmfValue::Object(vec![
-                    (
-                        "level".to_string(),
-                        AmfValue::String("status".to_string()),
-                    ),
+                    ("level".to_string(), AmfValue::String("status".to_string())),
                     (
                         "code".to_string(),
                         AmfValue::String("NetStream.Play.Reset".to_string()),
@@ -485,20 +608,14 @@ impl RtmpSession {
                 .await?;
 
                 let start_status = AmfValue::Object(vec![
-                    (
-                        "level".to_string(),
-                        AmfValue::String("status".to_string()),
-                    ),
+                    ("level".to_string(), AmfValue::String("status".to_string())),
                     (
                         "code".to_string(),
                         AmfValue::String("NetStream.Play.Start".to_string()),
                     ),
                     (
                         "description".to_string(),
-                        AmfValue::String(format!(
-                            "Playing {}/{}",
-                            self.app, self.stream_name
-                        )),
+                        AmfValue::String(format!("Playing {}/{}", self.app, self.stream_name)),
                     ),
                 ]);
                 self.send_msg(&RtmpMessage::Amf0Command {
@@ -590,10 +707,7 @@ impl RtmpSession {
             None => {
                 warn!("Stream not found: {}/{}", self.app, self.stream_name);
                 let on_status = AmfValue::Object(vec![
-                    (
-                        "level".to_string(),
-                        AmfValue::String("error".to_string()),
-                    ),
+                    ("level".to_string(), AmfValue::String("error".to_string())),
                     (
                         "code".to_string(),
                         AmfValue::String("NetStream.Play.StreamNotFound".to_string()),
@@ -635,8 +749,89 @@ impl RtmpSession {
 
     async fn cleanup(&mut self) {
         info!("RTMP session closing: {}/{}", self.app, self.stream_name);
+        if self.is_publisher {
+            self.event_bus.publish(Event::StreamUnPublish {
+                source_id: format!("__defaultVhost__/{}/{}", self.app, self.stream_name),
+                vhost: "__defaultVhost__".to_string(),
+                app: self.app.clone(),
+                stream: self.stream_name.clone(),
+            });
+        }
         self.source = None;
     }
+
+    /// Splits a stream name that may carry a `?sign=...` query into the bare
+    /// stream name and the extracted signature. Used for token-based auth.
+    fn split_stream_sign(name: &str) -> (String, String) {
+        match name.split_once('?') {
+            Some((base, query)) => {
+                let sign = query
+                    .split('&')
+                    .filter_map(|pair| pair.split_once('='))
+                    .find(|(k, _)| *k == "sign")
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_default();
+                (base.to_string(), sign)
+            }
+            None => (name.to_string(), String::new()),
+        }
+    }
+}
+
+/// Normalizes an enhanced-RTMP (E-RTMP, `IsExHeader` bit set) HEVC video
+/// packet into the legacy `codecid=12` FLV layout used by the rest of the
+/// pipeline: `[frame|12, packet_type, ct0, ct1, ct2, payload...]`.
+///
+/// - Non-enhanced packets are passed through unchanged.
+/// - `SequenceStart` (0) maps to packet_type 0 (HEVCDecoderConfigurationRecord).
+/// - `CodedFrames` (1) keeps its 3-byte composition time; `CodedFramesX` (3)
+///   uses a zero composition time.
+/// - Packets with no media payload (SequenceEnd, Metadata, ...) or with an
+///   unsupported FourCC return `None` and are dropped.
+fn normalize_enhanced_video(data: &bytes::Bytes) -> Option<bytes::Bytes> {
+    if data.len() < 5 || data[0] & 0x80 == 0 {
+        return Some(data.clone());
+    }
+    let frame_type = (data[0] >> 4) & 0x07;
+    let packet_type = data[0] & 0x0F;
+    let fourcc = &data[1..5];
+    if fourcc != b"hvc1" && fourcc != b"hev1" {
+        warn!(
+            "Unsupported enhanced-RTMP FourCC: {:?}",
+            String::from_utf8_lossy(fourcc)
+        );
+        return None;
+    }
+    let first = (frame_type << 4) | 12;
+    let mut out = Vec::with_capacity(data.len());
+    match packet_type {
+        0 => {
+            // SequenceStart: payload is the HEVCDecoderConfigurationRecord.
+            out.push(first);
+            out.push(0);
+            out.extend_from_slice(&[0, 0, 0]);
+            out.extend_from_slice(&data[5..]);
+        }
+        1 => {
+            // CodedFrames: 3-byte composition time precedes the NALUs.
+            if data.len() < 8 {
+                return None;
+            }
+            out.push(first);
+            out.push(1);
+            out.extend_from_slice(&data[5..8]);
+            out.extend_from_slice(&data[8..]);
+        }
+        3 => {
+            // CodedFramesX: no composition time (implicitly zero).
+            out.push(first);
+            out.push(1);
+            out.extend_from_slice(&[0, 0, 0]);
+            out.extend_from_slice(&data[5..]);
+        }
+        _ => return None,
+    }
+    Some(bytes::Bytes::from(out))
 }
 
 fn parse_video_rtmp_packet(data: &[u8]) -> (CodecId, bool, bool) {
@@ -674,5 +869,68 @@ fn parse_audio_rtmp_packet(data: &[u8]) -> CodecId {
         8 => CodecId::G711U,
         13 => CodecId::Opus,
         _ => CodecId::AAC,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[test]
+    fn enhanced_hevc_sequence_start_maps_to_legacy_config() {
+        // frame_type=1 (key), packet_type=0, FourCC hvc1, fake record bytes.
+        let mut d = vec![0x80 | (1 << 4)];
+        d.extend_from_slice(b"hvc1");
+        d.extend_from_slice(&[0x01, 0x02, 0x03]);
+        let out = normalize_enhanced_video(&Bytes::from(d)).unwrap();
+        assert_eq!(&out[..5], &[0x1C, 0x00, 0, 0, 0]);
+        assert_eq!(&out[5..], &[0x01, 0x02, 0x03]);
+        let (codec, key, config) = parse_video_rtmp_packet(&out);
+        assert_eq!(codec, CodecId::H265);
+        assert!(config);
+        assert!(!key);
+    }
+
+    #[test]
+    fn enhanced_hevc_coded_frames_keeps_composition_time() {
+        // frame_type=2 (inter), packet_type=1, ct=0x000102, one payload byte.
+        let mut d = vec![0x80 | (2 << 4) | 1];
+        d.extend_from_slice(b"hvc1");
+        d.extend_from_slice(&[0x00, 0x01, 0x02, 0xAA]);
+        let out = normalize_enhanced_video(&Bytes::from(d)).unwrap();
+        assert_eq!(&out[..5], &[0x2C, 0x01, 0x00, 0x01, 0x02]);
+        assert_eq!(&out[5..], &[0xAA]);
+        let (codec, key, config) = parse_video_rtmp_packet(&out);
+        assert_eq!(codec, CodecId::H265);
+        assert!(!config);
+        assert!(!key);
+    }
+
+    #[test]
+    fn enhanced_hevc_coded_frames_x_zero_ct() {
+        let mut d = vec![0x80 | (1 << 4) | 3];
+        d.extend_from_slice(b"hev1");
+        d.extend_from_slice(&[0xBB]);
+        let out = normalize_enhanced_video(&Bytes::from(d)).unwrap();
+        assert_eq!(&out[..5], &[0x1C, 0x01, 0, 0, 0]);
+        assert_eq!(&out[5..], &[0xBB]);
+    }
+
+    #[test]
+    fn legacy_packets_pass_through_and_metadata_dropped() {
+        let legacy = Bytes::from(vec![0x17, 0x00, 0, 0, 0, 0x01]);
+        assert_eq!(normalize_enhanced_video(&legacy).unwrap(), legacy);
+
+        // packet_type=4 (Metadata) carries no media and must be dropped.
+        let mut meta = vec![0x80 | (1 << 4) | 4];
+        meta.extend_from_slice(b"hvc1");
+        assert!(normalize_enhanced_video(&Bytes::from(meta)).is_none());
+
+        // Unsupported FourCC (av01) must be dropped.
+        let mut av1 = vec![0x80 | (1 << 4)];
+        av1.extend_from_slice(b"av01");
+        av1.push(0x00);
+        assert!(normalize_enhanced_video(&Bytes::from(av1)).is_none());
     }
 }

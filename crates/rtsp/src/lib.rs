@@ -1,5 +1,5 @@
 pub mod parser;
-pub mod session;
 pub mod server;
+pub mod session;
 
 pub use server::RtspServer;

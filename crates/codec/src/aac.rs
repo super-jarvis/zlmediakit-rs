@@ -15,8 +15,7 @@ impl AacParser {
     }
 
     pub const SAMPLE_RATES: [u32; 13] = [
-        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
-        16000, 12000, 11025, 8000, 7350,
+        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
     ];
 
     pub fn parse_audio_specific_config(data: &[u8]) -> Option<AacConfig> {
@@ -73,9 +72,8 @@ impl AacParser {
         header[1] = 0xF1;
         header[2] = ((config.object_type - 1) << 3) | (config.sample_rate_index << 1);
         header[2] |= (config.channel_config >> 2) & 0x01;
-        header[3] = ((config.channel_config & 0x03) << 6)
-            | (((frame_length >> 11) & 0x03) as u8)
-            | 0x01;
+        header[3] =
+            ((config.channel_config & 0x03) << 6) | (((frame_length >> 11) & 0x03) as u8) | 0x01;
         header[4] = ((frame_length >> 3) & 0xFF) as u8;
         header[5] = (((frame_length & 0x07) << 5) as u8) | 0x1F;
         header[6] = 0xFC;

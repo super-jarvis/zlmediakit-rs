@@ -1,5 +1,5 @@
 use bytes::{BufMut, BytesMut};
-use zlmediakit_core::media_frame::{FrameType, MediaFrame};
+use zlmediakit_core::media_frame::{CodecId, FrameType, MediaFrame};
 
 pub struct FlvMuxer {
     header_written: bool,
@@ -89,13 +89,18 @@ impl FlvMuxer {
         height: u32,
         fps: f64,
         sample_rate: u32,
+        video_codec: CodecId,
     ) -> BytesMut {
+        let videocodecid = match video_codec {
+            CodecId::H265 => "12",
+            _ => "7",
+        };
         let properties = vec![
             ("duration", "0".to_string()),
             ("width", width.to_string()),
             ("height", height.to_string()),
             ("framerate", fps.to_string()),
-            ("videocodecid", "7".to_string()),
+            ("videocodecid", videocodecid.to_string()),
             ("audiocodecid", "10".to_string()),
             ("audiosamplerate", sample_rate.to_string()),
             ("audiosamplesize", "16".to_string()),
@@ -154,5 +159,28 @@ impl FlvMuxer {
 impl Default for FlvMuxer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FlvMuxer;
+    use zlmediakit_core::media_frame::CodecId;
+
+    #[test]
+    fn metadata_videocodecid_reflects_codec() {
+        let muxer = FlvMuxer::new();
+        let h264 = muxer.write_metadata(1280, 720, 25.0, 44100, CodecId::H264);
+        let h265 = muxer.write_metadata(1280, 720, 25.0, 44100, CodecId::H265);
+
+        // videocodecid values "7"/"12" parse as AMF numbers (type 0x00) followed
+        // by the 8-byte big-endian f64 (bytes::put_f64 is BE):
+        // 7.0 -> 40 1C 00 00 00 00 00 00, 12.0 -> 40 28 00 00 00 00 00 00.
+        let seven = [0x40u8, 0x1C, 0, 0, 0, 0, 0, 0];
+        let twelve = [0x40u8, 0x28, 0, 0, 0, 0, 0, 0];
+        assert!(h264.as_ref().windows(8).any(|w| w == &seven));
+        assert!(h265.as_ref().windows(8).any(|w| w == &twelve));
+        // H264 and H265 metadata must differ (different videocodecid).
+        assert_ne!(h264.as_ref(), h265.as_ref());
     }
 }

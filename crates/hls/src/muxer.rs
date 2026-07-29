@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
-use zlmediakit_core::media_frame::{FrameType, MediaFrame};
+use zlmediakit_core::media_frame::{CodecId, FrameType, MediaFrame};
 use zlmediakit_core::media_source::MediaSource;
 
 const TS_PACKET_SIZE: usize = 188;
@@ -41,11 +41,11 @@ impl TsWriter {
         }
     }
 
-    fn write_pat_pmt(&mut self, out: &mut Vec<u8>) {
+    fn write_pat_pmt(&mut self, out: &mut Vec<u8>, video_stream_type: u8) {
         let mut pat = BytesMut::with_capacity(20);
-        pat.put_u8(0x00);                          // table_id
+        pat.put_u8(0x00); // table_id
         pat.put_u8(0xB0);
-        pat.put_u8(0x0D);                          // section_length: 9 data + 4 CRC32
+        pat.put_u8(0x0D); // section_length: 9 data + 4 CRC32
         pat.put_u16(0x0001);
         pat.put_u8(0xC1);
         pat.put_u8(0x00);
@@ -55,30 +55,30 @@ impl TsWriter {
         let crc = crc32(pat.as_ref());
         pat.put_u32(crc);
         let mut pat_payload = BytesMut::with_capacity(20);
-        pat_payload.put_u8(0x00);                  // pointer_field
+        pat_payload.put_u8(0x00); // pointer_field
         pat_payload.extend_from_slice(&pat);
         write_ts_packet(out, PAT_PID, &pat_payload, true, &mut self.continuity_pat);
 
         let mut pmt = BytesMut::with_capacity(32);
-        pmt.put_u8(0x02);                          // table_id
+        pmt.put_u8(0x02); // table_id
         pmt.put_u8(0xB0);
-        pmt.put_u8(0x17);                          // section_length: 19 data + 4 CRC32
+        pmt.put_u8(0x17); // section_length: 19 data + 4 CRC32
         pmt.put_u16(0x0001);
         pmt.put_u8(0xC1);
         pmt.put_u8(0x00);
         pmt.put_u8(0x00);
-        pmt.put_u16(0xE000 | VIDEO_PID);          // PCR_PID=video
+        pmt.put_u16(0xE000 | VIDEO_PID); // PCR_PID=video
         pmt.put_u16(0xF000);
-        pmt.put_u8(0x1B);                         // H.264
+        pmt.put_u8(video_stream_type); // H.264=0x1B / H.265=0x24
         pmt.put_u16(0xE000 | VIDEO_PID);
         pmt.put_u16(0xF000);
-        pmt.put_u8(0x0F);                         // AAC
+        pmt.put_u8(0x0F); // AAC
         pmt.put_u16(0xE000 | AUDIO_PID);
         pmt.put_u16(0xF000);
         let crc = crc32(pmt.as_ref());
         pmt.put_u32(crc);
         let mut pmt_payload = BytesMut::with_capacity(32);
-        pmt_payload.put_u8(0x00);                  // pointer_field
+        pmt_payload.put_u8(0x00); // pointer_field
         pmt_payload.extend_from_slice(&pmt);
         write_ts_packet(out, PMT_PID, &pmt_payload, true, &mut self.continuity_pmt);
     }
@@ -106,6 +106,7 @@ pub struct HlsMuxer {
     audio_config_sent: bool,
     video_config_data: Option<Vec<u8>>,
     audio_config_data: Option<Vec<u8>>,
+    video_codec: Option<CodecId>,
 }
 
 impl HlsMuxer {
@@ -120,6 +121,7 @@ impl HlsMuxer {
             audio_config_sent: false,
             video_config_data: None,
             audio_config_data: None,
+            video_codec: None,
         }
     }
 
@@ -131,10 +133,13 @@ impl HlsMuxer {
         if frame.frame_type == FrameType::Video && frame.key_frame {
             if let Some(start) = self.segment_start {
                 let elapsed = start.elapsed().as_secs_f64();
-                debug!("HLS keyframe check: elapsed={:.2} target={:.2} frames={}", elapsed, self.target_duration, self.current_frames.len());
-                if elapsed >= self.target_duration
-                    && !self.current_frames.is_empty()
-                {
+                debug!(
+                    "HLS keyframe check: elapsed={:.2} target={:.2} frames={}",
+                    elapsed,
+                    self.target_duration,
+                    self.current_frames.len()
+                );
+                if elapsed >= self.target_duration && !self.current_frames.is_empty() {
                     let data = self.mux_segment();
                     let _duration = start.elapsed().as_secs_f64();
                     let idx = self.segment_index;
@@ -174,14 +179,24 @@ impl HlsMuxer {
         for (i, frame) in self.current_frames.iter().enumerate() {
             match frame.frame_type {
                 FrameType::Video => {
-                    let is_cfg = is_h264_config(frame);
+                    let is_cfg = is_video_config(frame);
                     let is_kf = frame.key_frame;
-                    info!("  frame[{}] Video: key={} config={} data_len={} first_bytes={:02x?}",
-                        i, is_kf, is_cfg, frame.data.len(),
-                        &frame.data[..frame.data.len().min(5)]);
+                    info!(
+                        "  frame[{}] Video: key={} config={} data_len={} first_bytes={:02x?}",
+                        i,
+                        is_kf,
+                        is_cfg,
+                        frame.data.len(),
+                        &frame.data[..frame.data.len().min(5)]
+                    );
                     if is_cfg {
-                        let cfg = extract_h264_config(&frame.data);
-                        info!("  -> extracted config: {} bytes, {:02x?}", cfg.len(), &cfg[..cfg.len().min(20)]);
+                        self.video_codec = Some(frame.codec);
+                        let cfg = extract_video_config(frame);
+                        info!(
+                            "  -> extracted config: {} bytes, {:02x?}",
+                            cfg.len(),
+                            &cfg[..cfg.len().min(20)]
+                        );
                         self.video_config_data = Some(cfg);
                         self.video_config_sent = false;
                     }
@@ -196,7 +211,11 @@ impl HlsMuxer {
             }
         }
 
-        self.writer.write_pat_pmt(&mut out);
+        let video_stream_type = match self.video_codec {
+            Some(CodecId::H265) => 0x24,
+            _ => 0x1B,
+        };
+        self.writer.write_pat_pmt(&mut out, video_stream_type);
 
         if !self.video_config_sent {
             if let Some(ref config) = self.video_config_data {
@@ -220,14 +239,21 @@ impl HlsMuxer {
         for frame in &self.current_frames {
             match frame.frame_type {
                 FrameType::Video => {
-                    if !is_h264_config(frame) {
+                    if !is_video_config(frame) {
                         let annex_b = flv_video_to_annex_b(&frame.data);
                         if !annex_b.is_empty() {
-                            info!("  -> annex_b: {} bytes, first 12: {:02x?}", annex_b.len(), &annex_b[..annex_b.len().min(12)]);
+                            info!(
+                                "  -> annex_b: {} bytes, first 12: {:02x?}",
+                                annex_b.len(),
+                                &annex_b[..annex_b.len().min(12)]
+                            );
                             let pes = build_data_pes_raw(0xE0, &annex_b, frame.timestamp);
                             self.writer.write_pes(&mut out, VIDEO_PID, &pes, true);
                         } else {
-                            info!("  -> annex_b EMPTY for frame data[:5]={:02x?}", &frame.data[..frame.data.len().min(5)]);
+                            info!(
+                                "  -> annex_b EMPTY for frame data[:5]={:02x?}",
+                                &frame.data[..frame.data.len().min(5)]
+                            );
                         }
                     }
                 }
@@ -258,26 +284,10 @@ fn build_config_pes(stream_id: u8, config: &[u8]) -> Vec<u8> {
     let total_pes_len = config.len() + 3;
     pes.push(((total_pes_len >> 8) & 0xFF) as u8);
     pes.push((total_pes_len & 0xFF) as u8);
-    pes.push(0x84);  // '10', scrambling=00, priority=0, alignment=1
-    pes.push(0x00);  // PTS/DTS flags=00
-    pes.push(0x00);  // PES_header_data_length=0
+    pes.push(0x84); // '10', scrambling=00, priority=0, alignment=1
+    pes.push(0x00); // PTS/DTS flags=00
+    pes.push(0x00); // PES_header_data_length=0
     pes.extend_from_slice(config);
-    pes
-}
-
-fn build_data_pes(stream_id: u8, frame: &MediaFrame) -> Vec<u8> {
-    let mut pes = Vec::new();
-    pes.extend_from_slice(&[0x00, 0x00, 0x01, stream_id]);
-    let pts_dts_len: u8 = 5;
-    let total_pes_len = frame.data.len() + pts_dts_len as usize + 3;
-    pes.push(((total_pes_len >> 8) & 0xFF) as u8);
-    pes.push((total_pes_len & 0xFF) as u8);
-    pes.push(0x84);
-    pes.push(0x80);
-    pes.push(pts_dts_len);
-    let pts = frame.timestamp as u64 * 90;
-    write_pts(&mut pes, 0x21, pts);
-    pes.extend_from_slice(&frame.data);
     pes
 }
 
@@ -308,7 +318,8 @@ fn flv_video_to_annex_b(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut pos = 5;
     while pos + 4 <= data.len() {
-        let nalu_len = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let nalu_len =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
         if pos + nalu_len > data.len() {
             break;
@@ -366,7 +377,13 @@ fn flv_audio_to_adts(data: &[u8], audio_config: &[u8]) -> Vec<u8> {
     out
 }
 
-fn write_pes_to_ts(out: &mut Vec<u8>, pid: u16, pes: &[u8], rand_access: bool, continuity: &mut u8) {
+fn write_pes_to_ts(
+    out: &mut Vec<u8>,
+    pid: u16,
+    pes: &[u8],
+    rand_access: bool,
+    continuity: &mut u8,
+) {
     let mut offset = 0;
     let max_payload = TS_PACKET_SIZE - 4; // 184
 
@@ -380,32 +397,33 @@ fn write_pes_to_ts(out: &mut Vec<u8>, pid: u16, pes: &[u8], rand_access: bool, c
         if rand_access && first_pad >= 7 {
             // Random access: write adaptation with random_access flag + PCR placeholder (6 bytes of 0xFF)
             let adapt_data_len = first_pad - 1; // -1 for length byte itself
-            adapt.push(adapt_data_len as u8);   // adaptation_field_length
-            adapt.push(0x40);                    // random_access=1, no PCR flag
+            adapt.push(adapt_data_len as u8); // adaptation_field_length
+            adapt.push(0x40); // random_access=1, no PCR flag
             for _ in 1..adapt_data_len {
-                adapt.push(0xFF);                // stuffing
+                adapt.push(0xFF); // stuffing
             }
         } else if first_pad > 0 {
             // Just padding, no PCR, no random access
             let adapt_data_len = first_pad - 1; // -1 for length byte itself
-            adapt.push(adapt_data_len as u8);   // adaptation_field_length
+            adapt.push(adapt_data_len as u8); // adaptation_field_length
             if adapt_data_len > 0 {
-                adapt.push(0x00);                // no flags
+                adapt.push(0x00); // no flags
                 for _ in 1..adapt_data_len {
-                    adapt.push(0xFF);            // stuffing
+                    adapt.push(0xFF); // stuffing
                 }
             }
         } else {
             // rand_access but no room for padding — minimal adaptation with just rand_access flag
-            adapt.push(0x01);  // adaptation_field_length=1
-            adapt.push(0x40);  // random_access=1
+            adapt.push(0x01); // adaptation_field_length=1
+            adapt.push(0x40); // random_access=1
         }
     }
 
     let adapt_total = adapt.len(); // includes the length byte
     let payload_len = max_payload - adapt_total;
     write_ts_packet_with(
-        out, pid,
+        out,
+        pid,
         if adapt_total > 0 { Some(&adapt) } else { None },
         &pes[..payload_len],
         true,
@@ -437,7 +455,8 @@ fn write_pes_to_ts(out: &mut Vec<u8>, pid: u16, pes: &[u8], rand_access: bool, c
         let adapt_len = adapt.as_ref().map(|a| a.len()).unwrap_or(0);
         let actual_payload = max_payload - adapt_len;
         write_ts_packet_with(
-            out, pid,
+            out,
+            pid,
             adapt.as_deref(),
             &pes[offset..offset + actual_payload],
             false,
@@ -527,8 +546,18 @@ fn crc32(data: &[u8]) -> u32 {
     crc
 }
 
-fn is_h264_config(frame: &MediaFrame) -> bool {
-    frame.data.len() >= 2 && (frame.data[0] & 0x0F) == 7 && frame.data[1] & 0x0F == 0
+fn is_video_config(frame: &MediaFrame) -> bool {
+    frame.data.len() >= 2
+        && (frame.data[0] & 0x0F == 7 || frame.data[0] & 0x0F == 12)
+        && frame.data[1] & 0x0F == 0
+}
+
+fn extract_video_config(frame: &MediaFrame) -> Vec<u8> {
+    if frame.codec == CodecId::H265 {
+        extract_hevc_config(&frame.data)
+    } else {
+        extract_h264_config(&frame.data)
+    }
 }
 
 fn is_aac_config(frame: &MediaFrame) -> bool {
@@ -576,6 +605,46 @@ fn extract_h264_config(data: &[u8]) -> Vec<u8> {
     config
 }
 
+fn extract_hevc_config(data: &[u8]) -> Vec<u8> {
+    // `data` is an FLV video tag body: byte0 = frame type | codec id (12),
+    // byte1 = packet type (0 for the HEVCDecoderConfigurationRecord), bytes
+    // 2..5 = composition time, then the HEVCDecoderConfigurationRecord.
+    let mut config = Vec::new();
+    if data.len() < 28 {
+        return config;
+    }
+    // numOfArrays lives at offset 27 within the FLV tag (5-byte header +
+    // 22-byte fixed record header; avgFrameRate is 2 bytes).
+    let mut pos = 27;
+    let num_arrays = data[pos] as usize;
+    pos += 1;
+    for _ in 0..num_arrays {
+        if pos + 3 > data.len() {
+            break;
+        }
+        let nal_type = data[pos] & 0x3F;
+        let num_nalus = u16::from_be_bytes([data[pos + 1], data[pos + 2]]) as usize;
+        pos += 3;
+        for _ in 0..num_nalus {
+            if pos + 2 > data.len() {
+                break;
+            }
+            let nalu_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            if pos + nalu_len > data.len() {
+                break;
+            }
+            // Only VPS (32), SPS (33) and PPS (34) go into the in-band config.
+            if nal_type == 32 || nal_type == 33 || nal_type == 34 {
+                config.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                config.extend_from_slice(&data[pos..pos + nalu_len]);
+            }
+            pos += nalu_len;
+        }
+    }
+    config
+}
+
 fn extract_aac_config(data: &[u8]) -> Vec<u8> {
     if data.len() >= 3 {
         data[2..].to_vec()
@@ -596,22 +665,29 @@ pub fn start_hls_task(source: Arc<MediaSource>, segments: Arc<RwLock<VecDeque<Hl
 
         let config_frames = source.get_cached_config_frames().await;
         for frame in &config_frames {
-            debug!("HLS replay config frame: type={:?} key={} config={} ts={}",
-                frame.frame_type, frame.key_frame, frame.config_frame, frame.timestamp);
+            debug!(
+                "HLS replay config frame: type={:?} key={} config={} ts={}",
+                frame.frame_type, frame.key_frame, frame.config_frame, frame.timestamp
+            );
             let _ = muxer.push_frame(frame.clone());
         }
-        info!("HLS replayed {} config frames for {}", config_frames.len(), source.url());
+        info!(
+            "HLS replayed {} config frames for {}",
+            config_frames.len(),
+            source.url()
+        );
 
         let mut rx = source.subscribe();
 
         info!("HLS task started for {}, entering recv loop", source.url());
 
-        let mut recv_count: u64 = 0;
         loop {
             match rx.recv().await {
                 Ok(frame) => {
-                    info!("HLS recv frame: type={:?} key={} config={} ts={}",
-                        frame.frame_type, frame.key_frame, frame.config_frame, frame.timestamp);
+                    info!(
+                        "HLS recv frame: type={:?} key={} config={} ts={}",
+                        frame.frame_type, frame.key_frame, frame.config_frame, frame.timestamp
+                    );
                     if let Some((idx, data)) = muxer.push_frame(frame) {
                         let seg = HlsSegment {
                             index: idx,
@@ -648,4 +724,81 @@ pub fn start_hls_task(source: Arc<MediaSource>, segments: Arc<RwLock<VecDeque<Hl
 
         info!("HLS task ended for {}", source.url());
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    /// Builds a minimal FLV HEVC video tag body carrying an
+    /// HEVCDecoderConfigurationRecord with one VPS (32), SPS (33) and PPS (34).
+    fn make_hevc_config_data() -> Vec<u8> {
+        let mut d = vec![
+            0x1C, 0x00, 0x00, 0x00, 0x00, // frame type/codec(12) + packet type 0 + ctime
+            0x01, // configurationVersion
+            0x20, // profile_space/tier/profile_idc
+            0x00, 0x00, 0x00, 0x00, // general_profile_compatibility_flags
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // general_constraint_indicator_flags
+            0x5D, // general_level_idc
+            0x00, 0x00, // min_spatial_segmentation_idc
+            0x00, // parallelismType
+            0x01, // chromaFormat
+            0x00, // bitDepthLumaMinus8
+            0x00, // bitDepthChromaMinus8
+            0x00, 0x00, // avgFrameRate (2 bytes)
+            0x03, // lengthSizeMinusOne = 1, temporalIdNested = 1
+            0x03, // numOfArrays = 3
+        ];
+        // array 1: VPS
+        d.extend_from_slice(&[32, 0, 1, 0, 2, 0xAA, 0xBB]);
+        // array 2: SPS
+        d.extend_from_slice(&[33, 0, 1, 0, 2, 0xCC, 0xDD]);
+        // array 3: PPS
+        d.extend_from_slice(&[34, 0, 1, 0, 2, 0xEE, 0xFF]);
+        d
+    }
+
+    #[test]
+    fn hevc_config_extraction() {
+        let d = make_hevc_config_data();
+        let cfg = extract_hevc_config(&d);
+        assert_eq!(
+            cfg,
+            vec![0, 0, 0, 1, 0xAA, 0xBB, 0, 0, 0, 1, 0xCC, 0xDD, 0, 0, 0, 1, 0xEE, 0xFF]
+        );
+    }
+
+    #[test]
+    fn hevc_segment_pmt_stream_type() {
+        let mut muxer = HlsMuxer::new(2.0);
+
+        let cfg_frame = MediaFrame::new_video(
+            0,
+            CodecId::H265,
+            0,
+            0,
+            0,
+            Bytes::from(make_hevc_config_data()),
+            false,
+        );
+        // A HEVC IDR access unit (packet type 1, single 4-byte NALU).
+        let idr_data = vec![
+            0x1C, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x40, 0x01, 0x02, 0x03,
+        ];
+        let idr_frame =
+            MediaFrame::new_video(0, CodecId::H265, 0, 0, 0, Bytes::from(idr_data), true);
+
+        muxer.push_frame(cfg_frame);
+        muxer.push_frame(idr_frame);
+
+        let (_, seg) = muxer.flush().unwrap();
+        // PMT advertises HEVC (0x24) for the video PID (0xE100) with no
+        // program-info descriptors (0xF000) preceding the stream type.
+        let pattern = [0xE1, 0x00, 0xF0, 0x00, 0x24];
+        assert!(
+            seg.windows(5).any(|w| w == &pattern),
+            "PMT should advertise HEVC stream type 0x24"
+        );
+    }
 }

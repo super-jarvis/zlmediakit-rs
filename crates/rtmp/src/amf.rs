@@ -126,7 +126,11 @@ impl AmfDecoder {
                 }
                 let len = buf.get_u16() as usize;
                 if buf.remaining() < len {
-                    anyhow::bail!("Not enough data for AMF string (need {} bytes, have {})", len, buf.remaining());
+                    anyhow::bail!(
+                        "Not enough data for AMF string (need {} bytes, have {})",
+                        len,
+                        buf.remaining()
+                    );
                 }
                 let mut data = vec![0u8; len];
                 buf.copy_to_slice(&mut data);

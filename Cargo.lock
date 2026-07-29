@@ -1231,6 +1231,7 @@ dependencies = [
  "rand",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "toml",
@@ -1244,7 +1245,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "chrono",
  "thiserror",
+ "tokio",
  "tracing",
  "zlmediakit-core",
 ]
@@ -1271,6 +1274,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "chrono",
  "dashmap",
  "futures",
  "once_cell",

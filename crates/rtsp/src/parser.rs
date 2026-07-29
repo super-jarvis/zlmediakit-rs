@@ -42,10 +42,7 @@ impl RtspResponse {
     }
 
     pub fn serialize(&self) -> Vec<u8> {
-        let mut response = format!(
-            "{} {} {}\r\n",
-            self.version, self.status_code, self.reason
-        );
+        let mut response = format!("{} {} {}\r\n", self.version, self.status_code, self.reason);
         for (key, value) in &self.headers {
             response.push_str(&format!("{}: {}\r\n", key, value));
         }

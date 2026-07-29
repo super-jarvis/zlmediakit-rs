@@ -26,7 +26,11 @@ impl SessionManager {
     }
 
     pub fn create(&self, peer_addr: String, protocol: String) -> SessionId {
-        let id = format!("{}-{}", protocol.to_uppercase(), self.counter.fetch_add(1, Ordering::SeqCst));
+        let id = format!(
+            "{}-{}",
+            protocol.to_uppercase(),
+            self.counter.fetch_add(1, Ordering::SeqCst)
+        );
         let info = SessionInfo {
             id: id.clone(),
             peer_addr: peer_addr.clone(),

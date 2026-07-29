@@ -1,11 +1,17 @@
 use super::parser::{RtspParser, RtspRequest, RtspResponse};
-use bytes::{Buf, BufMut, BytesMut};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::{debug, error, info, warn};
-use zlmediakit_core::media_frame::MediaFrame;
+use zlmediakit_core::auth::StreamAuth;
+use zlmediakit_core::event_bus::{Event, EventBus};
+use zlmediakit_core::media_frame::{
+    AudioInfo, CodecId, FrameType, MediaFrame, TrackInfo, VideoInfo,
+};
 use zlmediakit_core::media_source::{MediaSource, MediaSourceManager};
 
 pub struct RtspSession {
@@ -13,17 +19,33 @@ pub struct RtspSession {
     peer_addr: String,
     client_ip: String,
     source_manager: Arc<MediaSourceManager>,
+    event_bus: Arc<EventBus>,
+    auth: Arc<StreamAuth>,
     source: Option<Arc<MediaSource>>,
     cseq: u32,
     session_id: String,
     app: String,
     stream_name: String,
+    stream_sign: String,
     is_publisher: bool,
     tcp_interleaved: bool,
     setup_count: u32,
     udp_video: Option<Arc<UdpSocket>>,
     udp_audio: Option<Arc<UdpSocket>>,
     buffer: BytesMut,
+
+    // RTSP push (publish) support
+    video_pt: u8,
+    audio_pt: u8,
+    video_chan: u8,
+    audio_chan: u8,
+    audio_sample_rate: u32,
+    video_codec: CodecId,
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+    vps: Option<Vec<u8>>,
+    audio_config: Option<Vec<u8>>,
+    depak: Option<RtpDepacketizer>,
 }
 
 impl RtspSession {
@@ -31,25 +53,46 @@ impl RtspSession {
         stream: TcpStream,
         peer_addr: String,
         source_manager: Arc<MediaSourceManager>,
+        event_bus: Arc<EventBus>,
+        auth: Arc<StreamAuth>,
     ) -> Self {
         let session_id = format!("{:08x}", rand::random::<u32>());
-        let client_ip = peer_addr.split(':').next().unwrap_or("127.0.0.1").to_string();
+        let client_ip = peer_addr
+            .split(':')
+            .next()
+            .unwrap_or("127.0.0.1")
+            .to_string();
         Self {
             stream: Some(stream),
             peer_addr,
             client_ip,
             source_manager,
+            event_bus,
+            auth,
             source: None,
             cseq: 0,
             session_id,
             app: String::new(),
             stream_name: String::new(),
+            stream_sign: String::new(),
             is_publisher: false,
             tcp_interleaved: false,
             setup_count: 0,
             udp_video: None,
             udp_audio: None,
             buffer: BytesMut::with_capacity(4096),
+
+            video_pt: 96,
+            audio_pt: 97,
+            video_chan: 0,
+            audio_chan: 2,
+            audio_sample_rate: 44100,
+            video_codec: CodecId::H264,
+            sps: None,
+            pps: None,
+            vps: None,
+            audio_config: None,
+            depak: None,
         }
     }
 
@@ -84,6 +127,26 @@ impl RtspSession {
 
     async fn process_buffer(&mut self) -> anyhow::Result<()> {
         loop {
+            // During publishing over TCP-interleaved, RTP arrives framed with '$'
+            // on the same connection. Demux it before trying to parse RTSP requests.
+            if self.is_publisher && self.tcp_interleaved {
+                if self.buffer.first() == Some(&b'$') {
+                    if self.buffer.len() < 4 {
+                        break;
+                    }
+                    let channel = self.buffer[1];
+                    let len = u16::from_be_bytes([self.buffer[2], self.buffer[3]]) as usize;
+                    if self.buffer.len() < 4 + len {
+                        break;
+                    }
+                    let payload = self.buffer[4..4 + len].to_vec();
+                    self.buffer.advance(4 + len);
+                    if let Some(ref mut depak) = self.depak {
+                        depak.handle_rtp(channel, &payload).await;
+                    }
+                    continue;
+                }
+            }
             if let Some((request, consumed)) = RtspParser::parse_request(&self.buffer) {
                 self.buffer.advance(consumed);
                 self.handle_request(request).await?;
@@ -134,7 +197,26 @@ impl RtspSession {
 
     async fn handle_describe(&mut self, request: &RtspRequest) -> anyhow::Result<()> {
         self.parse_uri(&request.uri);
-        info!("RTSP DESCRIBE: app={}, stream={}", self.app, self.stream_name);
+        info!(
+            "RTSP DESCRIBE: app={}, stream={}",
+            self.app, self.stream_name
+        );
+
+        if !self.auth.check(
+            "__defaultVhost__",
+            &self.app,
+            &self.stream_name,
+            "play",
+            &self.stream_sign,
+        ) {
+            warn!(
+                "RTSP play rejected (auth): {}/{}",
+                self.app, self.stream_name
+            );
+            let response =
+                RtspResponse::new(401, "Unauthorized").with_header("CSeq", &self.cseq.to_string());
+            return self.send_response(&response).await;
+        }
 
         let source = self
             .source_manager
@@ -146,7 +228,29 @@ impl RtspSession {
             Some(source) => {
                 self.source = Some(source.clone());
 
-                let sdp = self.generate_sdp();
+                let video_codec = {
+                    let info = source.info.read().await;
+                    info.tracks
+                        .iter()
+                        .find_map(|t| match t {
+                            TrackInfo::Video(v) => Some(v.codec),
+                            _ => None,
+                        })
+                        .unwrap_or(CodecId::H264)
+                };
+                let hevc_sprop = if video_codec == CodecId::H265 {
+                    extract_hevc_sprop_from_source(&source).await
+                } else {
+                    None
+                };
+                let has_audio = source
+                    .info
+                    .read()
+                    .await
+                    .tracks
+                    .iter()
+                    .any(|t| matches!(t, TrackInfo::Audio(_)));
+                let sdp = self.generate_sdp(video_codec, hevc_sprop, has_audio);
                 let response = RtspResponse::new(200, "OK")
                     .with_header("CSeq", &self.cseq.to_string())
                     .with_header("Content-Type", "application/sdp")
@@ -154,8 +258,8 @@ impl RtspSession {
                 self.send_response(&response).await
             }
             None => {
-                let response = RtspResponse::new(404, "Not Found")
-                    .with_header("CSeq", &self.cseq.to_string());
+                let response =
+                    RtspResponse::new(404, "Not Found").with_header("CSeq", &self.cseq.to_string());
                 self.send_response(&response).await
             }
         }
@@ -174,6 +278,11 @@ impl RtspSession {
                     rtp_channel,
                     rtp_channel + 1
                 );
+                if track_idx == 0 {
+                    self.video_chan = rtp_channel;
+                } else {
+                    self.audio_chan = rtp_channel;
+                }
                 let response = RtspResponse::new(200, "OK")
                     .with_header("CSeq", &self.cseq.to_string())
                     .with_header("Session", &self.session_id)
@@ -235,6 +344,22 @@ impl RtspSession {
     async fn handle_play(&mut self) -> anyhow::Result<()> {
         self.is_publisher = false;
 
+        if !self.auth.check(
+            "__defaultVhost__",
+            &self.app,
+            &self.stream_name,
+            "play",
+            &self.stream_sign,
+        ) {
+            warn!(
+                "RTSP play rejected (auth): {}/{}",
+                self.app, self.stream_name
+            );
+            let response =
+                RtspResponse::new(401, "Unauthorized").with_header("CSeq", &self.cseq.to_string());
+            return self.send_response(&response).await;
+        }
+
         let response = RtspResponse::new(200, "OK")
             .with_header("CSeq", &self.cseq.to_string())
             .with_header("Session", &self.session_id);
@@ -254,19 +379,31 @@ impl RtspSession {
                     let mut writer = stream;
                     let mut seq: u16 = 1;
                     let ssrc: u32 = rand::random();
+                    debug!(
+                        "RTSP play send task started (tcp interleaved), cached={}",
+                        cached.len()
+                    );
 
                     for frame in &cached {
-                        let _ = Self::send_interleaved_frame(&mut writer, frame, &mut seq, ssrc).await;
+                        let _ =
+                            Self::send_interleaved_frame(&mut writer, frame, &mut seq, ssrc).await;
                     }
 
                     loop {
                         match rx.recv().await {
                             Ok(frame) => {
-                                let _ = Self::send_interleaved_frame(&mut writer, &frame, &mut seq, ssrc).await;
+                                let _ = Self::send_interleaved_frame(
+                                    &mut writer,
+                                    &frame,
+                                    &mut seq,
+                                    ssrc,
+                                )
+                                .await;
                             }
                             Err(_) => break,
                         }
                     }
+                    debug!("RTSP play send task ended (tcp interleaved)");
                 });
 
                 handle.await.ok();
@@ -282,11 +419,23 @@ impl RtspSession {
                     for frame in &cached {
                         match frame.frame_type {
                             zlmediakit_core::media_frame::FrameType::Video => {
-                                let _ = Self::send_udp_frame(&video_sock, frame, &mut video_seq, video_ssrc).await;
+                                let _ = Self::send_udp_frame(
+                                    &video_sock,
+                                    frame,
+                                    &mut video_seq,
+                                    video_ssrc,
+                                )
+                                .await;
                             }
                             zlmediakit_core::media_frame::FrameType::Audio => {
                                 if let Some(ref sock) = audio_sock {
-                                    let _ = Self::send_udp_frame(sock, frame, &mut audio_seq, audio_ssrc).await;
+                                    let _ = Self::send_udp_frame(
+                                        sock,
+                                        frame,
+                                        &mut audio_seq,
+                                        audio_ssrc,
+                                    )
+                                    .await;
                                 }
                             }
                             _ => {}
@@ -295,19 +444,29 @@ impl RtspSession {
 
                     loop {
                         match rx.recv().await {
-                            Ok(frame) => {
-                                match frame.frame_type {
-                                    zlmediakit_core::media_frame::FrameType::Video => {
-                                        let _ = Self::send_udp_frame(&video_sock, &frame, &mut video_seq, video_ssrc).await;
-                                    }
-                                    zlmediakit_core::media_frame::FrameType::Audio => {
-                                        if let Some(ref sock) = audio_sock {
-                                            let _ = Self::send_udp_frame(sock, &frame, &mut audio_seq, audio_ssrc).await;
-                                        }
-                                    }
-                                    _ => {}
+                            Ok(frame) => match frame.frame_type {
+                                zlmediakit_core::media_frame::FrameType::Video => {
+                                    let _ = Self::send_udp_frame(
+                                        &video_sock,
+                                        &frame,
+                                        &mut video_seq,
+                                        video_ssrc,
+                                    )
+                                    .await;
                                 }
-                            }
+                                zlmediakit_core::media_frame::FrameType::Audio => {
+                                    if let Some(ref sock) = audio_sock {
+                                        let _ = Self::send_udp_frame(
+                                            sock,
+                                            &frame,
+                                            &mut audio_seq,
+                                            audio_ssrc,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                _ => {}
+                            },
                             Err(_) => break,
                         }
                     }
@@ -321,6 +480,33 @@ impl RtspSession {
     async fn handle_announce(&mut self, request: &RtspRequest) -> anyhow::Result<()> {
         self.is_publisher = true;
         self.parse_uri(&request.uri);
+
+        if !self.auth.check(
+            "__defaultVhost__",
+            &self.app,
+            &self.stream_name,
+            "pub",
+            &self.stream_sign,
+        ) {
+            warn!(
+                "RTSP publish rejected (auth): {}/{}",
+                self.app, self.stream_name
+            );
+            let response =
+                RtspResponse::new(401, "Unauthorized").with_header("CSeq", &self.cseq.to_string());
+            return self.send_response(&response).await;
+        }
+
+        // Parse the SDP body to learn payload types, codecs and decoder config.
+        let sdp = parse_sdp(&request.body);
+        self.video_pt = sdp.video_pt;
+        self.audio_pt = sdp.audio_pt;
+        self.audio_sample_rate = sdp.audio_sample_rate;
+        self.video_codec = sdp.video_codec;
+        self.sps = sdp.sps;
+        self.pps = sdp.pps;
+        self.vps = sdp.vps;
+        self.audio_config = sdp.audio_config;
 
         self.source = Some(self.source_manager.get_or_create(
             "__defaultVhost__",
@@ -338,7 +524,130 @@ impl RtspSession {
         let response = RtspResponse::new(200, "OK")
             .with_header("CSeq", &self.cseq.to_string())
             .with_header("Session", &self.session_id);
-        self.send_response(&response).await
+        self.send_response(&response).await?;
+
+        if !self.is_publisher {
+            return Ok(());
+        }
+
+        let source = match self.source.clone() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        // Populate the source track info so other protocols (FLV/HLS) can expose
+        // correct metadata for this published stream.
+        {
+            let mut info = source.info.write().await;
+            info.tracks.clear();
+            info.tracks.push(TrackInfo::Video(VideoInfo {
+                codec: self.video_codec,
+                width: 1280,
+                height: 720,
+                fps: 25.0,
+                key_frame: false,
+            }));
+            if self.audio_config.is_some() {
+                info.tracks.push(TrackInfo::Audio(AudioInfo {
+                    codec: CodecId::AAC,
+                    sample_rate: self.audio_sample_rate,
+                    channels: 1,
+                    bits_per_sample: 16,
+                }));
+            }
+        }
+
+        let (sps, pps, audio_config) = (
+            self.sps.clone(),
+            self.pps.clone(),
+            self.audio_config.clone(),
+        );
+
+        if self.tcp_interleaved {
+            // TCP-interleaved RTP is demuxed inside the main read loop.
+            let depak = RtpDepacketizer::new(
+                source,
+                self.video_pt,
+                self.audio_pt,
+                self.video_chan,
+                self.audio_chan,
+                self.audio_sample_rate,
+                None,
+                self.video_codec,
+                sps,
+                pps,
+                self.vps.clone(),
+                audio_config,
+            );
+            self.depak = Some(depak);
+        } else {
+            // UDP RTP: spawn per-track receive tasks.
+            if let Some(sock) = self.udp_video.take() {
+                let mut depak = RtpDepacketizer::new(
+                    source.clone(),
+                    self.video_pt,
+                    self.audio_pt,
+                    self.video_chan,
+                    self.audio_chan,
+                    self.audio_sample_rate,
+                    Some(FrameType::Video),
+                    self.video_codec,
+                    sps.clone(),
+                    pps.clone(),
+                    self.vps.clone(),
+                    audio_config.clone(),
+                );
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 65536];
+                    loop {
+                        match sock.recv(&mut buf).await {
+                            Ok(n) => depak.handle_rtp(0, &buf[..n]).await,
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+            if let Some(sock) = self.udp_audio.take() {
+                let mut depak = RtpDepacketizer::new(
+                    source.clone(),
+                    self.video_pt,
+                    self.audio_pt,
+                    self.video_chan,
+                    self.audio_chan,
+                    self.audio_sample_rate,
+                    Some(FrameType::Audio),
+                    self.video_codec,
+                    sps,
+                    pps,
+                    self.vps.clone(),
+                    audio_config,
+                );
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 65536];
+                    loop {
+                        match sock.recv(&mut buf).await {
+                            Ok(n) => depak.handle_rtp(0, &buf[..n]).await,
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+
+        info!(
+            "RTSP publish (RECORD) started: {}/{} (tcp={})",
+            self.app, self.stream_name, self.tcp_interleaved
+        );
+
+        // Notify the recorder supervisor (and any future hooks) that a stream
+        // has started publishing.
+        self.event_bus.publish(Event::StreamPublish {
+            source_id: format!("__defaultVhost__/{}/{}", self.app, self.stream_name),
+            vhost: "__defaultVhost__".to_string(),
+            app: self.app.clone(),
+            stream: self.stream_name.clone(),
+        });
+        Ok(())
     }
 
     async fn handle_teardown(&mut self) -> anyhow::Result<()> {
@@ -358,11 +667,24 @@ impl RtspSession {
     }
 
     fn parse_uri(&mut self, uri: &str) {
-        let path = uri.trim_start_matches("rtsp://");
+        let stripped = uri.trim_start_matches("rtsp://");
+        let (path, query) = match stripped.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (stripped, None),
+        };
         let path = path.splitn(2, '/').nth(1).unwrap_or("");
         let parts: Vec<&str> = path.splitn(2, '/').collect();
         self.app = parts.first().map_or("live", |v| v).to_string();
         self.stream_name = parts.get(1).map_or("stream", |v| v).to_string();
+        self.stream_sign = query
+            .map(|q| {
+                q.split('&')
+                    .filter_map(|pair| pair.split_once('='))
+                    .find(|(k, _)| *k == "sign")
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
     }
 
     fn parse_udp_transport(transport: &str) -> Option<(u16, u16)> {
@@ -377,31 +699,55 @@ impl RtspSession {
         }
     }
 
-    fn generate_sdp(&self) -> String {
-        format!(
+    fn generate_sdp(
+        &self,
+        video_codec: CodecId,
+        hevc_sprop: Option<(String, String, String)>,
+        has_audio: bool,
+    ) -> String {
+        let (video_rtpmap, video_fmtp) = match video_codec {
+            CodecId::H265 => {
+                if let Some((vps, sps, pps)) = hevc_sprop {
+                    (
+                        "H265/90000".to_string(),
+                        format!(
+                            "a=fmtp:96 sprop-vps={};sprop-sps={};sprop-pps={}\r\n",
+                            vps, sps, pps
+                        ),
+                    )
+                } else {
+                    ("H265/90000".to_string(), String::new())
+                }
+            }
+            _ => (
+                "H264/90000".to_string(),
+                "a=fmtp:96 packetization-mode=1;profile-level-id=42C01E\r\n".to_string(),
+            ),
+        };
+        let mut sdp = format!(
             "v=0\r\n\
              o=- 0 0 IN IP4 127.0.0.1\r\n\
              s=zlmediakit-rs\r\n\
              c=IN IP4 0.0.0.0\r\n\
              t=0 0\r\n\
              m=video 0 RTP/AVP 96\r\n\
-             a=rtpmap:96 H264/90000\r\n\
-             a=fmtp:96 packetization-mode=1;profile-level-id=42C01E\r\n\
-             a=control:track1\r\n\
-             m=audio 0 RTP/AVP 97\r\n\
-             a=rtpmap:97 MPEG4-GENERIC/44100/1\r\n\
-             a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3\r\n\
-             a=control:track2\r\n"
-        )
+             a=rtpmap:96 {}\r\n\
+             {}\
+             a=control:track1\r\n",
+            video_rtpmap, video_fmtp
+        );
+        if has_audio {
+            sdp.push_str(
+                "m=audio 0 RTP/AVP 97\r\n\
+                 a=rtpmap:97 MPEG4-GENERIC/44100/1\r\n\
+                 a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3\r\n\
+                 a=control:track2\r\n",
+            );
+        }
+        sdp
     }
 
-    fn make_rtp_header(
-        seq: u16,
-        timestamp: u32,
-        ssrc: u32,
-        pt: u8,
-        marker: bool,
-    ) -> [u8; 12] {
+    fn make_rtp_header(seq: u16, timestamp: u32, ssrc: u32, pt: u8, marker: bool) -> [u8; 12] {
         let mut hdr = [0u8; 12];
         hdr[0] = 0x80;
         hdr[1] = if marker { 0x80 | pt } else { pt };
@@ -418,12 +764,7 @@ impl RtspSession {
         hdr
     }
 
-    fn packetize_h264(
-        data: &[u8],
-        timestamp: u32,
-        ssrc: u32,
-        seq: &mut u16,
-    ) -> Vec<Vec<u8>> {
+    fn packetize_h264(data: &[u8], timestamp: u32, ssrc: u32, seq: &mut u16) -> Vec<Vec<u8>> {
         let mut packets = Vec::new();
 
         if data.len() < 5 {
@@ -445,8 +786,7 @@ impl RtspSession {
                         if pos + 2 > data.len() {
                             break;
                         }
-                        let nalu_len =
-                            u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                        let nalu_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
                         pos += 2;
                         if pos + nalu_len > data.len() {
                             break;
@@ -469,8 +809,7 @@ impl RtspSession {
                             if pos + 2 > data.len() {
                                 break;
                             }
-                            let nalu_len =
-                                u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                            let nalu_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
                             pos += 2;
                             if pos + nalu_len > data.len() {
                                 break;
@@ -554,12 +893,115 @@ impl RtspSession {
         packets
     }
 
-    fn packetize_audio(
-        data: &[u8],
+    fn packetize_video(
+        frame: &MediaFrame,
         timestamp: u32,
         ssrc: u32,
         seq: &mut u16,
     ) -> Vec<Vec<u8>> {
+        match frame.codec {
+            CodecId::H265 => Self::packetize_hevc(frame, timestamp, ssrc, seq),
+            _ => Self::packetize_h264(&frame.data, timestamp, ssrc, seq),
+        }
+    }
+
+    fn packetize_hevc(
+        frame: &MediaFrame,
+        timestamp: u32,
+        ssrc: u32,
+        seq: &mut u16,
+    ) -> Vec<Vec<u8>> {
+        let data = &frame.data;
+        let mut packets = Vec::new();
+        if data.len() < 5 {
+            return packets;
+        }
+        let packet_type = data[1] & 0x0F;
+        let rtp_ts = timestamp * 90;
+
+        match packet_type {
+            0 => {
+                // HEVCDecoderConfigurationRecord: emit VPS/SPS/PPS as
+                // individual single-NALU RTP packets (in-band parameter sets).
+                let (vps, sps, pps) = extract_hevc_nalus(data);
+                for nalu in [vps, sps, pps].iter().flatten() {
+                    let hdr = Self::make_rtp_header(*seq, rtp_ts, ssrc, 96, true);
+                    *seq = seq.wrapping_add(1);
+                    let mut pkt = Vec::with_capacity(12 + nalu.len());
+                    pkt.extend_from_slice(&hdr);
+                    pkt.extend_from_slice(nalu);
+                    packets.push(pkt);
+                }
+            }
+            1 => {
+                let mut pos = 5;
+                let mtu = 1400;
+                while pos + 4 <= data.len() {
+                    let nalu_len = u32::from_be_bytes([
+                        data[pos],
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                    ]) as usize;
+                    pos += 4;
+                    if pos + nalu_len > data.len() {
+                        break;
+                    }
+                    let nalu = &data[pos..pos + nalu_len];
+                    pos += nalu_len;
+                    if nalu.len() < 2 {
+                        continue;
+                    }
+                    if nalu.len() <= mtu {
+                        let hdr = Self::make_rtp_header(*seq, rtp_ts, ssrc, 96, true);
+                        *seq = seq.wrapping_add(1);
+                        let mut pkt = Vec::with_capacity(12 + nalu.len());
+                        pkt.extend_from_slice(&hdr);
+                        pkt.extend_from_slice(nalu);
+                        packets.push(pkt);
+                    } else {
+                        // RFC 7798 HEVC FU fragmentation: 2-byte PayloadHdr
+                        // (Type=49) + 1-byte FU header + fragment data.
+                        let nal_header0 = nalu[0];
+                        let nal_header1 = nalu[1];
+                        // HEVC NAL type lives in the upper 6 bits of byte 0.
+                        let nal_type = (nal_header0 >> 1) & 0x3F;
+                        // PayloadHdr byte0: keep F bit + LayerId high bit, Type=49.
+                        let payload_hdr0 = (nal_header0 & 0x81) | (49 << 1);
+                        let mut pos2 = 2;
+                        let mut first = true;
+                        while pos2 < nalu.len() {
+                            let chunk = std::cmp::min(mtu - 3, nalu.len() - pos2);
+                            let end = pos2 + chunk >= nalu.len();
+                            let mut fu_header = nal_type;
+                            if first {
+                                fu_header |= 0x80;
+                            }
+                            if end {
+                                fu_header |= 0x40;
+                            }
+                            let hdr = Self::make_rtp_header(*seq, rtp_ts, ssrc, 96, end);
+                            *seq = seq.wrapping_add(1);
+                            let mut pkt = Vec::with_capacity(12 + 3 + chunk);
+                            pkt.extend_from_slice(&hdr);
+                            pkt.push(payload_hdr0);
+                            pkt.push(nal_header1);
+                            pkt.push(fu_header);
+                            pkt.extend_from_slice(&nalu[pos2..pos2 + chunk]);
+                            packets.push(pkt);
+                            pos2 += chunk;
+                            first = false;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        packets
+    }
+
+    fn packetize_audio(data: &[u8], timestamp: u32, ssrc: u32, seq: &mut u16) -> Vec<Vec<u8>> {
         let mut packets = Vec::new();
         if data.len() < 2 {
             return packets;
@@ -629,7 +1071,7 @@ impl RtspSession {
     ) -> anyhow::Result<()> {
         let packets = match frame.frame_type {
             zlmediakit_core::media_frame::FrameType::Video => {
-                Self::packetize_h264(&frame.data, frame.timestamp, ssrc, seq)
+                Self::packetize_video(frame, frame.timestamp, ssrc, seq)
             }
             zlmediakit_core::media_frame::FrameType::Audio => {
                 Self::packetize_audio(&frame.data, frame.timestamp, ssrc, seq)
@@ -651,7 +1093,7 @@ impl RtspSession {
     ) -> anyhow::Result<()> {
         let packets = match frame.frame_type {
             zlmediakit_core::media_frame::FrameType::Video => {
-                Self::packetize_h264(&frame.data, frame.timestamp, ssrc, seq)
+                Self::packetize_video(frame, frame.timestamp, ssrc, seq)
             }
             zlmediakit_core::media_frame::FrameType::Audio => {
                 Self::packetize_audio(&frame.data, frame.timestamp, ssrc, seq)
@@ -670,8 +1112,809 @@ impl RtspSession {
 
     async fn cleanup(&mut self) {
         info!("RTSP session closing: {}/{}", self.app, self.stream_name);
+        if self.is_publisher {
+            self.event_bus.publish(Event::StreamUnPublish {
+                source_id: format!("__defaultVhost__/{}/{}", self.app, self.stream_name),
+                vhost: "__defaultVhost__".to_string(),
+                app: self.app.clone(),
+                stream: self.stream_name.clone(),
+            });
+        }
         self.source = None;
         self.udp_video = None;
         self.udp_audio = None;
+        self.depak = None;
+    }
+}
+
+// === RTSP push: RTP depacketization into FLV/AVCC MediaFrames ===
+
+struct RtpDepacketizer {
+    source: Arc<MediaSource>,
+    video_pt: u8,
+    audio_pt: u8,
+    video_chan: u8,
+    audio_chan: u8,
+    audio_sample_rate: u32,
+    force_media: Option<FrameType>,
+    video_codec: CodecId,
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+    vps: Option<Vec<u8>>,
+    audio_config: Option<Vec<u8>>,
+    config_sent: bool,
+    audio_config_sent: bool,
+    pending_nalus: Vec<Vec<u8>>,
+    fu_buf: Vec<u8>,
+    fu_active: bool,
+    pending_video_ts: u32,
+    video_key: bool,
+}
+
+impl RtpDepacketizer {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        source: Arc<MediaSource>,
+        video_pt: u8,
+        audio_pt: u8,
+        video_chan: u8,
+        audio_chan: u8,
+        audio_sample_rate: u32,
+        force_media: Option<FrameType>,
+        video_codec: CodecId,
+        sps: Option<Vec<u8>>,
+        pps: Option<Vec<u8>>,
+        vps: Option<Vec<u8>>,
+        audio_config: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            source,
+            video_pt,
+            audio_pt,
+            video_chan,
+            audio_chan,
+            audio_sample_rate,
+            force_media,
+            video_codec,
+            sps,
+            pps,
+            vps,
+            audio_config,
+            config_sent: false,
+            audio_config_sent: false,
+            pending_nalus: Vec::new(),
+            fu_buf: Vec::new(),
+            fu_active: false,
+            pending_video_ts: 0,
+            video_key: false,
+        }
+    }
+
+    async fn handle_rtp(&mut self, channel: u8, payload: &[u8]) {
+        if payload.len() < 12 {
+            return;
+        }
+        let pt = payload[1] & 0x7F;
+        let media = if let Some(m) = self.force_media {
+            m
+        } else if pt == self.video_pt || channel == self.video_chan {
+            FrameType::Video
+        } else if pt == self.audio_pt || channel == self.audio_chan {
+            FrameType::Audio
+        } else {
+            return;
+        };
+        let cc = (payload[0] & 0x0F) as usize;
+        let header_len = 12 + 4 * cc;
+        if payload.len() < header_len + 1 {
+            return;
+        }
+        let marker = (payload[1] & 0x80) != 0;
+        let ts = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        let data = &payload[header_len..];
+        match media {
+            FrameType::Video => self.handle_video_rtp(data, marker, ts).await,
+            FrameType::Audio => self.handle_audio_rtp(data, ts).await,
+            _ => {}
+        }
+    }
+
+    async fn handle_video_rtp(&mut self, data: &[u8], marker: bool, ts: u32) {
+        if data.is_empty() {
+            return;
+        }
+        self.pending_video_ts = ts;
+        if self.video_codec == CodecId::H265 {
+            self.handle_hevc_video_rtp(data);
+            if marker {
+                self.emit_video_frame().await;
+            }
+            return;
+        }
+        let nalu_type = data[0] & 0x1F;
+        match nalu_type {
+            1..=23 => {
+                // Single NALU
+                let nalu = data.to_vec();
+                self.observe_nalu(&nalu);
+                self.pending_nalus.push(nalu);
+            }
+            24 => {
+                // STAP-A: multiple NALUs in one packet
+                let mut pos = 1;
+                while pos + 2 <= data.len() {
+                    let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                    pos += 2;
+                    if pos + len > data.len() {
+                        break;
+                    }
+                    let nalu = data[pos..pos + len].to_vec();
+                    pos += len;
+                    self.observe_nalu(&nalu);
+                    self.pending_nalus.push(nalu);
+                }
+            }
+            28 => {
+                // FU-A: fragmented NALU
+                if data.len() < 2 {
+                    return;
+                }
+                let fu_indicator = data[0];
+                let fu_header = data[1];
+                let start = (fu_header & 0x80) != 0;
+                let end = (fu_header & 0x40) != 0;
+                let nal_type = fu_header & 0x1F;
+                let reconstructed = (fu_indicator & 0xE0) | nal_type;
+                if start {
+                    self.fu_buf.clear();
+                    self.fu_buf.push(reconstructed);
+                    self.fu_active = true;
+                }
+                if !self.fu_active {
+                    return;
+                }
+                self.fu_buf.extend_from_slice(&data[2..]);
+                if end {
+                    let nalu = std::mem::take(&mut self.fu_buf);
+                    self.fu_active = false;
+                    if nal_type == 5 {
+                        self.video_key = true;
+                    }
+                    self.pending_nalus.push(nalu);
+                }
+            }
+            _ => {}
+        }
+        if marker {
+            self.emit_video_frame().await;
+        }
+    }
+
+    /// Depacketizes HEVC RTP payloads (RFC 7798). The HEVC payload header is
+    /// two bytes; the NAL unit type lives in the top 6 bits of the first byte.
+    fn handle_hevc_video_rtp(&mut self, data: &[u8]) {
+        if data.len() < 2 {
+            return;
+        }
+        let nal_type = (data[0] >> 1) & 0x3F;
+        match nal_type {
+            48 => {
+                // AP (aggregation packet): each NALU is prefixed with a 2-byte
+                // length. Skip the 2-byte payload header first.
+                let mut pos = 2;
+                while pos + 2 <= data.len() {
+                    let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                    pos += 2;
+                    if pos + len > data.len() {
+                        break;
+                    }
+                    let nalu = data[pos..pos + len].to_vec();
+                    pos += len;
+                    self.observe_hevc_nalu(&nalu);
+                    self.pending_nalus.push(nalu);
+                }
+            }
+            49 => {
+                // FU-A: 2-byte payload header + 1-byte FU header + fragment.
+                if data.len() < 3 {
+                    return;
+                }
+                let fu_header = data[2];
+                let start = (fu_header & 0x80) != 0;
+                let end = (fu_header & 0x40) != 0;
+                let fu_type = fu_header & 0x3F;
+                // Reconstructed NAL unit header (2 bytes).
+                let reconstructed0 = (data[0] & 0x81) | (fu_type << 1);
+                let reconstructed1 = data[1];
+                if start {
+                    self.fu_buf.clear();
+                    self.fu_buf.push(reconstructed0);
+                    self.fu_buf.push(reconstructed1);
+                    self.fu_active = true;
+                }
+                if !self.fu_active {
+                    return;
+                }
+                self.fu_buf.extend_from_slice(&data[3..]);
+                if end {
+                    let nalu = std::mem::take(&mut self.fu_buf);
+                    self.fu_active = false;
+                    self.observe_hevc_nalu(&nalu);
+                    self.pending_nalus.push(nalu);
+                }
+            }
+            _ => {
+                // Single NALU unit (including VPS/SPS/PPS/IDR).
+                let nalu = data.to_vec();
+                self.observe_hevc_nalu(&nalu);
+                self.pending_nalus.push(nalu);
+            }
+        }
+    }
+
+    fn observe_nalu(&mut self, nalu: &[u8]) {
+        if nalu.is_empty() {
+            return;
+        }
+        let t = nalu[0] & 0x1F;
+        if t == 5 {
+            self.video_key = true;
+        } else if t == 7 {
+            self.sps = Some(nalu.to_vec());
+        } else if t == 8 {
+            self.pps = Some(nalu.to_vec());
+        }
+    }
+
+    fn observe_hevc_nalu(&mut self, nalu: &[u8]) {
+        if nalu.len() < 2 {
+            return;
+        }
+        let t = (nalu[0] >> 1) & 0x3F;
+        match t {
+            32 => self.vps = Some(nalu.to_vec()),
+            33 => self.sps = Some(nalu.to_vec()),
+            34 => self.pps = Some(nalu.to_vec()),
+            19 | 20 | 21 => self.video_key = true,
+            _ => {}
+        }
+    }
+
+    async fn emit_video_frame(&mut self) {
+        if self.pending_nalus.is_empty() {
+            return;
+        }
+        let ts = self.pending_video_ts;
+        let ms = ts / 90;
+
+        if self.video_codec == CodecId::H265 {
+            if !self.config_sent {
+                if let (Some(vps), Some(sps), Some(pps)) =
+                    (self.vps.clone(), self.sps.clone(), self.pps.clone())
+                {
+                    let mut frame_data = Vec::with_capacity(5 + 64);
+                    frame_data.push(0x1C); // key frame + HEVC codec id (12)
+                    frame_data.push(0x00); // packet type = HEVC config record
+                    frame_data.extend_from_slice(&[0, 0, 0]); // composition time
+                    frame_data.extend_from_slice(&build_hevc_config_record(&vps, &sps, &pps));
+                    let mut f = MediaFrame::new_video(
+                        0,
+                        CodecId::H265,
+                        ms,
+                        ms as u64,
+                        ms as u64,
+                        Bytes::from(frame_data),
+                        false,
+                    );
+                    f.config_frame = true;
+                    let _ = self.source.publish_and_cache(f).await;
+                    self.config_sent = true;
+                }
+            }
+
+            let mut frame_nalus = Vec::new();
+            for n in &self.pending_nalus {
+                let t = (n[0] >> 1) & 0x3F;
+                if t == 32 || t == 33 || t == 34 {
+                    continue;
+                }
+                frame_nalus.push(n.clone());
+            }
+            self.pending_nalus.clear();
+            if frame_nalus.is_empty() {
+                self.video_key = false;
+                return;
+            }
+
+            let mut frame_data = Vec::new();
+            frame_data.push(if self.video_key { 0x1C } else { 0x2C });
+            frame_data.push(0x01); // packet type = NALU
+            frame_data.extend_from_slice(&[0, 0, 0]); // composition time
+            for n in &frame_nalus {
+                frame_data.extend_from_slice(&(n.len() as u32).to_be_bytes());
+                frame_data.extend_from_slice(n);
+            }
+            let f = MediaFrame::new_video(
+                0,
+                CodecId::H265,
+                ms,
+                ms as u64,
+                ms as u64,
+                Bytes::from(frame_data),
+                self.video_key,
+            );
+            let _ = self.source.publish_and_cache(f).await;
+            self.video_key = false;
+            return;
+        }
+
+        if !self.config_sent {
+            if let (Some(sps), Some(pps)) = (self.sps.clone(), self.pps.clone()) {
+                let cfg = build_avcc_config(&sps, &pps);
+                let mut f = MediaFrame::new_video(
+                    0,
+                    CodecId::H264,
+                    ms,
+                    ms as u64,
+                    ms as u64,
+                    Bytes::from(cfg),
+                    false,
+                );
+                f.config_frame = true;
+                let _ = self.source.publish_and_cache(f).await;
+                self.config_sent = true;
+            }
+        }
+
+        let mut frame_nalus = Vec::new();
+        for n in &self.pending_nalus {
+            let t = n[0] & 0x1F;
+            if t == 7 || t == 8 {
+                continue;
+            }
+            frame_nalus.push(n.clone());
+        }
+        self.pending_nalus.clear();
+        if frame_nalus.is_empty() {
+            self.video_key = false;
+            return;
+        }
+
+        let data = build_avcc_frame(&frame_nalus, self.video_key);
+        let f = MediaFrame::new_video(
+            0,
+            CodecId::H264,
+            ms,
+            ms as u64,
+            ms as u64,
+            Bytes::from(data),
+            self.video_key,
+        );
+        let _ = self.source.publish_and_cache(f).await;
+        self.video_key = false;
+    }
+
+    async fn handle_audio_rtp(&mut self, data: &[u8], ts: u32) {
+        if data.len() < 2 {
+            return;
+        }
+        let au_headers_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+        let num_aus = au_headers_len / 16;
+        let mut pos = 2;
+        let mut sizes = Vec::new();
+        for _ in 0..num_aus {
+            if pos + 2 > data.len() {
+                break;
+            }
+            let au_header = u16::from_be_bytes([data[pos], data[pos + 1]]);
+            let size = ((au_header >> 3) & 0x1FFF) as usize;
+            sizes.push(size);
+            pos += 2;
+        }
+
+        if !self.audio_config_sent {
+            if let Some(cfg) = self.audio_config.clone() {
+                let mut v = vec![0xAF, 0x00];
+                v.extend_from_slice(&cfg);
+                let mut af = MediaFrame::new_audio(1, CodecId::AAC, 0, 0, 0, Bytes::from(v));
+                af.config_frame = true;
+                let _ = self.source.publish_and_cache(af).await;
+                self.audio_config_sent = true;
+            }
+        }
+
+        // AAC-LC encodes 1024 samples per frame; derive the per-frame duration
+        // in milliseconds so each access unit gets a distinct, monotonic
+        // timestamp (an RTP packet may carry several AUs).
+        let frame_ms = (1024u64 * 1000).div_ceil(self.audio_sample_rate as u64);
+        let mut ms = (ts as u64 * 1000 / self.audio_sample_rate as u64) as u32;
+        for size in sizes {
+            if pos + size > data.len() {
+                break;
+            }
+            let raw = data[pos..pos + size].to_vec();
+            pos += size;
+            let mut v = Vec::with_capacity(2 + raw.len());
+            v.push(0xAF);
+            v.push(0x01);
+            v.extend_from_slice(&raw);
+            let f =
+                MediaFrame::new_audio(1, CodecId::AAC, ms, ms as u64, ms as u64, Bytes::from(v));
+            let _ = self.source.publish_and_cache(f).await;
+            ms = ms.saturating_add(frame_ms as u32);
+        }
+    }
+}
+
+// === SDP parsing & AVCC builders ===
+
+struct SdpInfo {
+    video_pt: u8,
+    audio_pt: u8,
+    video_codec: CodecId,
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+    vps: Option<Vec<u8>>,
+    audio_config: Option<Vec<u8>>,
+    audio_sample_rate: u32,
+}
+
+fn parse_sdp(body: &[u8]) -> SdpInfo {
+    let mut info = SdpInfo {
+        video_pt: 96,
+        audio_pt: 97,
+        video_codec: CodecId::H264,
+        sps: None,
+        pps: None,
+        vps: None,
+        audio_config: None,
+        audio_sample_rate: 44100,
+    };
+    let text = String::from_utf8_lossy(body);
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("m=") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 4 {
+                if let Ok(pt) = parts[3].parse::<u8>() {
+                    match parts[0] {
+                        "video" => info.video_pt = pt,
+                        "audio" => info.audio_pt = pt,
+                        _ => {}
+                    }
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Ok(pt) = parts[0].parse::<u8>() {
+                    let codec = parts[1].to_lowercase();
+                    if codec.contains("h265") || codec.contains("hevc") {
+                        if pt == info.video_pt {
+                            info.video_codec = CodecId::H265;
+                        }
+                    } else if codec.contains("mpeg4-generic") || codec.contains("aac") {
+                        if pt == info.audio_pt {
+                            if let Some(rate) =
+                                codec.split('/').nth(1).and_then(|r| r.parse::<u32>().ok())
+                            {
+                                info.audio_sample_rate = rate;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("a=fmtp:") {
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                if let Ok(pt) = parts[0].parse::<u8>() {
+                    let params = parts[1];
+                    if pt == info.video_pt {
+                        if info.video_codec == CodecId::H265 {
+                            // HEVC (RFC 7798) advertises parameter sets individually.
+                            if let Some(v) = extract_param(params, "sprop-vps") {
+                                info.vps = base64_decode(&v);
+                            }
+                            if let Some(s) = extract_param(params, "sprop-sps") {
+                                info.sps = base64_decode(&s);
+                            }
+                            if let Some(p) = extract_param(params, "sprop-pps") {
+                                info.pps = base64_decode(&p);
+                            }
+                        } else if let Some(sp) = extract_param(params, "sprop-parameter-sets") {
+                            let mut iter = sp.split(',');
+                            info.sps = iter.next().and_then(base64_decode);
+                            info.pps = iter.next().and_then(base64_decode);
+                        }
+                    } else if pt == info.audio_pt {
+                        if let Some(cfg) = extract_param(params, "config") {
+                            info.audio_config = hex_decode(&cfg);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    info
+}
+
+fn extract_param(params: &str, key: &str) -> Option<String> {
+    for kv in params.split(';') {
+        let kv = kv.trim();
+        if let Some(rest) = kv.strip_prefix(&format!("{}=", key)) {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    BASE64.decode(s.trim()).ok()
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i < s.len() {
+        let byte = u8::from_str_radix(&s[i..i + 2], 16).ok()?;
+        out.push(byte);
+        i += 2;
+    }
+    Some(out)
+}
+
+fn build_avcc_config(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(0x17); // key frame + H264
+    out.push(0x00); // AVC decoder config record
+    out.extend_from_slice(&[0, 0, 0]);
+    let profile = sps.get(1).copied().unwrap_or(0x42);
+    let compat = sps.get(2).copied().unwrap_or(0x00);
+    let level = sps.get(3).copied().unwrap_or(0x1E);
+    out.push(0x01); // configurationVersion
+    out.push(profile);
+    out.push(compat);
+    out.push(level);
+    out.push(0xFF); // lengthSizeMinusOne = 3
+    out.push(0xE1); // numSPS = 1
+    out.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    out.extend_from_slice(sps);
+    out.push(0x01); // numPPS
+    out.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+    out.extend_from_slice(pps);
+    out
+}
+
+fn build_avcc_frame(nalus: &[Vec<u8>], key: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(if key { 0x17 } else { 0x27 });
+    out.push(0x01); // AVC NALU
+    out.extend_from_slice(&[0, 0, 0]);
+    for n in nalus {
+        out.extend_from_slice(&(n.len() as u32).to_be_bytes());
+        out.extend_from_slice(n);
+    }
+    out
+}
+
+/// Builds the body of an FLV HEVC `video tag` configuration record (the part
+/// that follows the 5-byte tag header: frame-type/codec byte, packet-type byte
+/// and 3-byte composition time). The fixed 21-byte `HEVCDecoderConfigurationRecord`
+/// header is followed by the VPS/SPS/PPS arrays (2-byte NALU lengths), matching
+/// the layout `extract_hevc_config`/`extract_hevc_nalus` expect downstream.
+fn build_hevc_config_record(vps: &[u8], sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(0x01); // configurationVersion
+    if sps.len() >= 8 {
+        out.push(sps[2]); // profile_space | tier | profile_idc
+        out.extend_from_slice(&sps[3..7]); // profile_compatibility_flags (4)
+        out.extend_from_slice(&[0u8; 6]); // general_constraint_indicator_flags (6)
+        out.push(sps[7]); // level_idc
+    } else {
+        out.push(0x20);
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&[0u8; 6]);
+        out.push(0x5D);
+    }
+    out.extend_from_slice(&[0, 0]); // min_spatial_segmentation_idc
+    out.push(0); // parallelismType
+    out.push(1); // chromaFormat (4:2:0)
+    out.push(0); // bitDepthLumaMinus8
+    out.push(0); // bitDepthChromaMinus8
+    out.extend_from_slice(&[0, 0]); // avgFrameRate (2 bytes)
+    out.push(0x0F); // numTemporalLayers=1, lengthSizeMinusOne=3, temporalIdNested=1
+    out.push(0x03); // numOfArrays = 3
+
+    for (nal_type, nalu) in [(32u8, vps), (33, sps), (34, pps)] {
+        out.push(nal_type);
+        out.extend_from_slice(&[0, 1]); // numNalus = 1
+        out.extend_from_slice(&(nalu.len() as u16).to_be_bytes());
+        out.extend_from_slice(nalu);
+    }
+    out
+}
+
+/// Parses the FLV HEVC configuration record carried in a video frame body and
+/// returns the raw VPS/SPS/PPS NALUs (without start codes), if present.
+fn extract_hevc_nalus(data: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) {
+    if data.len() < 28 {
+        return (None, None, None);
+    }
+    // numOfArrays lives at offset 27: 5-byte FLV header + 22-byte fixed
+    // HEVCDecoderConfigurationRecord header (avgFrameRate is 2 bytes).
+    let mut pos = 27;
+    let num_arrays = data[pos] as usize;
+    pos += 1;
+    let mut vps = None;
+    let mut sps = None;
+    let mut pps = None;
+    for _ in 0..num_arrays {
+        if pos + 3 > data.len() {
+            break;
+        }
+        let nal_type = data[pos] & 0x3F;
+        let num_nalus = u16::from_be_bytes([data[pos + 1], data[pos + 2]]) as usize;
+        pos += 3;
+        for _ in 0..num_nalus {
+            if pos + 2 > data.len() {
+                break;
+            }
+            let nalu_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            if pos + nalu_len > data.len() {
+                break;
+            }
+            let nalu = data[pos..pos + nalu_len].to_vec();
+            pos += nalu_len;
+            match nal_type {
+                32 => vps = Some(nalu),
+                33 => sps = Some(nalu),
+                34 => pps = Some(nalu),
+                _ => {}
+            }
+        }
+    }
+    (vps, sps, pps)
+}
+
+/// Reads the cached HEVC configuration frame from a published source and
+/// returns base64-encoded (vps, sps, pps) for the SDP `sprop-*` parameters.
+async fn extract_hevc_sprop_from_source(
+    source: &Arc<MediaSource>,
+) -> Option<(String, String, String)> {
+    let config_frames = source.get_cached_config_frames().await;
+    for f in &config_frames {
+        if f.codec == CodecId::H265 {
+            if let (Some(v), Some(s), Some(p)) = extract_hevc_nalus(&f.data) {
+                return Some((BASE64.encode(v), BASE64.encode(s), BASE64.encode(p)));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    /// Builds a minimal FLV HEVC video tag body carrying an
+    /// HEVCDecoderConfigurationRecord with one VPS (32), SPS (33) and PPS (34).
+    fn make_hevc_config_data() -> Vec<u8> {
+        let mut d = vec![
+            0x1C, 0x00, 0x00, 0x00, 0x00, // frame type/codec(12) + packet type 0 + ctime
+            0x01, // configurationVersion
+            0x20, // profile_space/tier/profile_idc
+            0x00, 0x00, 0x00, 0x00, // general_profile_compatibility_flags
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // general_constraint_indicator_flags
+            0x5D, // general_level_idc
+            0x00, 0x00, // min_spatial_segmentation_idc
+            0x00, // parallelismType
+            0x01, // chromaFormat
+            0x00, // bitDepthLumaMinus8
+            0x00, // bitDepthChromaMinus8
+            0x00, 0x00, // avgFrameRate (2 bytes)
+            0x03, // lengthSizeMinusOne = 1, temporalIdNested = 1
+            0x03, // numOfArrays = 3
+        ];
+        d.extend_from_slice(&[32, 0, 1, 0, 2, 0xAA, 0xBB]); // VPS
+        d.extend_from_slice(&[33, 0, 1, 0, 2, 0xCC, 0xDD]); // SPS
+        d.extend_from_slice(&[34, 0, 1, 0, 2, 0xEE, 0xFF]); // PPS
+        d
+    }
+
+    #[test]
+    fn hevc_config_nalus_parsed() {
+        let d = make_hevc_config_data();
+        let (vps, sps, pps) = extract_hevc_nalus(&d);
+        assert_eq!(vps, Some(vec![0xAA, 0xBB]));
+        assert_eq!(sps, Some(vec![0xCC, 0xDD]));
+        assert_eq!(pps, Some(vec![0xEE, 0xFF]));
+    }
+
+    #[test]
+    fn hevc_packetize_config_emits_three_nalus() {
+        let frame = MediaFrame::new_video(
+            0,
+            CodecId::H265,
+            0,
+            0,
+            0,
+            Bytes::from(make_hevc_config_data()),
+            false,
+        );
+        let mut seq = 1u16;
+        let pkts = RtspSession::packetize_hevc(&frame, 0, 0x1234, &mut seq);
+        assert_eq!(pkts.len(), 3);
+        // Each packet: 12-byte RTP header + NALU payload.
+        assert_eq!(&pkts[0][12..], &[0xAA, 0xBB]);
+        assert_eq!(&pkts[1][12..], &[0xCC, 0xDD]);
+        assert_eq!(&pkts[2][12..], &[0xEE, 0xFF]);
+        // Payload type 96, marker bit set on parameter-set packets.
+        assert_eq!(pkts[0][1] & 0x7F, 96);
+        assert!((pkts[0][1] & 0x80) != 0);
+    }
+
+    #[test]
+    fn hevc_packetize_single_nalu() {
+        // packet type 1 with one 4-byte NALU (0x40 0x01 0x02 0x03).
+        let mut d = vec![0x1C, 0x01, 0x00, 0x00, 0x00, 0, 0, 0, 4];
+        d.extend_from_slice(&[0x40, 0x01, 0x02, 0x03]);
+        let frame = MediaFrame::new_video(0, CodecId::H265, 0, 0, 0, Bytes::from(d), true);
+        let mut seq = 1u16;
+        let pkts = RtspSession::packetize_hevc(&frame, 0, 0x1234, &mut seq);
+        assert_eq!(pkts.len(), 1);
+        assert_eq!(&pkts[0][12..], &[0x40, 0x01, 0x02, 0x03]);
+        assert!((pkts[0][1] & 0x80) != 0); // marker set for single NALU
+    }
+
+    #[test]
+    fn parse_sdp_detects_hevc_and_sprops() {
+        let vps = BASE64.encode([0x40u8, 0x01, 0x0C]);
+        let sps = BASE64.encode([0x42u8, 0x01, 0x01]);
+        let pps = BASE64.encode([0x44u8, 0x01, 0x02]);
+        let body = format!(
+            "v=0\r\n\
+             m=video 0 RTP/AVP 96\r\n\
+             a=rtpmap:96 H265/90000\r\n\
+             a=fmtp:96 sprop-vps={};sprop-sps={};sprop-pps={}\r\n",
+            vps, sps, pps
+        );
+        let sdp = parse_sdp(body.as_bytes());
+        assert_eq!(sdp.video_codec, CodecId::H265);
+        assert_eq!(sdp.vps, Some(vec![0x40, 0x01, 0x0C]));
+        assert_eq!(sdp.sps, Some(vec![0x42, 0x01, 0x01]));
+        assert_eq!(sdp.pps, Some(vec![0x44, 0x01, 0x02]));
+    }
+
+    #[test]
+    fn parse_sdp_keeps_h264_default() {
+        let body = "v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n";
+        let sdp = parse_sdp(body.as_bytes());
+        assert_eq!(sdp.video_codec, CodecId::H264);
+        assert!(sdp.vps.is_none());
+    }
+
+    #[test]
+    fn hevc_config_record_roundtrip() {
+        let vps = vec![0x40u8, 0x01, 0x0C, 0x00];
+        let sps = vec![0x42u8, 0x01, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let pps = vec![0x44u8, 0x01, 0x02];
+        let record = build_hevc_config_record(&vps, &sps, &pps);
+        // Prepend the 5-byte FLV tag header that emit_video_frame adds so we can
+        // verify it round-trips through the same extract_hevc_nalus the HLS/RTSP
+        // players use (numOfArrays sits at offset 27 = 5-byte header + 22-byte
+        // fixed record header).
+        let mut data = vec![0x1C, 0x00, 0, 0, 0];
+        data.extend_from_slice(&record);
+        assert_eq!(data[27], 0x03);
+        let (rv, rs, rp) = extract_hevc_nalus(&data);
+        assert_eq!(rv, Some(vps.clone()));
+        assert_eq!(rs, Some(sps.clone()));
+        assert_eq!(rp, Some(pps.clone()));
     }
 }

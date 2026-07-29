@@ -24,6 +24,9 @@ pub struct ServerConfig {
     pub secret: String,
 
     #[serde(default)]
+    pub auth_enabled: bool,
+
+    #[serde(default)]
     pub general: GeneralConfig,
 
     #[serde(default)]
@@ -85,6 +88,8 @@ pub struct HttpConfig {
 pub struct RecordConfig {
     #[serde(default)]
     pub app: String,
+    #[serde(default = "default_record_path")]
+    pub path: String,
     #[serde(default)]
     pub hls: bool,
     #[serde(default)]
@@ -114,6 +119,10 @@ fn default_vhost() -> String {
 fn default_secret() -> String {
     "035c73f7-bb6b-4889-a715-d9eb2d1925cc".to_string()
 }
+
+fn default_auth_enabled() -> bool {
+    false
+}
 fn default_flow_threshold() -> i64 {
     1024
 }
@@ -122,6 +131,10 @@ fn default_stream_none_reader_delay() -> u64 {
 }
 fn default_true() -> bool {
     true
+}
+
+fn default_record_path() -> String {
+    "./record".to_string()
 }
 
 impl Default for GeneralConfig {
@@ -169,6 +182,7 @@ impl Default for RecordConfig {
     fn default() -> Self {
         Self {
             app: "record".to_string(),
+            path: default_record_path(),
             hls: false,
             mp4: false,
             flv: false,
@@ -186,6 +200,7 @@ impl Default for ServerConfig {
             rtp_port: default_rtp_port(),
             default_vhost: default_vhost(),
             secret: default_secret(),
+            auth_enabled: default_auth_enabled(),
             general: GeneralConfig::default(),
             rtmp: RtmpConfig::default(),
             rtsp: RtspConfig::default(),

@@ -1,0 +1,28 @@
+# Test config with FLV recording enabled
+[general]
+flow_threshold = 1024
+stream_none_reader_delay = 10
+
+[rtmp]
+enabled = true
+port = 1935
+ssl = false
+
+[rtsp]
+enabled = true
+port = 8554
+ssl = false
+tcp_mode = true
+
+[http]
+enabled = true
+port = 8080
+ssl = false
+dir_root = true
+
+[record]
+app = "record"
+path = "./record"
+hls = true
+mp4 = false
+flv = true

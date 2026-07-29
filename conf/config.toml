@@ -1,5 +1,12 @@
 # ZLMediaKit-RS Configuration File
 
+# API/stream token auth. When enabled, publish/play requests must carry a
+# `?sign=` query parameter. sign = sha256(secret | vhost | app | stream | action)
+# where action is "pub" (publish) or "play". The secret below is also used by
+# the management API. Default secret is generated if omitted.
+auth_enabled = false
+secret = "035c73f7-bb6b-4889-a715-d9eb2d1925cc"
+
 # General settings
 [general]
 flow_threshold = 1024

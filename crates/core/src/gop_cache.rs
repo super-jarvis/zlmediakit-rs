@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
 use crate::media_frame::{FrameType, MediaFrame};
+use std::collections::VecDeque;
 use tracing::debug;
 
 #[derive(Clone, Debug)]
@@ -36,17 +36,23 @@ impl GopCache {
 
     pub fn cache_frame(&mut self, frame: &MediaFrame) {
         if frame.frame_type == FrameType::Metadata {
-            self.metadata = Some(vec![CachedFrame { frame: frame.clone() }]);
+            self.metadata = Some(vec![CachedFrame {
+                frame: frame.clone(),
+            }]);
             return;
         }
 
         if frame.frame_type == FrameType::Video && is_config_frame(frame) {
-            self.video_config = Some(CachedFrame { frame: frame.clone() });
+            self.video_config = Some(CachedFrame {
+                frame: frame.clone(),
+            });
             return;
         }
 
         if frame.frame_type == FrameType::Audio && is_config_frame(frame) {
-            self.audio_config = Some(CachedFrame { frame: frame.clone() });
+            self.audio_config = Some(CachedFrame {
+                frame: frame.clone(),
+            });
             return;
         }
 
@@ -56,7 +62,9 @@ impl GopCache {
             }
         }
 
-        self.frames.push_back(CachedFrame { frame: frame.clone() });
+        self.frames.push_back(CachedFrame {
+            frame: frame.clone(),
+        });
     }
 
     pub fn get_all_frames(&self) -> Vec<MediaFrame> {

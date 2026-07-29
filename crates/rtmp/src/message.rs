@@ -19,10 +19,26 @@ pub enum RtmpMessage {
     UserControl(u16, Vec<u8>),
     WindowAckSize(u32),
     SetPeerBandwidth(u32, u8),
-    Audio { stream_id: u32, timestamp: u32, data: Bytes },
-    Video { stream_id: u32, timestamp: u32, data: Bytes },
-    Amf0Data { stream_id: u32, timestamp: u32, data: Bytes },
-    Amf0Command { stream_id: u32, timestamp: u32, data: Bytes },
+    Audio {
+        stream_id: u32,
+        timestamp: u32,
+        data: Bytes,
+    },
+    Video {
+        stream_id: u32,
+        timestamp: u32,
+        data: Bytes,
+    },
+    Amf0Data {
+        stream_id: u32,
+        timestamp: u32,
+        data: Bytes,
+    },
+    Amf0Command {
+        stream_id: u32,
+        timestamp: u32,
+        data: Bytes,
+    },
 }
 
 impl RtmpMessage {
@@ -166,11 +182,15 @@ impl RtmpMessageParser {
 
         let (csid, basic_header_len) = match csid_raw {
             0 => {
-                if self.buffer.len() < 2 { return Ok(None); }
+                if self.buffer.len() < 2 {
+                    return Ok(None);
+                }
                 (self.buffer[1] as u32 + 64, 2)
             }
             1 => {
-                if self.buffer.len() < 3 { return Ok(None); }
+                if self.buffer.len() < 3 {
+                    return Ok(None);
+                }
                 let low = self.buffer[1] as u32;
                 let high = self.buffer[2] as u32;
                 (64 + low + high * 256, 3)
@@ -204,7 +224,11 @@ impl RtmpMessageParser {
                 msg_length: p.msg_length,
                 msg_type_id: p.msg_type_id,
                 msg_stream_id: p.msg_stream_id,
-                buffer: if fmt == 0 { BytesMut::new() } else { p.buffer.clone() },
+                buffer: if fmt == 0 {
+                    BytesMut::new()
+                } else {
+                    p.buffer.clone()
+                },
             }
         } else {
             ChunkState {
@@ -232,11 +256,14 @@ impl RtmpMessageParser {
                 ]);
                 state.msg_type_id = self.buffer[pos + 6];
                 state.msg_length = u32::from_be_bytes([
-                    0, self.buffer[pos + 3],
-                    self.buffer[pos + 4], self.buffer[pos + 5],
+                    0,
+                    self.buffer[pos + 3],
+                    self.buffer[pos + 4],
+                    self.buffer[pos + 5],
                 ]);
                 state.ts_field = u32::from_be_bytes([
-                    0, self.buffer[pos],
+                    0,
+                    self.buffer[pos],
                     self.buffer[pos + 1],
                     self.buffer[pos + 2],
                 ]);
@@ -244,18 +271,22 @@ impl RtmpMessageParser {
             1 => {
                 state.msg_type_id = self.buffer[pos + 6];
                 state.msg_length = u32::from_be_bytes([
-                    0, self.buffer[pos + 3],
-                    self.buffer[pos + 4], self.buffer[pos + 5],
+                    0,
+                    self.buffer[pos + 3],
+                    self.buffer[pos + 4],
+                    self.buffer[pos + 5],
                 ]);
                 state.ts_field = u32::from_be_bytes([
-                    0, self.buffer[pos],
+                    0,
+                    self.buffer[pos],
                     self.buffer[pos + 1],
                     self.buffer[pos + 2],
                 ]);
             }
             2 => {
                 state.ts_field = u32::from_be_bytes([
-                    0, self.buffer[pos],
+                    0,
+                    self.buffer[pos],
                     self.buffer[pos + 1],
                     self.buffer[pos + 2],
                 ]);
@@ -267,16 +298,22 @@ impl RtmpMessageParser {
 
         // Step 3: Extended timestamp
         if state.ts_field == 0xFFFFFF {
-            if self.buffer.len() < pos + 4 { return Ok(None); }
+            if self.buffer.len() < pos + 4 {
+                return Ok(None);
+            }
             state.ts_field = u32::from_be_bytes([
-                self.buffer[pos], self.buffer[pos + 1],
-                self.buffer[pos + 2], self.buffer[pos + 3],
+                self.buffer[pos],
+                self.buffer[pos + 1],
+                self.buffer[pos + 2],
+                self.buffer[pos + 3],
             ]);
             state.has_extended_ts = true;
             pos += 4;
         } else if fmt == 3 && state.has_extended_ts {
             // fmt=3 continuation for a message that had extended ts
-            if self.buffer.len() < pos + 4 { return Ok(None); }
+            if self.buffer.len() < pos + 4 {
+                return Ok(None);
+            }
             pos += 4; // skip the repeated extended ts value
         }
 
@@ -289,7 +326,9 @@ impl RtmpMessageParser {
             return Ok(None);
         }
 
-        state.buffer.extend_from_slice(&self.buffer[pos..pos + available]);
+        state
+            .buffer
+            .extend_from_slice(&self.buffer[pos..pos + available]);
         pos += available;
         self.buffer.advance(pos);
 
@@ -316,7 +355,13 @@ impl RtmpMessageParser {
             self.chunk_states.insert(csid, saved);
 
             let payload = state.buffer.freeze();
-            Ok(Some(self.make_message(ts, state.msg_length, state.msg_type_id, state.msg_stream_id, payload)))
+            Ok(Some(self.make_message(
+                ts,
+                state.msg_length,
+                state.msg_type_id,
+                state.msg_stream_id,
+                payload,
+            )))
         } else {
             let saved = ChunkState {
                 is_abs_timestamp: state.is_abs_timestamp,
@@ -333,56 +378,97 @@ impl RtmpMessageParser {
         }
     }
 
-    fn make_message(&self, timestamp: u32, _msg_length: u32, msg_type_id: u8, msg_stream_id: u32, payload: Bytes) -> RtmpMessage {
+    fn make_message(
+        &self,
+        timestamp: u32,
+        _msg_length: u32,
+        msg_type_id: u8,
+        msg_stream_id: u32,
+        payload: Bytes,
+    ) -> RtmpMessage {
         match msg_type_id {
             MSG_SET_CHUNK_SIZE => {
                 let size = if payload.len() >= 4 {
                     u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
-                } else { 128 };
+                } else {
+                    128
+                };
                 RtmpMessage::SetChunkSize(size)
             }
             MSG_ABORT => {
                 let sid = if payload.len() >= 4 {
                     u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
-                } else { 0 };
+                } else {
+                    0
+                };
                 RtmpMessage::Abort(sid)
             }
             MSG_ACK => {
                 let seq = if payload.len() >= 4 {
                     u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
-                } else { 0 };
+                } else {
+                    0
+                };
                 RtmpMessage::Ack(seq)
             }
             MSG_USER_CONTROL => {
                 let event_type = if payload.len() >= 2 {
                     u16::from_be_bytes([payload[0], payload[1]])
-                } else { 0 };
+                } else {
+                    0
+                };
                 RtmpMessage::UserControl(event_type, payload.slice(2..).to_vec())
             }
             MSG_WINDOW_ACK_SIZE => {
                 let size = if payload.len() >= 4 {
                     u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
-                } else { 2500000 };
+                } else {
+                    2500000
+                };
                 RtmpMessage::WindowAckSize(size)
             }
             MSG_SET_PEER_BW => {
                 let size = if payload.len() >= 4 {
                     u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
-                } else { 2500000 };
+                } else {
+                    2500000
+                };
                 let limit_type = if payload.len() >= 5 { payload[4] } else { 2 };
                 RtmpMessage::SetPeerBandwidth(size, limit_type)
             }
-            MSG_AUDIO => RtmpMessage::Audio { stream_id: msg_stream_id, timestamp, data: payload },
-            MSG_VIDEO => RtmpMessage::Video { stream_id: msg_stream_id, timestamp, data: payload },
-            MSG_AMF0_DATA => RtmpMessage::Amf0Data { stream_id: msg_stream_id, timestamp, data: payload },
-            MSG_AMF0_COMMAND => RtmpMessage::Amf0Command { stream_id: msg_stream_id, timestamp, data: payload },
-            _ => RtmpMessage::Amf0Data { stream_id: msg_stream_id, timestamp, data: payload },
+            MSG_AUDIO => RtmpMessage::Audio {
+                stream_id: msg_stream_id,
+                timestamp,
+                data: payload,
+            },
+            MSG_VIDEO => RtmpMessage::Video {
+                stream_id: msg_stream_id,
+                timestamp,
+                data: payload,
+            },
+            MSG_AMF0_DATA => RtmpMessage::Amf0Data {
+                stream_id: msg_stream_id,
+                timestamp,
+                data: payload,
+            },
+            MSG_AMF0_COMMAND => RtmpMessage::Amf0Command {
+                stream_id: msg_stream_id,
+                timestamp,
+                data: payload,
+            },
+            _ => RtmpMessage::Amf0Data {
+                stream_id: msg_stream_id,
+                timestamp,
+                data: payload,
+            },
         }
     }
 }
 
 impl Default for RtmpMessageParser {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone)]
@@ -391,9 +477,13 @@ pub struct RtmpMessageEncoder {
 }
 
 impl RtmpMessageEncoder {
-    pub fn new() -> Self { Self { chunk_size: 128 } }
+    pub fn new() -> Self {
+        Self { chunk_size: 128 }
+    }
 
-    pub fn set_chunk_size(&mut self, size: usize) { self.chunk_size = size; }
+    pub fn set_chunk_size(&mut self, size: usize) {
+        self.chunk_size = size;
+    }
 
     pub fn encode(&self, msg: &RtmpMessage) -> BytesMut {
         let mut buf = BytesMut::new();
@@ -413,7 +503,11 @@ impl RtmpMessageEncoder {
         let basic_header = encode_basic_header(0, csid);
         buf.extend_from_slice(&basic_header);
 
-        let ts_field = if timestamp >= 0xFFFFFF { 0xFFFFFF } else { timestamp };
+        let ts_field = if timestamp >= 0xFFFFFF {
+            0xFFFFFF
+        } else {
+            timestamp
+        };
         buf.put_u8(((ts_field >> 16) & 0xFF) as u8);
         buf.put_u8(((ts_field >> 8) & 0xFF) as u8);
         buf.put_u8((ts_field & 0xFF) as u8);
@@ -461,5 +555,7 @@ pub fn encode_basic_header(fmt: u8, csid: u32) -> BytesMut {
 }
 
 impl Default for RtmpMessageEncoder {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

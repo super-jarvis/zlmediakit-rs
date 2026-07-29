@@ -7,9 +7,15 @@ use tokio::sync::broadcast;
 pub enum Event {
     StreamPublish {
         source_id: SourceId,
+        vhost: String,
+        app: String,
+        stream: String,
     },
     StreamUnPublish {
         source_id: SourceId,
+        vhost: String,
+        app: String,
+        stream: String,
     },
     StreamPlay {
         source_id: SourceId,

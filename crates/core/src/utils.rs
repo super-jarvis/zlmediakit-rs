@@ -1,21 +1,22 @@
 use crate::media_frame::CodecId;
 
 pub fn parse_url(url: &str) -> Option<(String, String, String)> {
-    let url = url.trim_start_matches("rtmp://")
+    let url = url
+        .trim_start_matches("rtmp://")
         .trim_start_matches("rtsp://")
         .trim_start_matches("http://")
         .trim_start_matches("https://");
-    
+
     let parts: Vec<&str> = url.splitn(2, '/').collect();
     if parts.len() < 2 {
         return None;
     }
-    
+
     let path_parts: Vec<&str> = parts[1].splitn(2, '/').collect();
     if path_parts.len() < 2 {
         return None;
     }
-    
+
     Some((
         "__defaultVhost__".to_string(),
         path_parts[0].to_string(),
