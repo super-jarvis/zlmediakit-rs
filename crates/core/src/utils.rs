@@ -49,11 +49,11 @@ pub fn codec_id_to_rtsp_codec_name(codec: CodecId) -> &'static str {
 }
 
 pub fn random_string(len: usize) -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
+    use rand::RngExt;
+    let mut rng = rand::rng();
     (0..len)
         .map(|_| {
-            let idx = rng.gen_range(0..36);
+            let idx = rng.random_range(0..36);
             if idx < 10 {
                 (b'0' + idx) as char
             } else {

@@ -1,4 +1,5 @@
 use bytes::{BufMut, BytesMut};
+use rand::RngExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::debug;
 
@@ -35,13 +36,7 @@ impl RtmpHandshake {
         s0s1.put_u32(s1_time);
         s0s1.put_u32(s1_version);
         let mut random = vec![0u8; 1528];
-        {
-            use rand::Rng;
-            let mut rng = rand::thread_rng();
-            for b in &mut random {
-                *b = rng.gen();
-            }
-        }
+        rand::rng().fill(&mut random);
         s0s1.extend_from_slice(&random);
         stream.write_all(&s0s1).await?;
 

@@ -18,6 +18,7 @@ use zlmediakit_http::HttpServer;
 use zlmediakit_rtmp::RtmpServer;
 use zlmediakit_rtsp::rtsp_pull_start;
 use zlmediakit_rtsp::RtspServer;
+use zlmediakit_webrtc::WebRtcServer;
 
 #[derive(Parser, Debug)]
 #[command(name = "zlmediakit")]
@@ -40,6 +41,9 @@ struct Cli {
 
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    #[arg(long)]
+    webrtc_port: Option<u16>,
 }
 
 #[tokio::main]
@@ -90,6 +94,9 @@ async fn main() -> Result<()> {
     }
     if let Some(port) = cli.api_port {
         config.api_port = port;
+    }
+    if let Some(port) = cli.webrtc_port {
+        config.webrtc_port = port;
     }
 
     let source_manager = Arc::new(MediaSourceManager::new());
@@ -184,6 +191,25 @@ async fn main() -> Result<()> {
                     }
                 }
                 Err(e) => error!("Failed to start API server: {}", e),
+            }
+        });
+        handles.push(handle);
+    }
+
+    // WebRTC (WHEP) playback server: lets a browser play a published stream
+    // over WebRTC. It binds its own HTTP listener (WHEP is HTTP-based) so the
+    // `http` protocol crate stays decoupled from the `webrtc` crate.
+    if config.webrtc.enabled {
+        let addr = format!("0.0.0.0:{}", config.webrtc_port);
+        let sm = source_manager.clone();
+        let handle = tokio::spawn(async move {
+            match WebRtcServer::new(&addr, sm).await {
+                Ok(server) => {
+                    if let Err(e) = server.run().await {
+                        error!("WebRTC server error: {}", e);
+                    }
+                }
+                Err(e) => error!("Failed to start WebRTC server: {}", e),
             }
         });
         handles.push(handle);

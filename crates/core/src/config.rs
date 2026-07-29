@@ -40,6 +40,12 @@ pub struct ServerConfig {
 
     #[serde(default)]
     pub record: RecordConfig,
+
+    #[serde(default)]
+    pub webrtc: WebRtcConfig,
+
+    #[serde(default = "default_webrtc_port")]
+    pub webrtc_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +91,14 @@ pub struct HttpConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebRtcConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordConfig {
     #[serde(default)]
     pub app: String,
@@ -112,6 +126,9 @@ fn default_api_port() -> u16 {
 }
 fn default_rtp_port() -> u16 {
     8000
+}
+fn default_webrtc_port() -> u16 {
+    9000
 }
 fn default_vhost() -> String {
     "__defaultVhost__".to_string()
@@ -190,6 +207,15 @@ impl Default for RecordConfig {
     }
 }
 
+impl Default for WebRtcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: None,
+        }
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -206,6 +232,8 @@ impl Default for ServerConfig {
             rtsp: RtspConfig::default(),
             http: HttpConfig::default(),
             record: RecordConfig::default(),
+            webrtc: WebRtcConfig::default(),
+            webrtc_port: default_webrtc_port(),
         }
     }
 }

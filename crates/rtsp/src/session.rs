@@ -2,6 +2,7 @@ use super::parser::{RtspParser, RtspRequest, RtspResponse};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use rand::RngExt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -56,7 +57,7 @@ impl RtspSession {
         event_bus: Arc<EventBus>,
         auth: Arc<StreamAuth>,
     ) -> Self {
-        let session_id = format!("{:08x}", rand::random::<u32>());
+        let session_id = format!("{:08x}", rand::rng().random::<u32>());
         let client_ip = peer_addr
             .split(':')
             .next()
@@ -378,7 +379,7 @@ impl RtspSession {
                 let handle = tokio::spawn(async move {
                     let mut writer = stream;
                     let mut seq: u16 = 1;
-                    let ssrc: u32 = rand::random();
+                    let ssrc: u32 = rand::rng().random();
                     debug!(
                         "RTSP play send task started (tcp interleaved), cached={}",
                         cached.len()
@@ -413,8 +414,8 @@ impl RtspSession {
                 tokio::spawn(async move {
                     let mut video_seq: u16 = 1;
                     let mut audio_seq: u16 = 1;
-                    let video_ssrc: u32 = rand::random();
-                    let audio_ssrc: u32 = rand::random();
+                    let video_ssrc: u32 = rand::rng().random();
+                    let audio_ssrc: u32 = rand::rng().random();
 
                     for frame in &cached {
                         match frame.frame_type {
