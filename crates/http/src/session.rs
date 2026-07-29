@@ -168,17 +168,12 @@ impl HttpSession {
 
                 let mut rx = source.subscribe();
 
-                loop {
-                    match rx.recv().await {
-                        Ok(frame) => {
-                            if zlmediakit_core::gop_cache::is_config_frame(&frame) {
-                                continue;
-                            }
-                            let tag = muxer.write_tag(&frame);
-                            self.stream.write_all(&tag).await?;
-                        }
-                        Err(_) => break,
+                while let Ok(frame) = rx.recv().await {
+                    if zlmediakit_core::gop_cache::is_config_frame(&frame) {
+                        continue;
                     }
+                    let tag = muxer.write_tag(&frame);
+                    self.stream.write_all(&tag).await?;
                 }
             }
             None => {
@@ -625,19 +620,25 @@ impl HttpSession {
         (vhost, app, stream)
     }
 
-    /// Decides which container formats to record from the `type` query param.
-    /// ZLMediaKit uses `type`: `hls`/`flv`/`mp4` (or `all`). Defaults to HLS.
+    /// Decides which container formats to record. Accepts ZLMediaKit's `type`
+    /// param (`hls`/`flv`/`mp4`/`all`) and the boolean flags `hls=1`/`flv=1`/
+    /// `mp4=1`. Defaults to HLS when nothing is requested.
     fn api_record_types(path: &str) -> (bool, bool, bool) {
         let q = Self::parse_query(path);
         let t = q
             .get("type")
             .map(|s| s.as_str())
-            .unwrap_or("hls")
+            .unwrap_or("")
             .to_lowercase();
-        let hls = t == "hls" || t == "all";
-        let flv = t == "flv" || t == "all";
-        let mp4 = t == "mp4" || t == "all";
-        (hls, flv, mp4)
+        let flag = |k: &str| q.get(k).map(|v| v == "1").unwrap_or(false);
+        let hls = t == "hls" || t == "all" || flag("hls");
+        let flv = t == "flv" || t == "all" || flag("flv");
+        let mp4 = t == "mp4" || t == "all" || flag("mp4");
+        if hls || flv || mp4 {
+            (hls, flv, mp4)
+        } else {
+            (true, false, false)
+        }
     }
 
     async fn send_json(&mut self, body: &serde_json::Value) -> anyhow::Result<()> {

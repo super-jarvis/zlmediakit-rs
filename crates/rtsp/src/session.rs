@@ -131,23 +131,21 @@ impl RtspSession {
         loop {
             // During publishing over TCP-interleaved, RTP arrives framed with '$'
             // on the same connection. Demux it before trying to parse RTSP requests.
-            if self.is_publisher && self.tcp_interleaved {
-                if self.buffer.first() == Some(&b'$') {
-                    if self.buffer.len() < 4 {
-                        break;
-                    }
-                    let channel = self.buffer[1];
-                    let len = u16::from_be_bytes([self.buffer[2], self.buffer[3]]) as usize;
-                    if self.buffer.len() < 4 + len {
-                        break;
-                    }
-                    let payload = self.buffer[4..4 + len].to_vec();
-                    self.buffer.advance(4 + len);
-                    if let Some(ref mut depak) = self.depak {
-                        depak.handle_rtp(channel, &payload).await;
-                    }
-                    continue;
+            if self.is_publisher && self.tcp_interleaved && self.buffer.first() == Some(&b'$') {
+                if self.buffer.len() < 4 {
+                    break;
                 }
+                let channel = self.buffer[1];
+                let len = u16::from_be_bytes([self.buffer[2], self.buffer[3]]) as usize;
+                if self.buffer.len() < 4 + len {
+                    break;
+                }
+                let payload = self.buffer[4..4 + len].to_vec();
+                self.buffer.advance(4 + len);
+                if let Some(ref mut depak) = self.depak {
+                    depak.handle_rtp(channel, &payload).await;
+                }
+                continue;
             }
             if let Some((request, consumed)) = RtspParser::parse_request(&self.buffer) {
                 self.buffer.advance(consumed);
@@ -404,19 +402,9 @@ impl RtspSession {
                             Self::send_interleaved_frame(&mut writer, frame, &mut seq, ssrc).await;
                     }
 
-                    loop {
-                        match rx.recv().await {
-                            Ok(frame) => {
-                                let _ = Self::send_interleaved_frame(
-                                    &mut writer,
-                                    &frame,
-                                    &mut seq,
-                                    ssrc,
-                                )
-                                .await;
-                            }
-                            Err(_) => break,
-                        }
+                    while let Ok(frame) = rx.recv().await {
+                        let _ =
+                            Self::send_interleaved_frame(&mut writer, &frame, &mut seq, ssrc).await;
                     }
                     debug!("RTSP play send task ended (tcp interleaved)");
                 });
@@ -457,32 +445,29 @@ impl RtspSession {
                         }
                     }
 
-                    loop {
-                        match rx.recv().await {
-                            Ok(frame) => match frame.frame_type {
-                                zlmediakit_core::media_frame::FrameType::Video => {
+                    while let Ok(frame) = rx.recv().await {
+                        match frame.frame_type {
+                            zlmediakit_core::media_frame::FrameType::Video => {
+                                let _ = Self::send_udp_frame(
+                                    &video_sock,
+                                    &frame,
+                                    &mut video_seq,
+                                    video_ssrc,
+                                )
+                                .await;
+                            }
+                            zlmediakit_core::media_frame::FrameType::Audio => {
+                                if let Some(ref sock) = audio_sock {
                                     let _ = Self::send_udp_frame(
-                                        &video_sock,
+                                        sock,
                                         &frame,
-                                        &mut video_seq,
-                                        video_ssrc,
+                                        &mut audio_seq,
+                                        audio_ssrc,
                                     )
                                     .await;
                                 }
-                                zlmediakit_core::media_frame::FrameType::Audio => {
-                                    if let Some(ref sock) = audio_sock {
-                                        let _ = Self::send_udp_frame(
-                                            sock,
-                                            &frame,
-                                            &mut audio_seq,
-                                            audio_ssrc,
-                                        )
-                                        .await;
-                                    }
-                                }
-                                _ => {}
-                            },
-                            Err(_) => break,
+                            }
+                            _ => {}
                         }
                     }
                 });
@@ -614,11 +599,8 @@ impl RtspSession {
                 );
                 tokio::spawn(async move {
                     let mut buf = [0u8; 65536];
-                    loop {
-                        match sock.recv(&mut buf).await {
-                            Ok(n) => depak.handle_rtp(0, &buf[..n]).await,
-                            Err(_) => break,
-                        }
+                    while let Ok(n) = sock.recv(&mut buf).await {
+                        depak.handle_rtp(0, &buf[..n]).await;
                     }
                 });
             }
@@ -639,11 +621,8 @@ impl RtspSession {
                 );
                 tokio::spawn(async move {
                     let mut buf = [0u8; 65536];
-                    loop {
-                        match sock.recv(&mut buf).await {
-                            Ok(n) => depak.handle_rtp(0, &buf[..n]).await,
-                            Err(_) => break,
-                        }
+                    while let Ok(n) = sock.recv(&mut buf).await {
+                        depak.handle_rtp(0, &buf[..n]).await;
                     }
                 });
             }
@@ -687,7 +666,7 @@ impl RtspSession {
             Some((p, q)) => (p, Some(q)),
             None => (stripped, None),
         };
-        let path = path.splitn(2, '/').nth(1).unwrap_or("");
+        let path = path.split_once('/').map(|x| x.1).unwrap_or("");
         let parts: Vec<&str> = path.splitn(2, '/').collect();
         self.app = parts.first().map_or("live", |v| v).to_string();
         self.stream_name = parts.get(1).map_or("stream", |v| v).to_string();
@@ -1390,7 +1369,7 @@ impl RtpDepacketizer {
             32 => self.vps = Some(nalu.to_vec()),
             33 => self.sps = Some(nalu.to_vec()),
             34 => self.pps = Some(nalu.to_vec()),
-            19 | 20 | 21 => self.video_key = true,
+            19..=21 => self.video_key = true,
             _ => {}
         }
     }
@@ -1608,13 +1587,13 @@ pub(crate) fn parse_sdp(body: &[u8]) -> SdpInfo {
                         if pt == info.video_pt {
                             info.video_codec = CodecId::H265;
                         }
-                    } else if codec.contains("mpeg4-generic") || codec.contains("aac") {
-                        if pt == info.audio_pt {
-                            if let Some(rate) =
-                                codec.split('/').nth(1).and_then(|r| r.parse::<u32>().ok())
-                            {
-                                info.audio_sample_rate = rate;
-                            }
+                    } else if (codec.contains("mpeg4-generic") || codec.contains("aac"))
+                        && pt == info.audio_pt
+                    {
+                        if let Some(rate) =
+                            codec.split('/').nth(1).and_then(|r| r.parse::<u32>().ok())
+                        {
+                            info.audio_sample_rate = rate;
                         }
                     }
                 }
@@ -1669,7 +1648,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / 2);
@@ -1755,7 +1734,9 @@ fn build_hevc_config_record(vps: &[u8], sps: &[u8], pps: &[u8]) -> Vec<u8> {
 
 /// Parses the FLV HEVC configuration record carried in a video frame body and
 /// returns the raw VPS/SPS/PPS NALUs (without start codes), if present.
-fn extract_hevc_nalus(data: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) {
+type HevcNalus = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
+
+fn extract_hevc_nalus(data: &[u8]) -> HevcNalus {
     if data.len() < 28 {
         return (None, None, None);
     }

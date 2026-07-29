@@ -16,6 +16,7 @@ use zlmediakit_flv::FlvRecorder;
 use zlmediakit_hls::HlsRecorder;
 use zlmediakit_http::HttpServer;
 use zlmediakit_mp4::recorder::Mp4Recorder;
+use zlmediakit_rtmp::push_client as rtmp_push_client;
 use zlmediakit_rtmp::RtmpServer;
 use zlmediakit_rtsp::rtsp_pull_start;
 use zlmediakit_rtsp::RtspServer;
@@ -419,8 +420,18 @@ async fn run_proxy_supervisor(
         let active = active.clone();
         tokio::spawn(async move {
             info!("stream proxy task start: {} -> {}", url, key);
-            if let Err(e) = rtsp_pull_start(&url, &vhost, &app, &stream, sm, stop, stopped).await {
-                warn!("stream proxy task error {}: {}", key, e);
+            if url.starts_with("rtmp://") || url.starts_with("rtmps://") {
+                if let Err(e) =
+                    rtmp_push_client::start(&url, &vhost, &app, &stream, sm, stop, stopped).await
+                {
+                    warn!("RTMP push task error {}: {}", key, e);
+                }
+            } else {
+                if let Err(e) =
+                    rtsp_pull_start(&url, &vhost, &app, &stream, sm, stop, stopped).await
+                {
+                    warn!("stream proxy task error {}: {}", key, e);
+                }
             }
             info!("stream proxy task end: {}", key);
             active.remove(&key);

@@ -99,10 +99,12 @@ async fn handle_conn(
                 &path,
                 &query,
                 &body,
-                &sm,
-                &ice_servers,
-                &play_sessions,
-                &publish_sessions,
+                &WebRtcState {
+                    sm: &sm,
+                    ice_servers: &ice_servers,
+                    play_sessions: &play_sessions,
+                    publish_sessions: &publish_sessions,
+                },
             )
             .await
         }
@@ -133,20 +135,26 @@ fn resolve_stream(segs: &[&str], query: &HashMap<String, String>) -> (String, St
     }
 }
 
+/// Shared server state threaded through every request handler, bundled so the
+/// handler signatures stay readable.
+struct WebRtcState<'a> {
+    sm: &'a Arc<MediaSourceManager>,
+    ice_servers: &'a [IceServer],
+    play_sessions: &'a Arc<DashMap<String, WhepSession>>,
+    publish_sessions: &'a Arc<DashMap<String, WhipSession>>,
+}
+
 async fn handle_post(
     stream: &mut TcpStream,
     path: &str,
     query: &HashMap<String, String>,
     body: &[u8],
-    sm: &Arc<MediaSourceManager>,
-    ice_servers: &[IceServer],
-    play_sessions: &Arc<DashMap<String, WhepSession>>,
-    publish_sessions: &Arc<DashMap<String, WhipSession>>,
+    state: &WebRtcState<'_>,
 ) -> Result<()> {
     if path.starts_with("/webrtc/play/") {
-        handle_play(stream, path, query, body, sm, ice_servers, play_sessions).await
+        handle_play(stream, path, query, body, state).await
     } else if path.starts_with("/webrtc/publish/") {
-        handle_publish(stream, path, query, body, sm, ice_servers, publish_sessions).await
+        handle_publish(stream, path, query, body, state).await
     } else {
         write_response(stream, 404, "Not Found", &[], b"unknown endpoint").await
     }
@@ -175,9 +183,7 @@ async fn handle_play(
     path: &str,
     query: &HashMap<String, String>,
     body: &[u8],
-    sm: &Arc<MediaSourceManager>,
-    ice_servers: &[IceServer],
-    sessions: &Arc<DashMap<String, WhepSession>>,
+    state: &WebRtcState<'_>,
 ) -> Result<()> {
     let segs: Vec<String> = play_segments(path);
     let segs_ref: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
@@ -194,7 +200,7 @@ async fn handle_play(
         .await;
     }
 
-    let source = match sm.get(&vhost, &app, &stream_id) {
+    let source = match state.sm.get(&vhost, &app, &stream_id) {
         Some(s) => s,
         None => {
             return write_response(stream, 404, "Not Found", &[], b"stream not found").await;
@@ -203,9 +209,9 @@ async fn handle_play(
 
     let offer = String::from_utf8_lossy(body).to_string();
     let resource = Uuid::new_v4().to_string();
-    match whep_play(&offer, source, resource.clone(), ice_servers.to_vec()).await {
+    match whep_play(&offer, source, resource.clone(), state.ice_servers.to_vec()).await {
         Ok((answer, session)) => {
-            sessions.insert(resource.clone(), session);
+            state.play_sessions.insert(resource.clone(), session);
             let location = format!("/webrtc/play/{}", resource);
             write_response(
                 stream,
@@ -243,9 +249,7 @@ async fn handle_publish(
     path: &str,
     query: &HashMap<String, String>,
     body: &[u8],
-    sm: &Arc<MediaSourceManager>,
-    ice_servers: &[IceServer],
-    sessions: &Arc<DashMap<String, WhipSession>>,
+    state: &WebRtcState<'_>,
 ) -> Result<()> {
     let segs: Vec<String> = publish_segments(path);
     let segs_ref: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
@@ -262,12 +266,12 @@ async fn handle_publish(
         .await;
     }
 
-    let source = sm.get_or_create(&vhost, &app, &stream_id);
+    let source = state.sm.get_or_create(&vhost, &app, &stream_id);
     let offer = String::from_utf8_lossy(body).to_string();
     let resource = Uuid::new_v4().to_string();
-    match whip_publish(&offer, source, resource.clone(), ice_servers.to_vec()).await {
+    match whip_publish(&offer, source, resource.clone(), state.ice_servers.to_vec()).await {
         Ok((answer, session)) => {
-            sessions.insert(resource.clone(), session);
+            state.publish_sessions.insert(resource.clone(), session);
             let location = format!("/webrtc/publish/{}", resource);
             write_response(
                 stream,

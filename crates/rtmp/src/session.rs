@@ -64,11 +64,7 @@ impl RtmpSession {
         info!("RTMP handshake completed from {}", self.peer_addr);
 
         let mut buf = [0u8; 65536];
-        loop {
-            let stream = match self.stream.as_mut() {
-                Some(s) => s,
-                None => break,
-            };
+        while let Some(stream) = self.stream.as_mut() {
             match stream.read(&mut buf).await {
                 Ok(0) => {
                     debug!("RTMP connection closed: {}", self.peer_addr);
@@ -227,11 +223,9 @@ impl RtmpSession {
             }
             RtmpMessage::UserControl(event_type, data) => {
                 debug!("UserControl event: {}", event_type);
-                if event_type == 6 {
-                    if data.len() >= 4 {
-                        let seq = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-                        self.send_msg(&RtmpMessage::Ack(seq)).await?;
-                    }
+                if event_type == 6 && data.len() >= 4 {
+                    let seq = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                    self.send_msg(&RtmpMessage::Ack(seq)).await?;
                 }
             }
             RtmpMessage::Ack(_) => {}
@@ -288,7 +282,26 @@ impl RtmpSession {
                 if self.is_publisher {
                     if let Some(ref source) = self.source {
                         let codec = parse_audio_rtmp_packet(&data);
-                        let frame = MediaFrame::new_audio(
+                        let is_config =
+                            data.len() >= 2 && (data[0] >> 4) & 0x0F == 10 && data[1] == 0x00;
+                        if is_config {
+                            let has_audio = source.info.read().await.tracks.iter().any(|t| {
+                                matches!(t, zlmediakit_core::media_frame::TrackInfo::Audio(_))
+                            });
+                            if !has_audio {
+                                source.info.write().await.tracks.push(
+                                    zlmediakit_core::media_frame::TrackInfo::Audio(
+                                        zlmediakit_core::media_frame::AudioInfo {
+                                            codec,
+                                            sample_rate: 44100,
+                                            channels: 2,
+                                            bits_per_sample: 16,
+                                        },
+                                    ),
+                                );
+                            }
+                        }
+                        let mut frame = MediaFrame::new_audio(
                             1,
                             codec,
                             timestamp,
@@ -296,6 +309,7 @@ impl RtmpSession {
                             timestamp as u64,
                             data,
                         );
+                        frame.config_frame = is_config;
                         source.publish_and_cache(frame).await;
                     }
                 }
@@ -915,8 +929,6 @@ fn parse_video_rtmp_packet(data: &[u8]) -> (CodecId, bool, bool) {
         (CodecId::H264, is_keyframe && !is_config, is_config)
     } else if codec_id == 12 {
         (CodecId::H265, is_keyframe && !is_config, is_config)
-    } else if codec_id == 13 {
-        (CodecId::H264, is_keyframe, false)
     } else {
         (CodecId::H264, is_keyframe, false)
     }

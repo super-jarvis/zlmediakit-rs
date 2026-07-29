@@ -178,8 +178,8 @@ mod tests {
         // 7.0 -> 40 1C 00 00 00 00 00 00, 12.0 -> 40 28 00 00 00 00 00 00.
         let seven = [0x40u8, 0x1C, 0, 0, 0, 0, 0, 0];
         let twelve = [0x40u8, 0x28, 0, 0, 0, 0, 0, 0];
-        assert!(h264.as_ref().windows(8).any(|w| w == &seven));
-        assert!(h265.as_ref().windows(8).any(|w| w == &twelve));
+        assert!(h264.as_ref().windows(8).any(|w| w == seven));
+        assert!(h265.as_ref().windows(8).any(|w| w == twelve));
         // H264 and H265 metadata must differ (different videocodecid).
         assert_ne!(h264.as_ref(), h265.as_ref());
     }

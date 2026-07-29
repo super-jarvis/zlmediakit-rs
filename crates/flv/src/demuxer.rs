@@ -138,6 +138,12 @@ impl FlvDemuxer {
     }
 }
 
+impl Default for FlvDemuxer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,11 +308,5 @@ mod tests {
         d.parse_header();
         let frame = d.parse_tag().unwrap();
         assert_eq!(frame.codec, CodecId::H265);
-    }
-}
-
-impl Default for FlvDemuxer {
-    fn default() -> Self {
-        Self::new()
     }
 }

@@ -583,7 +583,7 @@ pub fn encode_basic_header(fmt: u8, csid: u32) -> BytesMut {
         buf.put_u8((adjusted & 0xFF) as u8);
         buf.put_u8(((adjusted >> 8) & 0xFF) as u8);
     } else if csid >= 64 {
-        buf.put_u8((fmt << 6) | 0);
+        buf.put_u8(fmt << 6);
         buf.put_u8((csid - 64) as u8);
     } else {
         buf.put_u8((fmt << 6) | (csid as u8));

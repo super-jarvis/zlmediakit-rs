@@ -201,11 +201,9 @@ impl HlsMuxer {
                         self.video_config_sent = false;
                     }
                 }
-                FrameType::Audio => {
-                    if is_aac_config(frame) {
-                        self.audio_config_data = Some(extract_aac_config(&frame.data));
-                        self.audio_config_sent = false;
-                    }
+                FrameType::Audio if is_aac_config(frame) => {
+                    self.audio_config_data = Some(extract_aac_config(&frame.data));
+                    self.audio_config_sent = false;
                 }
                 _ => {}
             }
@@ -257,17 +255,15 @@ impl HlsMuxer {
                         }
                     }
                 }
-                FrameType::Audio => {
-                    if !is_aac_config(frame) {
-                        let audio_data = if let Some(ref config) = self.audio_config_data {
-                            flv_audio_to_adts(&frame.data, config)
-                        } else {
-                            flv_audio_to_raw(&frame.data)
-                        };
-                        if !audio_data.is_empty() {
-                            let pes = build_data_pes_raw(0xC0, &audio_data, frame.timestamp);
-                            self.writer.write_pes(&mut out, AUDIO_PID, &pes, false);
-                        }
+                FrameType::Audio if !is_aac_config(frame) => {
+                    let audio_data = if let Some(ref config) = self.audio_config_data {
+                        flv_audio_to_adts(&frame.data, config)
+                    } else {
+                        flv_audio_to_raw(&frame.data)
+                    };
+                    if !audio_data.is_empty() {
+                        let pes = build_data_pes_raw(0xC0, &audio_data, frame.timestamp);
+                        self.writer.write_pes(&mut out, AUDIO_PID, &pes, false);
                     }
                 }
                 _ => {}
@@ -399,18 +395,15 @@ fn write_pes_to_ts(
             let adapt_data_len = first_pad - 1; // -1 for length byte itself
             adapt.push(adapt_data_len as u8); // adaptation_field_length
             adapt.push(0x40); // random_access=1, no PCR flag
-            for _ in 1..adapt_data_len {
-                adapt.push(0xFF); // stuffing
-            }
+            adapt.extend(std::iter::repeat_n(0xFF, adapt_data_len.saturating_sub(1)));
+        // stuffing
         } else if first_pad > 0 {
             // Just padding, no PCR, no random access
             let adapt_data_len = first_pad - 1; // -1 for length byte itself
             adapt.push(adapt_data_len as u8); // adaptation_field_length
             if adapt_data_len > 0 {
                 adapt.push(0x00); // no flags
-                for _ in 1..adapt_data_len {
-                    adapt.push(0xFF); // stuffing
-                }
+                adapt.extend(std::iter::repeat_n(0xFF, adapt_data_len.saturating_sub(1)));
             }
         } else {
             // rand_access but no room for padding — minimal adaptation with just rand_access flag
@@ -443,9 +436,7 @@ fn write_pes_to_ts(
             a.push(adapt_data_len as u8); // adaptation_field_length
             if adapt_data_len > 0 {
                 a.push(0x00); // no flags
-                for _ in 1..adapt_data_len {
-                    a.push(0xFF);
-                }
+                a.extend(std::iter::repeat_n(0xFF, adapt_data_len.saturating_sub(1)));
             }
             Some(a)
         } else {

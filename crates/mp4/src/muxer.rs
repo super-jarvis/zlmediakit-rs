@@ -352,6 +352,7 @@ fn write_mvhd(buf: &mut BytesMut, duration_ms: u32, next_track_id: u32) {
     write_full_box(buf, b"mvhd", 0, 0, &data);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_trak(
     buf: &mut BytesMut,
     track_id: u32,
@@ -495,6 +496,7 @@ fn write_dinf(buf: &mut BytesMut) {
     buf.extend_from_slice(&make_box(b"dinf", &dref_box));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_stbl(
     buf: &mut BytesMut,
     codec: &CodecId,
@@ -817,17 +819,7 @@ fn build_esds_descriptors(_channels: u32, audio_specific_config: &[u8]) -> Vec<u
 
     let mut decoder_config = Vec::new();
     decoder_config.push(0x04);
-    let mut dc_data = Vec::new();
-    dc_data.push(0x40); // objectTypeIndication (AAC)
-    dc_data.push(0x15); // streamType (Audio) + upstream
-    dc_data.push(0x00); // bufferSizeDB
-    dc_data.push(0x00);
-    dc_data.push(0x03); // maxBitrate
-    dc_data.push(0x00);
-    dc_data.push(0x00);
-    dc_data.push(0x03); // avgBitrate
-    dc_data.push(0x00);
-    dc_data.push(0x00);
+    let dc_data = vec![0x40, 0x15, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00];
 
     let mut dec_specific = Vec::new();
     dec_specific.push(0x05);
@@ -840,10 +832,7 @@ fn build_esds_descriptors(_channels: u32, audio_specific_config: &[u8]) -> Vec<u
     decoder_config.extend_from_slice(&dc_data);
     decoder_config.extend_from_slice(&dec_specific);
 
-    let mut sl_config = Vec::new();
-    sl_config.push(0x06);
-    sl_config.push(1); // SLConfigDescriptor length
-    sl_config.push(0x02);
+    let sl_config = vec![0x06, 1, 0x02];
 
     let desc_len = desc_data.len() + decoder_config.len() + sl_config.len();
     put_ber_length(&mut esds, desc_len);

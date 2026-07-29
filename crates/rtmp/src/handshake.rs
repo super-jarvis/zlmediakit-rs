@@ -50,6 +50,39 @@ impl RtmpHandshake {
         debug!("RTMP handshake completed");
         Ok(())
     }
+
+    /// Client-side RTMP handshake.
+    ///
+    /// 1. Sends C0 (version 3) + C1 (4-byte timestamp, 4-byte zero, 1528 random bytes).
+    /// 2. Reads S0 + S1 + S2.
+    /// 3. Sends C2 (echo of S1).
+    pub async fn client_handshake<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+        stream: &mut S,
+    ) -> anyhow::Result<()> {
+        let mut c0c1 = Vec::with_capacity(1 + C0C1_SIZE);
+        c0c1.push(0x03);
+        let mut c1 = vec![0u8; C0C1_SIZE];
+        let ts = 0u32;
+        c1[..4].copy_from_slice(&ts.to_be_bytes());
+        rand::rng().fill(&mut c1[8..]);
+        c0c1.extend_from_slice(&c1);
+        stream.write_all(&c0c1).await?;
+
+        let mut s0s1 = vec![0u8; 1 + C0C1_SIZE];
+        stream.read_exact(&mut s0s1).await?;
+        if s0s1[0] != 0x03 {
+            anyhow::bail!("Invalid server RTMP version: {}", s0s1[0]);
+        }
+
+        let mut s2 = vec![0u8; C2_SIZE];
+        stream.read_exact(&mut s2).await?;
+
+        let c2 = &s0s1[1..];
+        stream.write_all(c2).await?;
+
+        debug!("RTMP client handshake completed");
+        Ok(())
+    }
 }
 
 impl Default for RtmpHandshake {

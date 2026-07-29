@@ -13,13 +13,13 @@ pub use tokio_rustls::TlsAcceptor;
 /// without changing any session logic.
 pub enum TransportStream {
     Tcp(TcpStream),
-    Tls(tokio_rustls::server::TlsStream<TcpStream>),
+    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
 }
 
 impl TransportStream {
     /// Wrap the result of `TlsAcceptor::accept` into a `TransportStream`.
     pub fn from_tls_accepted(accepted: tokio_rustls::server::TlsStream<TcpStream>) -> Self {
-        TransportStream::Tls(accepted)
+        TransportStream::Tls(Box::new(accepted))
     }
 
     pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
