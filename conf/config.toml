@@ -32,6 +32,14 @@ port = 80
 ssl = false
 dir_root = true
 
+# WebRTC (WHEP playback) server. A browser plays a published stream over
+# WebRTC by POSTing an SDP offer to /webrtc/play/<vhost>/<app>/<stream> (or
+# with ?vhost=&app=&stream= query params) and DELETEing the returned Location
+# to stop. Currently playback (WHEP) only; H.264 video and Opus audio.
+[webrtc]
+enabled = true
+port = 9000
+
 # Record settings
 [record]
 app = "record"
