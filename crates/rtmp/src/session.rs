@@ -24,6 +24,9 @@ pub struct RtmpSession {
     stream_name: String,
     is_publisher: bool,
     stream_id: u32,
+    total_read: u64,
+    client_win_size: u32,
+    last_ack_seq: u64,
 }
 
 impl RtmpSession {
@@ -47,6 +50,9 @@ impl RtmpSession {
             stream_name: String::new(),
             is_publisher: false,
             stream_id: 0,
+            total_read: 0,
+            client_win_size: 2500000,
+            last_ack_seq: 0,
         }
     }
 
@@ -58,7 +64,6 @@ impl RtmpSession {
         info!("RTMP handshake completed from {}", self.peer_addr);
 
         let mut buf = [0u8; 65536];
-        let mut total_bytes = 0u64;
         loop {
             let stream = match self.stream.as_mut() {
                 Some(s) => s,
@@ -70,12 +75,54 @@ impl RtmpSession {
                     break;
                 }
                 Ok(n) => {
-                    total_bytes += n as u64;
+                    self.total_read += n as u64;
                     let messages = self.msg_parser.feed(&buf[..n]);
+                    for m in &messages {
+                        info!(
+                            "MSG: type={} ts={} stream_id={} len={}",
+                            m.type_id(),
+                            m.timestamp(),
+                            m.stream_id(),
+                            m.payload().len()
+                        );
+                    }
+                    if messages.is_empty()
+                        && n > 0
+                        && (self.total_read > 5000 || self.msg_parser.has_stuck_data())
+                    {
+                        let alert = if self.msg_parser.has_stuck_data() {
+                            "STUCK"
+                        } else {
+                            "stall"
+                        };
+                        let parser_prefix: Vec<String> = self
+                            .msg_parser
+                            .peek_front(n.min(48))
+                            .iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect();
+                        let read_prefix: Vec<String> = buf[..n.min(16)]
+                            .iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect();
+                        let b0 = buf[0];
+                        warn!(
+                            "RTMP {}: n={}, total={}, first=0x{:02x}(fmt={},csid_raw={}), parser_buf={} read=[{}] parser_front=[{}]",
+                            alert,
+                            n,
+                            self.total_read,
+                            b0,
+                            (b0 >> 6) & 0x03,
+                            b0 & 0x3F,
+                            self.msg_parser.buffer_len(),
+                            read_prefix.join(" "),
+                            parser_prefix.join(" "),
+                        );
+                    }
                     info!(
                         "RTMP read: {} bytes (total={}), {} messages",
                         n,
-                        total_bytes,
+                        self.total_read,
                         messages.len()
                     );
                     for msg in messages {
@@ -84,6 +131,7 @@ impl RtmpSession {
                             break;
                         }
                     }
+                    self.send_window_ack().await;
                 }
                 Err(e) => {
                     error!("RTMP read error: {}", e);
@@ -111,14 +159,10 @@ impl RtmpSession {
                 debug!("Set chunk size: {}", size);
             }
             RtmpMessage::WindowAckSize(size) => {
-                // Client acknowledged its receive window. We do NOT re-negotiate
-                // the chunk size here: chunk size is negotiated once in
-                // handle_connect (SetChunkSize) and applied to the encoder. The
-                // server's *parser* reads the client's 128-byte send chunks and
-                // must keep using that size; changing it here would desync
-                // server-side parsing of client messages.
+                self.client_win_size = size;
                 self.send_msg(&RtmpMessage::SetPeerBandwidth(size, 2))
                     .await?;
+                self.send_window_ack().await;
             }
             RtmpMessage::Amf0Command { data, .. } => {
                 let values = AmfDecoder::decode(&data)?;
@@ -193,11 +237,18 @@ impl RtmpSession {
             RtmpMessage::Ack(_) => {}
             RtmpMessage::SetPeerBandwidth(_, _) => {}
             RtmpMessage::Video {
-                stream_id: _,
+                stream_id,
                 timestamp,
                 data,
             } => {
                 if self.is_publisher {
+                    info!(
+                        "VIDEO: ts={} stream_id={} len={} first_bytes={:02x?}",
+                        timestamp,
+                        stream_id,
+                        data.len(),
+                        &data[..data.len().min(8)]
+                    );
                     if let (Some(ref source), Some(data)) =
                         (&self.source, normalize_enhanced_video(&data))
                     {
@@ -254,6 +305,20 @@ impl RtmpSession {
             }
         }
         Ok(())
+    }
+
+    async fn send_window_ack(&mut self) {
+        let unacked = self.total_read.saturating_sub(self.last_ack_seq);
+        if unacked >= self.client_win_size as u64 {
+            if let Some(ref mut stream) = self.stream {
+                let ack = RtmpMessage::Ack(self.total_read as u32);
+                let encoded = self.msg_encoder.encode(&ack);
+                if let Err(e) = stream.write_all(&encoded).await {
+                    warn!("Failed to send window ack: {}", e);
+                }
+                self.last_ack_seq = self.total_read;
+            }
+        }
     }
 
     fn parse_stream_key(&mut self, key: &str) {

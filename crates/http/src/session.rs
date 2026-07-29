@@ -9,6 +9,7 @@ use tracing::{debug, error, warn};
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::recorder::RecorderControl;
+use zlmediakit_core::stream_proxy::StreamProxyControl;
 use zlmediakit_hls::muxer::{self, HlsSegment};
 
 use zlmediakit_flv::FlvMuxer;
@@ -22,6 +23,7 @@ pub struct HttpSession {
     source_manager: Arc<MediaSourceManager>,
     auth: Arc<StreamAuth>,
     recorder: Arc<RecorderControl>,
+    proxy: Arc<StreamProxyControl>,
     buffer: BytesMut,
 }
 
@@ -32,6 +34,7 @@ impl HttpSession {
         source_manager: Arc<MediaSourceManager>,
         auth: Arc<StreamAuth>,
         recorder: Arc<RecorderControl>,
+        proxy: Arc<StreamProxyControl>,
     ) -> Self {
         Self {
             stream,
@@ -39,6 +42,7 @@ impl HttpSession {
             source_manager,
             auth,
             recorder,
+            proxy,
             buffer: BytesMut::with_capacity(4096),
         }
     }
@@ -494,6 +498,82 @@ impl HttpSession {
                 }))
                 .await?;
             }
+            "addStreamProxy" => {
+                let q = Self::parse_query(path);
+                let url = q.get("url").map(|s| s.as_str()).unwrap_or("").to_string();
+                let vhost = q
+                    .get("vhost")
+                    .map(|s| s.as_str())
+                    .unwrap_or("__defaultVhost__")
+                    .to_string();
+                let app = q
+                    .get("app")
+                    .map(|s| s.as_str())
+                    .unwrap_or("live")
+                    .to_string();
+                let stream = q
+                    .get("stream")
+                    .map(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if url.is_empty() || stream.is_empty() {
+                    self.send_json(&serde_json::json!({
+                        "code": -400,
+                        "msg": "missing url or stream param"
+                    }))
+                    .await?;
+                    return Ok(());
+                }
+                let ok = self.proxy.add(&url, &vhost, &app, &stream);
+                if ok {
+                    self.send_json(
+                        &serde_json::json!({"code": 0, "result": "stream proxy started"}),
+                    )
+                    .await?;
+                } else {
+                    self.send_json(&serde_json::json!({
+                        "code": -1,
+                        "msg": "proxy already exists"
+                    }))
+                    .await?;
+                }
+            }
+            "delStreamProxy" => {
+                let (vhost, app, stream) = Self::api_stream_params(path);
+                if stream.is_empty() {
+                    self.send_json(
+                        &serde_json::json!({"code": -400, "msg": "missing stream param"}),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let ok = self.proxy.remove(&vhost, &app, &stream);
+                if ok {
+                    self.send_json(
+                        &serde_json::json!({"code": 0, "result": "stream proxy stopped"}),
+                    )
+                    .await?;
+                } else {
+                    self.send_json(&serde_json::json!({"code": -404, "msg": "proxy not found"}))
+                        .await?;
+                }
+            }
+            "getStreamProxyList" => {
+                let list = self.proxy.list();
+                let data: Vec<serde_json::Value> = list
+                    .iter()
+                    .map(|(url, vhost, app, stream)| {
+                        serde_json::json!({
+                            "url": url,
+                            "vhost": vhost,
+                            "app": app,
+                            "stream": stream,
+                        })
+                    })
+                    .collect();
+                self.send_json(&serde_json::json!({"code": 0, "result": data}))
+                    .await?;
+            }
             _ => {
                 self.send_404().await?;
             }
@@ -609,48 +689,8 @@ impl HttpSession {
     }
 
     async fn handle_index(&mut self) -> anyhow::Result<()> {
-        let html = r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>ZLMediaKit-RS</title>
-    <style>
-        body { font-family: monospace; padding: 20px; background: #1a1a2e; color: #e0e0e0; }
-        h1 { color: #0f3460; }
-        .card { background: #16213e; padding: 15px; margin: 10px 0; border-radius: 5px; }
-        a { color: #00b4d8; }
-    </style>
-</head>
-<body>
-    <h1>ZLMediaKit-RS Streaming Server</h1>
-    <div class="card">
-        <h2>Supported Protocols</h2>
-        <ul>
-            <li>RTMP - Port 1935</li>
-            <li>RTSP - Port 554</li>
-            <li>HTTP-FLV - Port 8080</li>
-            <li>HLS - Port 8080</li>
-        </ul>
-    </div>
-    <div class="card">
-        <h2>API Endpoints</h2>
-        <ul>
-            <li><a href="/index/api/getMediaList">/index/api/getMediaList</a> - List media streams</li>
-            <li><a href="/index/api/getMediaInfo?stream=stream">/index/api/getMediaInfo</a> - Stream info</li>
-            <li><a href="/index/api/getStatistic">/index/api/getStatistic</a> - Server statistics</li>
-            <li><a href="/index/api/getServerConfig">/index/api/getServerConfig</a> - Server config</li>
-            <li>/index/api/closeStream?vhost=__defaultVhost__&amp;app=live&amp;stream=stream - Close/kick a stream</li>
-        </ul>
-    </div>
-    <div class="card">
-        <h2>Stream URLs</h2>
-        <p>RTMP: rtmp://host/live/stream</p>
-        <p>RTSP: rtsp://host/live/stream</p>
-        <p>HTTP-FLV: http://host/live/stream.flv</p>
-        <p>HLS: http://host/live/stream.m3u8</p>
-    </div>
-</body>
-</html>"#;
-
+        let port = self.stream.local_addr().map(|a| a.port()).unwrap_or(80);
+        let html = self.build_dashboard_html(port);
         let response = format!(
             "HTTP/1.1 200 OK\r\n\
              Content-Type: text/html\r\n\
@@ -661,6 +701,224 @@ impl HttpSession {
         );
         self.stream.write_all(response.as_bytes()).await?;
         Ok(())
+    }
+
+    fn build_dashboard_html(&self, port: u16) -> String {
+        format!(
+            r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZLMediaKit-RS</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<script src="https://cdn.jsdelivr.net/npm/flv.js@latest"></script>
+<style>
+* {{ margin:0; padding:0; box-sizing:border-box; }}
+body {{ font:14px/1.4 monospace; background:#0d1117; color:#c9d1d9; padding:16px; }}
+h1 {{ color:#58a6ff; font-size:20px; margin-bottom:12px; }}
+h2 {{ color:#8b949e; font-size:14px; text-transform:uppercase; letter-spacing:1px; margin:16px 0 8px; }}
+.card {{ background:#161b22; border:1px solid #30363d; border-radius:6px; padding:12px; margin-bottom:12px; }}
+table {{ width:100%; border-collapse:collapse; font-size:13px; }}
+th,td {{ text-align:left; padding:6px 8px; border-bottom:1px solid #21262d; }}
+th {{ color:#8b949e; }}
+tr:hover td {{ background:#1c2128; }}
+.badge {{ display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; }}
+.badge-green {{ background:#238636; color:#fff; }}
+.badge-red {{ background:#da3633; color:#fff; }}
+.badge-blue {{ background:#1f6feb; color:#fff; }}
+input {{ background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding:6px 8px; border-radius:4px; font:13px monospace; width:300px; }}
+button {{ background:#238636; color:#fff; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font:13px monospace; }}
+button:hover {{ background:#2ea043; }}
+button.danger {{ background:#da3633; }}
+button.danger:hover {{ background:#f85149; }}
+#player-container video {{ width:100%; max-width:640px; background:#000; border-radius:4px; }}
+.status-dot {{ display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }}
+.status-dot.on {{ background:#3fb950; }}
+.status-dot.off {{ background:#da3633; }}
+.toolbar {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
+</style>
+</head>
+<body>
+
+<h1>ZLMediaKit-RS &middot; Monitoring Dashboard</h1>
+
+<div class="card" style="display:flex; gap:24px; flex-wrap:wrap;">
+  <div><span class="status-dot on"></span><strong id="server-name">zlmediakit-rs</strong> <span id="server-version">v0.1.0</span></div>
+  <div><strong>Streams:</strong> <span id="stream-count">0</span></div>
+  <div><strong>Players:</strong> <span id="player-count">0</span></div>
+  <div><button onclick="refreshStreams()" style="font-size:11px; padding:3px 10px;">&#x21bb; Refresh</button></div>
+</div>
+
+<div class="card">
+  <h2>Active Streams</h2>
+  <table><thead><tr>
+    <th>App</th><th>Stream</th><th>Status</th><th>Viewers</th><th>Alive</th><th>Video</th><th>Audio</th><th>Actions</th>
+  </tr></thead><tbody id="stream-table-body">
+    <tr><td colspan="8" style="text-align:center; color:#8b949e;">No active streams</td></tr>
+  </tbody></table>
+</div>
+
+<div class="card">
+  <h2>Player</h2>
+  <div class="toolbar">
+    <input id="stream-url" type="text" value="/live/test/hls.m3u8" placeholder="Stream URL" />
+    <button onclick="playStream()">&#x25b6; Play</button>
+    <button class="danger" onclick="stopPlayer()">&#x25a0; Stop</button>
+    <select id="player-type" style="background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding:6px; border-radius:4px;">
+      <option value="auto">Auto</option>
+      <option value="hls">HLS</option>
+      <option value="flv">HTTP-FLV</option>
+    </select>
+  </div>
+  <div id="player-container" style="margin-top:8px;display:none;">
+    <video id="video-player" controls autoplay muted></video>
+    <div id="player-info" style="font-size:12px; color:#8b949e; margin-top:4px;"></div>
+  </div>
+  <div id="player-error" style="color:#f85149; font-size:13px; margin-top:4px; display:none;"></div>
+</div>
+
+<div class="card">
+  <h2>Stream URLs</h2>
+  <table><tr><td>RTMP</td><td><code>rtmp://host:{0}/live/stream</code></td></tr>
+  <tr><td>RTSP</td><td><code>rtsp://host:{0}/live/stream</code></td></tr>
+  <tr><td>HTTP-FLV</td><td><code>http://host:{0}/live/stream.flv</code></td></tr>
+  <tr><td>HLS</td><td><code>http://host:{0}/live/stream/hls.m3u8</code></td></tr>
+  <tr><td>HLS (alt)</td><td><code>http://host:{0}/live/stream.m3u8</code></td></tr>
+  <tr><td>API</td><td><code>http://host:{0}/index/api/getMediaList</code></td></tr>
+</table>
+</div>
+
+<script>
+let refreshTimer = null;
+let currentPlayer = null;
+
+function refreshStreams() {{
+  fetch('/index/api/getMediaList')
+    .then(r => r.json())
+    .then(data => {{
+      const list = data.result || [];
+      document.getElementById('stream-count').textContent = list.length;
+      const tb = document.getElementById('stream-table-body');
+      if (list.length === 0) {{
+        tb.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#8b949e;">No active streams</td></tr>';
+        document.getElementById('player-count').textContent = '0';
+        return;
+      }}
+      let totalViewers = 0;
+      tb.innerHTML = list.map(function(s) {{
+        totalViewers += s.readerCount || 0;
+        var vtracks = (s.tracks || []).filter(function(t) {{ return t.codec_type === 'video'; }});
+        var atracks = (s.tracks || []).filter(function(t) {{ return t.codec_type === 'audio'; }});
+        var vinfo = vtracks.map(function(t) {{ return t.codec_id + ' ' + (t.width||'?')+'x'+(t.height||'?'); }}).join(', ') || '-';
+        var ainfo = atracks.map(function(t) {{ return t.codec_id+' '+((t.sample_rate||0)/1000).toFixed(1)+'kHz '+((t.channels||0))+'ch'; }}).join(', ') || '-';
+        var alive = s.createTime ? Math.floor((Date.now() - s.createTime) / 1000) + 's' : '-';
+        var app = s.app || 'live';
+        var stream = s.stream || '';
+        var streamDisp = s.stream || '-';
+        return '<tr>' +
+          '<td>' + (s.app||'-') + '</td>' +
+          '<td><a href="#" onclick="setStreamUrl(\'' + app + '\',\'' + stream + '\');return false;">' + streamDisp + '</a></td>' +
+          '<td><span class="badge badge-green">live</span></td>' +
+          '<td>' + (s.readerCount||0) + '</td>' +
+          '<td>' + alive + '</td>' +
+          '<td style="font-size:11px;">' + vinfo + '</td>' +
+          '<td style="font-size:11px;">' + ainfo + '</td>' +
+          '<td><button class="danger" style="font-size:11px;padding:2px 6px;" onclick="closeStream(\'' + app + '\',\'' + stream + '\')">X</button></td>' +
+          '</tr>';
+      }}).join('');
+      document.getElementById('player-count').textContent = totalViewers;
+    }})
+    .catch(() => {{}});
+}}
+
+function closeStream(app, stream) {{
+  if (!confirm('Close stream: ' + app + '/' + stream + '?')) return;
+  fetch('/index/api/closeStream?app='+app+'&stream='+stream+'&vhost=__defaultVhost__')
+    .then(r => r.json()).then(() => refreshStreams()).catch(() => {{}});
+}}
+
+function setStreamUrl(app, stream) {{
+  const sel = document.getElementById('player-type').value;
+  if (sel === 'hls' || sel === 'auto')
+    document.getElementById('stream-url').value = '/' + app + '/' + stream + '/hls.m3u8';
+  else
+    document.getElementById('stream-url').value = '/' + app + '/' + stream + '.flv';
+  playStream();
+}}
+
+function playStream() {{
+  stopPlayer();
+  const url = document.getElementById('stream-url').value.trim();
+  if (!url) return;
+  const playerType = document.getElementById('player-type').value;
+
+  const container = document.getElementById('player-container');
+  const video = document.getElementById('video-player');
+  const info = document.getElementById('player-info');
+  const errEl = document.getElementById('player-error');
+  errEl.style.display = 'none';
+  container.style.display = 'block';
+
+  const isAbsolute = url.startsWith('http://') || url.startsWith('https://');
+  const fullUrl = isAbsolute ? url : window.location.protocol + '//' + window.location.host + url;
+
+  if (url.endsWith('.m3u8') || playerType === 'hls') {{
+    info.textContent = 'HLS: ' + fullUrl;
+    if (Hls.isSupported()) {{
+      const hls = new Hls();
+      hls.loadSource(fullUrl);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {{}}));
+      hls.on(Hls.Events.ERROR, (e, d) => {{
+        if (d.fatal) {{ errEl.textContent = 'HLS error: ' + d.type + ' ' + d.details; errEl.style.display = 'block'; }}
+      }});
+      currentPlayer = hls;
+    }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
+      video.src = fullUrl;
+      currentPlayer = video;
+    }} else {{
+      errEl.textContent = 'HLS not supported in this browser';
+      errEl.style.display = 'block';
+    }}
+  }} else if (url.endsWith('.flv') || playerType === 'flv') {{
+    info.textContent = 'HTTP-FLV: ' + fullUrl;
+    if (flvjs.isSupported()) {{
+      const f = flvjs.createPlayer({{ type: 'flv', url: fullUrl }}, {{ enableWorker: false }});
+      f.attachMediaElement(video);
+      f.load();
+      f.play();
+      currentPlayer = f;
+    }} else {{
+      errEl.textContent = 'FLV not supported in this browser';
+      errEl.style.display = 'block';
+    }}
+  }} else {{
+    info.textContent = url;
+    video.src = fullUrl;
+    currentPlayer = video;
+  }}
+}}
+
+function stopPlayer() {{
+  const video = document.getElementById('video-player');
+  if (currentPlayer) {{
+    if (currentPlayer.destroy) currentPlayer.destroy();
+    else if (currentPlayer.pause) currentPlayer.pause();
+    video.src = '';
+    currentPlayer = null;
+  }}
+  document.getElementById('player-container').style.display = 'none';
+}}
+
+refreshStreams();
+if (refreshTimer) clearInterval(refreshTimer);
+refreshTimer = setInterval(refreshStreams, 3000);
+</script>
+</body>
+</html>"##,
+            port
+        )
     }
 
     async fn send_400(&mut self) -> anyhow::Result<()> {

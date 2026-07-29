@@ -162,10 +162,40 @@ impl RtmpMessageParser {
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(_) => {
+                    break;
+                }
             }
         }
         messages
+    }
+
+    pub fn buffer_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    pub fn peek_front(&self, max: usize) -> Vec<u8> {
+        let n = self.buffer.len().min(max);
+        self.buffer[..n].to_vec()
+    }
+
+    pub fn has_stuck_data(&self) -> bool {
+        if self.buffer.is_empty() || self.chunk_states.is_empty() {
+            return false;
+        }
+        let b0 = self.buffer[0];
+        let fmt = (b0 >> 6) & 0x03;
+        let csid_raw = b0 & 0x3F;
+        let csid_actual = match csid_raw {
+            0 if self.buffer.len() >= 2 => self.buffer[1] as u32 + 64,
+            1 if self.buffer.len() >= 3 => 64 + self.buffer[1] as u32 + self.buffer[2] as u32 * 256,
+            _ => csid_raw as u32,
+        };
+        let has_state = self.chunk_states.contains_key(&csid_actual);
+        if fmt == 3 && !has_state {
+            return true;
+        }
+        false
     }
 
     fn try_parse_one(&mut self) -> anyhow::Result<Option<RtmpMessage>> {
@@ -323,6 +353,9 @@ impl RtmpMessageParser {
         let available = std::cmp::min(chunk_to_read, self.buffer.len() - pos);
 
         if available == 0 {
+            if remaining == 0 {
+                self.buffer.advance(pos);
+            }
             return Ok(None);
         }
 
@@ -355,6 +388,10 @@ impl RtmpMessageParser {
             self.chunk_states.insert(csid, saved);
 
             let payload = state.buffer.freeze();
+            if state.msg_type_id == MSG_SET_CHUNK_SIZE && payload.len() >= 4 {
+                let new_size = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                self.chunk_size = new_size.max(1) as usize;
+            }
             Ok(Some(self.make_message(
                 ts,
                 state.msg_length,

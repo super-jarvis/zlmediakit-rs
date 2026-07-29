@@ -11,10 +11,12 @@ use zlmediakit_core::config::{RecordConfig, ServerConfig};
 use zlmediakit_core::event_bus::{Event, EventBus};
 use zlmediakit_core::media_source::{MediaSource, MediaSourceManager};
 use zlmediakit_core::recorder::{RecorderCommand, RecorderControl};
+use zlmediakit_core::stream_proxy::{ProxyCmd, ProxyTable, StreamProxyControl};
 use zlmediakit_flv::FlvRecorder;
 use zlmediakit_hls::HlsRecorder;
 use zlmediakit_http::HttpServer;
 use zlmediakit_rtmp::RtmpServer;
+use zlmediakit_rtsp::rtsp_pull_start;
 use zlmediakit_rtsp::RtspServer;
 
 #[derive(Parser, Debug)]
@@ -96,6 +98,9 @@ async fn main() -> Result<()> {
     let (recorder_control, recorder_cmd_rx) = RecorderControl::new();
     let recorder_control = Arc::new(recorder_control);
 
+    let (proxy_control, proxy_active, proxy_cmd_rx) = StreamProxyControl::new();
+    let proxy_control = Arc::new(proxy_control);
+
     info!("========================================");
     info!("  ZLMediaKit-RS v{}", env!("CARGO_PKG_VERSION"));
     info!("  High Performance Streaming Server");
@@ -148,8 +153,9 @@ async fn main() -> Result<()> {
         let sm = source_manager.clone();
         let http_auth = auth.clone();
         let rec = recorder_control.clone();
+        let proxy = proxy_control.clone();
         let handle = tokio::spawn(async move {
-            match HttpServer::new(&addr, sm, http_auth, rec).await {
+            match HttpServer::new(&addr, sm, http_auth, rec, proxy).await {
                 Ok(server) => {
                     if let Err(e) = server.run().await {
                         error!("HTTP server error: {}", e);
@@ -169,8 +175,9 @@ async fn main() -> Result<()> {
         let sm = source_manager.clone();
         let api_auth = auth.clone();
         let rec = recorder_control.clone();
+        let proxy = proxy_control.clone();
         let handle = tokio::spawn(async move {
-            match HttpServer::new(&addr, sm, api_auth, rec).await {
+            match HttpServer::new(&addr, sm, api_auth, rec, proxy).await {
                 Ok(server) => {
                     if let Err(e) = server.run().await {
                         error!("API server error: {}", e);
@@ -202,6 +209,19 @@ async fn main() -> Result<()> {
         let handle = tokio::spawn(async move {
             run_recorder_supervisor(sup_event, sup_sm, rec_cfg, rec_base, recorder_cmd_rx, rec)
                 .await;
+        });
+        handles.push(handle);
+    }
+
+    // Stream proxy supervisor: drains `addStreamProxy` commands and spawns
+    // pull tasks. Each task republishes a remote stream locally; when it ends,
+    // the supervisor removes the entry from the shared active table.
+    {
+        let sup_sm = source_manager.clone();
+        let sup_active = proxy_active.clone();
+        info!("Stream proxy supervisor started");
+        let handle = tokio::spawn(async move {
+            run_proxy_supervisor(proxy_cmd_rx, sup_sm, sup_active).await;
         });
         handles.push(handle);
     }
@@ -318,6 +338,38 @@ async fn spawn_recorders(
             if let Err(e) = HlsRecorder::record(src, &path, s).await {
                 error!("HLS recorder error: {}", e);
             }
+        });
+    }
+}
+
+/// Drains `ProxyCmd` commands from the HTTP API and spawns an RTSP pull task
+/// for each. When a task finishes (stopped via `delStreamProxy`, or the
+/// upstream drops) its entry is removed from the shared active table so
+/// `getStreamProxyList` reflects reality.
+async fn run_proxy_supervisor(
+    mut cmd_rx: mpsc::UnboundedReceiver<ProxyCmd>,
+    source_manager: Arc<MediaSourceManager>,
+    active: ProxyTable,
+) {
+    while let Some(cmd) = cmd_rx.recv().await {
+        let ProxyCmd {
+            url,
+            vhost,
+            app,
+            stream,
+            stop,
+            stopped,
+        } = cmd;
+        let key = format!("{}/{}/{}", vhost, app, stream);
+        let sm = source_manager.clone();
+        let active = active.clone();
+        tokio::spawn(async move {
+            info!("stream proxy task start: {} -> {}", url, key);
+            if let Err(e) = rtsp_pull_start(&url, &vhost, &app, &stream, sm, stop, stopped).await {
+                warn!("stream proxy task error {}: {}", key, e);
+            }
+            info!("stream proxy task end: {}", key);
+            active.remove(&key);
         });
     }
 }

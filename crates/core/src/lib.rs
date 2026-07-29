@@ -8,6 +8,7 @@ pub mod media_sink;
 pub mod media_source;
 pub mod recorder;
 pub mod session;
+pub mod stream_proxy;
 pub mod utils;
 
 pub use auth::{generate_sign, validate_sign, StreamAuth};
@@ -19,3 +20,4 @@ pub use media_sink::MediaSink;
 pub use media_source::{MediaSource, MediaSourceManager, SourceId};
 pub use recorder::{RecorderCommand, RecorderControl};
 pub use session::{SessionId, SessionManager};
+pub use stream_proxy::{ProxyCmd, ProxyEntry, StreamProxyControl};

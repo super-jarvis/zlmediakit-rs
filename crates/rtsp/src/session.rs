@@ -1129,7 +1129,7 @@ impl RtspSession {
 
 // === RTSP push: RTP depacketization into FLV/AVCC MediaFrames ===
 
-struct RtpDepacketizer {
+pub(crate) struct RtpDepacketizer {
     source: Arc<MediaSource>,
     video_pt: u8,
     audio_pt: u8,
@@ -1153,7 +1153,7 @@ struct RtpDepacketizer {
 
 impl RtpDepacketizer {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub(crate) fn new(
         source: Arc<MediaSource>,
         video_pt: u8,
         audio_pt: u8,
@@ -1190,7 +1190,7 @@ impl RtpDepacketizer {
         }
     }
 
-    async fn handle_rtp(&mut self, channel: u8, payload: &[u8]) {
+    pub(crate) async fn handle_rtp(&mut self, channel: u8, payload: &[u8]) {
         if payload.len() < 12 {
             return;
         }
@@ -1548,18 +1548,18 @@ impl RtpDepacketizer {
 
 // === SDP parsing & AVCC builders ===
 
-struct SdpInfo {
-    video_pt: u8,
-    audio_pt: u8,
-    video_codec: CodecId,
-    sps: Option<Vec<u8>>,
-    pps: Option<Vec<u8>>,
-    vps: Option<Vec<u8>>,
-    audio_config: Option<Vec<u8>>,
-    audio_sample_rate: u32,
+pub(crate) struct SdpInfo {
+    pub(crate) video_pt: u8,
+    pub(crate) audio_pt: u8,
+    pub(crate) video_codec: CodecId,
+    pub(crate) sps: Option<Vec<u8>>,
+    pub(crate) pps: Option<Vec<u8>>,
+    pub(crate) vps: Option<Vec<u8>>,
+    pub(crate) audio_config: Option<Vec<u8>>,
+    pub(crate) audio_sample_rate: u32,
 }
 
-fn parse_sdp(body: &[u8]) -> SdpInfo {
+pub(crate) fn parse_sdp(body: &[u8]) -> SdpInfo {
     let mut info = SdpInfo {
         video_pt: 96,
         audio_pt: 97,
