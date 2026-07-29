@@ -15,6 +15,7 @@ use zlmediakit_core::stream_proxy::{ProxyCmd, ProxyTable, StreamProxyControl};
 use zlmediakit_flv::FlvRecorder;
 use zlmediakit_hls::HlsRecorder;
 use zlmediakit_http::HttpServer;
+use zlmediakit_mp4::recorder::Mp4Recorder;
 use zlmediakit_rtmp::RtmpServer;
 use zlmediakit_rtsp::rtsp_pull_start;
 use zlmediakit_rtsp::RtspServer;
@@ -119,13 +120,21 @@ async fn main() -> Result<()> {
 
     let mut handles = Vec::new();
 
+    // Common TLS config (shared across protocols). When a protocol has
+    // `ssl: true` its server will attempt TLS negotiation after accepting a
+    // plain TCP connection.
+    let ssl_cert = config.http.ssl_cert.clone();
+    let ssl_key = config.http.ssl_key.clone();
+
     if config.rtmp.enabled {
         let addr = format!("0.0.0.0:{}", config.rtmp_port);
         let sm = source_manager.clone();
         let eb = event_bus.clone();
         let rtmp_auth = auth.clone();
+        let rtmp_cert = config.rtmp.ssl_cert.clone();
+        let rtmp_key = config.rtmp.ssl_key.clone();
         let handle = tokio::spawn(async move {
-            match RtmpServer::new(&addr, sm, eb, rtmp_auth).await {
+            match RtmpServer::new(&addr, sm, eb, rtmp_auth, rtmp_cert, rtmp_key).await {
                 Ok(server) => {
                     if let Err(e) = server.run().await {
                         error!("RTMP server error: {}", e);
@@ -142,8 +151,10 @@ async fn main() -> Result<()> {
         let sm = source_manager.clone();
         let eb = event_bus.clone();
         let rtsp_auth = auth.clone();
+        let rtsp_cert = config.rtsp.ssl_cert.clone();
+        let rtsp_key = config.rtsp.ssl_key.clone();
         let handle = tokio::spawn(async move {
-            match RtspServer::new(&addr, sm, eb, rtsp_auth).await {
+            match RtspServer::new(&addr, sm, eb, rtsp_auth, rtsp_cert, rtsp_key).await {
                 Ok(server) => {
                     if let Err(e) = server.run().await {
                         error!("RTSP server error: {}", e);
@@ -161,8 +172,10 @@ async fn main() -> Result<()> {
         let http_auth = auth.clone();
         let rec = recorder_control.clone();
         let proxy = proxy_control.clone();
+        let http_cert = ssl_cert.clone();
+        let http_key = ssl_key.clone();
         let handle = tokio::spawn(async move {
-            match HttpServer::new(&addr, sm, http_auth, rec, proxy).await {
+            match HttpServer::new(&addr, sm, http_auth, rec, proxy, http_cert, http_key).await {
                 Ok(server) => {
                     if let Err(e) = server.run().await {
                         error!("HTTP server error: {}", e);
@@ -183,8 +196,10 @@ async fn main() -> Result<()> {
         let api_auth = auth.clone();
         let rec = recorder_control.clone();
         let proxy = proxy_control.clone();
+        let api_cert = ssl_cert.clone();
+        let api_key = ssl_key.clone();
         let handle = tokio::spawn(async move {
-            match HttpServer::new(&addr, sm, api_auth, rec, proxy).await {
+            match HttpServer::new(&addr, sm, api_auth, rec, proxy, api_cert, api_key).await {
                 Ok(server) => {
                     if let Err(e) = server.run().await {
                         error!("API server error: {}", e);
@@ -202,8 +217,9 @@ async fn main() -> Result<()> {
     if config.webrtc.enabled {
         let addr = format!("0.0.0.0:{}", config.webrtc_port);
         let sm = source_manager.clone();
+        let ice_servers = config.webrtc.ice_servers.clone();
         let handle = tokio::spawn(async move {
-            match WebRtcServer::new(&addr, sm).await {
+            match WebRtcServer::new(&addr, sm, ice_servers).await {
                 Ok(server) => {
                     if let Err(e) = server.run().await {
                         error!("WebRTC server error: {}", e);
@@ -228,8 +244,8 @@ async fn main() -> Result<()> {
         let sup_event = event_bus.clone();
         let sup_sm = source_manager.clone();
         info!(
-            "Recorder supervisor started (auto hls={}, flv={}) -> {}",
-            config.record.flv, config.record.hls, rec_base
+            "Recorder supervisor started (auto hls={}, flv={}, mp4={}) -> {}",
+             config.record.hls, config.record.flv, config.record.mp4, rec_base
         );
         let rec = recorder_control.clone();
         let handle = tokio::spawn(async move {
@@ -286,13 +302,13 @@ async fn run_recorder_supervisor(
             event = rx.recv() => {
                 match event {
                     Ok(Event::StreamPublish { source_id, vhost, app, stream }) => {
-                        let (hls, flv) = (record.hls, record.flv);
-                        if (hls || flv) && !stops.lock().await.contains_key(&source_id) {
+                        let (hls, flv, mp4) = (record.hls, record.flv, record.mp4);
+                        if (hls || flv || mp4) && !stops.lock().await.contains_key(&source_id) {
                             if let Some(src) = source_manager.get(&vhost, &app, &stream) {
                                 let stop = Arc::new(Notify::new());
                                 stops.lock().await.insert(source_id.clone(), stop.clone());
-                                control.mark_recording(&source_id, hls, flv);
-                                spawn_recorders(src, &base_path, hls, flv, stop).await;
+                                control.mark_recording(&source_id, hls, flv, mp4);
+                                spawn_recorders(src, &base_path, hls, flv, mp4, stop).await;
                             }
                         }
                     }
@@ -307,17 +323,17 @@ async fn run_recorder_supervisor(
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(RecorderCommand { vhost, app, stream, hls, flv }) => {
+                    Some(RecorderCommand { vhost, app, stream, hls, flv, mp4 }) => {
                         let source_id = format!("{}/{}/{}", vhost, app, stream);
-                        if hls || flv {
+                        if hls || flv || mp4 {
                             if !stops.lock().await.contains_key(&source_id) {
                                 if let Some(src) =
                                     source_manager.get(&vhost, &app, &stream)
                                 {
                                     let stop = Arc::new(Notify::new());
                                     stops.lock().await.insert(source_id.clone(), stop.clone());
-                                    control.mark_recording(&source_id, hls, flv);
-                                    spawn_recorders(src, &base_path, hls, flv, stop).await;
+                                    control.mark_recording(&source_id, hls, flv, mp4);
+                                    spawn_recorders(src, &base_path, hls, flv, mp4, stop).await;
                                 } else {
                                     warn!("startRecord: stream not live: {}", source_id);
                                 }
@@ -337,13 +353,15 @@ async fn run_recorder_supervisor(
     }
 }
 
-/// Spawns the FLV and/or HLS recorder tasks for a live source, each stopped via
-/// the shared `Notify` when the stream unpublishes or recording is cancelled.
+/// Spawns the FLV, HLS and/or MP4 recorder tasks for a live source, each
+/// stopped via the shared `Notify` when the stream unpublishes or recording is
+/// cancelled.
 async fn spawn_recorders(
     source: Arc<MediaSource>,
     base_path: &str,
     hls: bool,
     flv: bool,
+    mp4: bool,
     stop: Arc<Notify>,
 ) {
     if flv {
@@ -363,6 +381,16 @@ async fn spawn_recorders(
         tokio::spawn(async move {
             if let Err(e) = HlsRecorder::record(src, &path, s).await {
                 error!("HLS recorder error: {}", e);
+            }
+        });
+    }
+    if mp4 {
+        let src = source.clone();
+        let path = base_path.to_string();
+        let s = stop.clone();
+        tokio::spawn(async move {
+            if let Err(e) = Mp4Recorder::record(src, &path, s).await {
+                error!("MP4 recorder error: {}", e);
             }
         });
     }

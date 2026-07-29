@@ -1,6 +1,6 @@
-//! Minimal HTTP transport for WHEP.
+//! Minimal HTTP transport for WHEP (playback) and WHIP (publishing).
 //!
-//! WHEP is a tiny HTTP protocol: the client POSTs an SDP offer and gets an SDP
+//! Both are tiny HTTP protocols: the client POSTs an SDP offer and gets an SDP
 //! answer back (plus a `Location` it later DELETEs to stop). We implement just
 //! enough HTTP/1.1 here so the WebRTC crate stays decoupled from the `http`
 //! protocol crate (which, per project convention, must not depend on WebRTC).
@@ -14,24 +14,34 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info};
 use uuid::Uuid;
+use zlmediakit_core::config::IceServer;
 use zlmediakit_core::media_source::MediaSourceManager;
 
 use crate::whep::{whep_play, WhepSession};
+use crate::whip::{whip_publish, WhipSession};
 
 pub struct WebRtcServer {
     listener: TcpListener,
     source_manager: Arc<MediaSourceManager>,
-    sessions: Arc<DashMap<String, WhepSession>>,
+    ice_servers: Vec<IceServer>,
+    play_sessions: Arc<DashMap<String, WhepSession>>,
+    publish_sessions: Arc<DashMap<String, WhipSession>>,
 }
 
 impl WebRtcServer {
-    pub async fn new(addr: &str, source_manager: Arc<MediaSourceManager>) -> Result<Self> {
+    pub async fn new(
+        addr: &str,
+        source_manager: Arc<MediaSourceManager>,
+        ice_servers: Vec<IceServer>,
+    ) -> Result<Self> {
         let listener = TcpListener::bind(addr).await?;
-        info!("WebRTC (WHEP) server listening on {}", addr);
+        info!("WebRTC (WHEP/WHIP) server listening on {}", addr);
         Ok(Self {
             listener,
             source_manager,
-            sessions: Arc::new(DashMap::new()),
+            ice_servers,
+            play_sessions: Arc::new(DashMap::new()),
+            publish_sessions: Arc::new(DashMap::new()),
         })
     }
 
@@ -39,9 +49,11 @@ impl WebRtcServer {
         loop {
             let (stream, _peer) = self.listener.accept().await?;
             let sm = self.source_manager.clone();
-            let sessions = self.sessions.clone();
+            let ice = self.ice_servers.clone();
+            let play = self.play_sessions.clone();
+            let pub_ = self.publish_sessions.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_conn(stream, sm, sessions).await {
+                if let Err(e) = handle_conn(stream, sm, ice, play, pub_).await {
                     error!("webrtc: conn error: {}", e);
                 }
             });
@@ -52,12 +64,13 @@ impl WebRtcServer {
 async fn handle_conn(
     mut stream: TcpStream,
     sm: Arc<MediaSourceManager>,
-    sessions: Arc<DashMap<String, WhepSession>>,
+    ice_servers: Vec<IceServer>,
+    play_sessions: Arc<DashMap<String, WhepSession>>,
+    publish_sessions: Arc<DashMap<String, WhipSession>>,
 ) -> Result<()> {
     let mut buf = BytesMut::new();
     let mut tmp = [0u8; 8192];
 
-    // Read until we have the full headers and body (signalled by Content-Length).
     loop {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
@@ -73,14 +86,26 @@ async fn handle_conn(
             }
         }
         if buf.len() > 1 << 20 {
-            return Ok(()); // safety: ignore absurd requests
+            return Ok(());
         }
     }
 
     let (method, path, query, body) = parse_request(&buf)?;
     match method.as_str() {
-        "POST" => handle_post(&mut stream, &path, &query, &body, &sm, &sessions).await,
-        "DELETE" => handle_delete(&mut stream, &path, &sessions).await,
+        "POST" => {
+            handle_post(
+                &mut stream,
+                &path,
+                &query,
+                &body,
+                &sm,
+                &ice_servers,
+                &play_sessions,
+                &publish_sessions,
+            )
+            .await
+        }
+        "DELETE" => handle_delete(&mut stream, &path, &play_sessions, &publish_sessions).await,
         _ => write_response(&mut stream, 405, "Method Not Allowed", &[], &[]).await,
     }
 }
@@ -113,15 +138,49 @@ async fn handle_post(
     query: &HashMap<String, String>,
     body: &[u8],
     sm: &Arc<MediaSourceManager>,
-    sessions: &Arc<DashMap<String, WhepSession>>,
+    ice_servers: &[IceServer],
+    play_sessions: &Arc<DashMap<String, WhepSession>>,
+    publish_sessions: &Arc<DashMap<String, WhipSession>>,
 ) -> Result<()> {
-    let segs: Vec<&str> = path
-        .trim_start_matches("/webrtc/play/")
+    if path.starts_with("/webrtc/play/") {
+        handle_play(stream, path, query, body, sm, ice_servers, play_sessions).await
+    } else if path.starts_with("/webrtc/publish/") {
+        handle_publish(stream, path, query, body, sm, ice_servers, publish_sessions).await
+    } else {
+        write_response(stream, 404, "Not Found", &[], b"unknown endpoint").await
+    }
+}
+
+fn play_segments(path: &str) -> Vec<String> {
+    path.trim_start_matches("/webrtc/play/")
         .trim_end_matches('/')
         .split('/')
         .filter(|s| !s.is_empty())
-        .collect();
-    let (vhost, app, stream_id) = resolve_stream(&segs, query);
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn publish_segments(path: &str) -> Vec<String> {
+    path.trim_start_matches("/webrtc/publish/")
+        .trim_end_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+async fn handle_play(
+    stream: &mut TcpStream,
+    path: &str,
+    query: &HashMap<String, String>,
+    body: &[u8],
+    sm: &Arc<MediaSourceManager>,
+    ice_servers: &[IceServer],
+    sessions: &Arc<DashMap<String, WhepSession>>,
+) -> Result<()> {
+    let segs: Vec<String> = play_segments(path);
+    let segs_ref: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
+    let (vhost, app, stream_id) = resolve_stream(&segs_ref, query);
 
     if stream_id.is_empty() {
         return write_response(
@@ -143,7 +202,7 @@ async fn handle_post(
 
     let offer = String::from_utf8_lossy(body).to_string();
     let resource = Uuid::new_v4().to_string();
-    match whep_play(&offer, source, resource.clone()).await {
+    match whep_play(&offer, source, resource.clone(), ice_servers.to_vec()).await {
         Ok((answer, session)) => {
             sessions.insert(resource.clone(), session);
             let location = format!("/webrtc/play/{}", resource);
@@ -178,21 +237,88 @@ async fn handle_post(
     }
 }
 
+async fn handle_publish(
+    stream: &mut TcpStream,
+    path: &str,
+    query: &HashMap<String, String>,
+    body: &[u8],
+    sm: &Arc<MediaSourceManager>,
+    ice_servers: &[IceServer],
+    sessions: &Arc<DashMap<String, WhipSession>>,
+) -> Result<()> {
+    let segs: Vec<String> = publish_segments(path);
+    let segs_ref: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
+    let (vhost, app, stream_id) = resolve_stream(&segs_ref, query);
+
+    if stream_id.is_empty() {
+        return write_response(
+            stream,
+            400,
+            "Bad Request",
+            &[],
+            b"missing stream identifier",
+        )
+        .await;
+    }
+
+    let source = sm.get_or_create(&vhost, &app, &stream_id);
+    let offer = String::from_utf8_lossy(body).to_string();
+    let resource = Uuid::new_v4().to_string();
+    match whip_publish(&offer, source, resource.clone(), ice_servers.to_vec()).await {
+        Ok((answer, session)) => {
+            sessions.insert(resource.clone(), session);
+            let location = format!("/webrtc/publish/{}", resource);
+            write_response(
+                stream,
+                201,
+                "Created",
+                &[
+                    ("Content-Type", "application/sdp"),
+                    ("Location", &location),
+                    ("ETag", &resource),
+                    ("Access-Control-Allow-Origin", "*"),
+                ],
+                answer.as_bytes(),
+            )
+            .await
+        }
+        Err(e) => {
+            error!(
+                "webrtc: whip_publish failed for {}/{}/{}: {}",
+                vhost, app, stream_id, e
+            );
+            write_response(
+                stream,
+                500,
+                "Internal Server Error",
+                &[],
+                b"negotiation failed",
+            )
+            .await
+        }
+    }
+}
+
 async fn handle_delete(
     stream: &mut TcpStream,
     path: &str,
-    sessions: &Arc<DashMap<String, WhepSession>>,
+    play_sessions: &Arc<DashMap<String, WhepSession>>,
+    publish_sessions: &Arc<DashMap<String, WhipSession>>,
 ) -> Result<()> {
     let resource = path
         .trim_start_matches("/webrtc/play/")
+        .trim_start_matches("/webrtc/publish/")
         .trim_end_matches('/')
         .to_string();
-    if let Some((_, session)) = sessions.remove(&resource) {
+    if let Some((_, session)) = play_sessions.remove(&resource) {
         session.close().await;
-        write_response(stream, 200, "OK", &[], b"stopped").await
-    } else {
-        write_response(stream, 404, "Not Found", &[], b"unknown resource").await
+        return write_response(stream, 200, "OK", &[], b"stopped").await;
     }
+    if let Some((_, session)) = publish_sessions.remove(&resource) {
+        session.close().await;
+        return write_response(stream, 200, "OK", &[], b"stopped").await;
+    }
+    write_response(stream, 404, "Not Found", &[], b"unknown resource").await
 }
 
 fn content_length(buf: &BytesMut) -> usize {

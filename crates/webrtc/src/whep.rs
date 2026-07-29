@@ -11,7 +11,9 @@
 //! * playback only (server -> client);
 //! * H.264 video and Opus audio (the formats the wire payloaders in the
 //!   `webrtc` crate understand natively). AAC audio is published by many
-//!   streams but is not a WebRTC codec, so it is silently skipped for now.
+//!   streams but is not a WebRTC codec. With the `transcode` Cargo feature
+//!   (and a working AAC decoder) an AAC source is transcoded to Opus on the
+//!   fly; without it the AAC track is silently skipped.
 
 use anyhow::{anyhow, Result};
 use bytes::{Bytes, BytesMut};
@@ -22,6 +24,7 @@ use tracing::{debug, info, warn};
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
+use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -29,8 +32,12 @@ use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecParameters;
 use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+use zlmediakit_core::config::IceServer;
 use zlmediakit_core::media_frame::{CodecId, MediaFrame, TrackInfo};
 use zlmediakit_core::media_source::MediaSource;
+
+#[cfg(feature = "transcode")]
+use crate::transcode::AudioTranscoder;
 
 /// A live WHEP session. Held by the HTTP server so the `PeerConnection` (and the
 /// background media pump) stay alive until the client issues a DELETE or the
@@ -51,9 +58,9 @@ impl WhepSession {
 
 /// Negotiate a WHEP playback session.
 ///
-/// * `offer_sdp`  — the SDP offer posted by the client.
-/// * `source`     — the local stream to play.
-/// * `resource`   — opaque id the HTTP layer uses for DELETE / bookkeeping.
+/// * `offer_sdp` — the SDP offer posted by the client.
+/// * `source`    — the local stream to play.
+/// * `resource`  — opaque id the HTTP layer uses for DELETE / bookkeeping.
 ///
 /// Returns the SDP answer (to be returned to the client with the proper
 /// `Content-Type` / `Location` headers) and the kept-alive session.
@@ -61,6 +68,7 @@ pub async fn whep_play(
     offer_sdp: &str,
     source: Arc<MediaSource>,
     resource: String,
+    ice_servers: Vec<IceServer>,
 ) -> Result<(String, WhepSession)> {
     let mut m = MediaEngine::default();
     // Register exactly the codecs we can send. The `TrackLocalStaticSample`
@@ -97,7 +105,7 @@ pub async fn whep_play(
     )?;
 
     let api = APIBuilder::new().with_media_engine(m).build();
-    let pc = Arc::new(api.new_peer_connection(RTCConfiguration::default()).await?);
+    let pc = Arc::new(api.new_peer_connection(build_rtc_config(&ice_servers)).await?);
 
     // Non-trickle WHEP: wait until ICE gathering completes so candidates are
     // embedded in the returned answer SDP.
@@ -163,6 +171,60 @@ pub async fn whep_play(
         audio_track = Some(track);
     }
 
+    // Optional AAC -> Opus transcoding so an AAC-only source can still be played
+    // over WebRTC. Only compiled with the `transcode` feature.
+    #[cfg(feature = "transcode")]
+    let mut transcoder: Option<Arc<tokio::sync::Mutex<AudioTranscoder>>> = None;
+    #[cfg(feature = "transcode")]
+    if !has_audio_opus {
+        let has_aac = {
+            let info = source.info.read().await;
+            info.tracks
+                .iter()
+                .any(|t| matches!(t, TrackInfo::Audio(ai) if ai.codec == CodecId::AAC))
+        };
+        if has_aac {
+            let track = Arc::new(TrackLocalStaticSample::new(
+                RTCRtpCodecCapability {
+                    mime_type: webrtc::api::media_engine::MIME_TYPE_OPUS.to_owned(),
+                    clock_rate: 48_000,
+                    channels: 2,
+                    sdp_fmtp_line: "minptime=10;useinbandfec=1".to_string(),
+                    rtcp_feedback: vec![],
+                },
+                "audio".to_string(),
+                "zlmediakit".to_string(),
+            ));
+            let _ = pc.add_track(track.clone()).await;
+            audio_track = Some(track);
+
+            #[cfg(feature = "aac-transcode")]
+            let decoder: Option<Box<dyn crate::transcode::Decoder>> = {
+                let info = source.info.read().await;
+                let (rate, ch) = info
+                    .tracks
+                    .iter()
+                    .find_map(|t| match t {
+                        TrackInfo::Audio(ai) if ai.codec == CodecId::AAC => {
+                            Some((ai.sample_rate, ai.channels as u8))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or((48_000, 2));
+                match crate::transcode::FdkAacDecoder::new(rate, ch) {
+                    Ok(d) => Some(Box::new(d)),
+                    Err(_) => None,
+                }
+            };
+            #[cfg(not(feature = "aac-transcode"))]
+            let decoder: Option<Box<dyn crate::transcode::Decoder>> = None;
+
+            transcoder = Some(Arc::new(tokio::sync::Mutex::new(AudioTranscoder::new(
+                decoder, 48_000, 2,
+            )?)));
+        }
+    }
+
     let offer = RTCSessionDescription::offer(offer_sdp.to_string())?;
     pc.set_remote_description(offer).await?;
     let answer = pc.create_answer(None).await?;
@@ -176,41 +238,36 @@ pub async fn whep_play(
         .ok_or_else(|| anyhow!("webrtc: no local description after gathering"))?;
     let answer_sdp = local.sdp.clone();
 
-    spawn_pump(source, video_track, audio_track);
+    spawn_pump(source, video_track, audio_track, transcoder);
 
     info!("webrtc: WHEP session {} negotiated", resource);
     Ok((answer_sdp, WhepSession { pc, resource }))
 }
 
-/// Spawns the background task that replays the cached GOP and then streams
-/// live frames into the RTP tracks. Samples written before the DTLS/SRTP
-/// transport is bound are dropped by `TrackLocalStaticSample` (it returns
-/// `Ok(())` without sending), so starting immediately is safe.
+#[cfg(not(feature = "transcode"))]
 fn spawn_pump(
     source: Arc<MediaSource>,
     video: Option<Arc<TrackLocalStaticSample>>,
     audio: Option<Arc<TrackLocalStaticSample>>,
 ) {
     tokio::spawn(async move {
-        // Replay cached config (SPS/PPS) + latest GOP so a late decoder can
-        // start from a key frame.
         let cached = source.get_latest_gop_frames().await;
         for f in &cached {
             push_frame(f, &video, &audio).await;
         }
-
         let mut rx = source.subscribe();
         loop {
             match rx.recv().await {
                 Ok(f) => push_frame(&f, &video, &audio).await,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => break, // closed
+                Err(_) => break,
             }
         }
         info!("webrtc: media pump ended");
     });
 }
 
+#[cfg(not(feature = "transcode"))]
 async fn push_frame(
     f: &MediaFrame,
     video: &Option<Arc<TrackLocalStaticSample>>,
@@ -244,6 +301,91 @@ async fn push_frame(
                 };
                 if let Err(e) = a.write_sample(&sample).await {
                     debug!("webrtc: audio write_sample error: {}", e);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(feature = "transcode")]
+fn spawn_pump(
+    source: Arc<MediaSource>,
+    video: Option<Arc<TrackLocalStaticSample>>,
+    audio: Option<Arc<TrackLocalStaticSample>>,
+    transcoder: Option<Arc<tokio::sync::Mutex<AudioTranscoder>>>,
+) {
+    tokio::spawn(async move {
+        let cached = source.get_latest_gop_frames().await;
+        for f in &cached {
+            push_frame(f, &video, &audio, &transcoder).await;
+        }
+        let mut rx = source.subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(f) => push_frame(&f, &video, &audio, &transcoder).await,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        info!("webrtc: media pump ended");
+    });
+}
+
+#[cfg(feature = "transcode")]
+async fn push_frame(
+    f: &MediaFrame,
+    video: &Option<Arc<TrackLocalStaticSample>>,
+    audio: &Option<Arc<TrackLocalStaticSample>>,
+    transcoder: &Option<Arc<tokio::sync::Mutex<AudioTranscoder>>>,
+) {
+    match f.codec {
+        CodecId::H264 => {
+            if let Some(v) = video {
+                let annexb = avcc_to_annexb(&f.data);
+                if annexb.is_empty() {
+                    return;
+                }
+                let sample = webrtc::media::Sample {
+                    data: annexb,
+                    timestamp: SystemTime::now(),
+                    duration: Duration::from_millis(40),
+                    ..Default::default()
+                };
+                if let Err(e) = v.write_sample(&sample).await {
+                    debug!("webrtc: video write_sample error: {}", e);
+                }
+            }
+        }
+        CodecId::Opus => {
+            if let Some(a) = audio {
+                let sample = webrtc::media::Sample {
+                    data: f.data.clone(),
+                    timestamp: SystemTime::now(),
+                    duration: Duration::from_millis(20),
+                    ..Default::default()
+                };
+                if let Err(e) = a.write_sample(&sample).await {
+                    debug!("webrtc: audio write_sample error: {}", e);
+                }
+            }
+        }
+        CodecId::AAC => {
+            // Transcode AAC -> Opus so WebRTC can carry it.
+            if let (Some(a), Some(t)) = (audio, transcoder) {
+                match t.lock().await.transcode(&f.data) {
+                    Ok(opus_bytes) => {
+                        let sample = webrtc::media::Sample {
+                            data: Bytes::from(opus_bytes),
+                            timestamp: SystemTime::now(),
+                            duration: Duration::from_millis(20),
+                            ..Default::default()
+                        };
+                        if let Err(e) = a.write_sample(&sample).await {
+                            debug!("webrtc: transcoded audio write_sample error: {}", e);
+                        }
+                    }
+                    Err(e) => debug!("webrtc: transcode error: {}", e),
                 }
             }
         }
@@ -319,4 +461,21 @@ fn avcc_to_annexb(data: &[u8]) -> Bytes {
         }
     }
     out.freeze()
+}
+
+/// Build a `webrtc` `RTCConfiguration` from the server's `IceServer` list so
+/// STUN/TURN servers for NAT traversal can be configured via `conf/config.toml`.
+/// Shared by both WHEP (playback) and WHIP (publish) negotiation.
+pub(crate) fn build_rtc_config(ice_servers: &[IceServer]) -> RTCConfiguration {
+    RTCConfiguration {
+        ice_servers: ice_servers
+            .iter()
+            .map(|s| RTCIceServer {
+                urls: s.urls.clone(),
+                username: s.username.clone(),
+                credential: s.credential.clone(),
+            })
+            .collect(),
+        ..Default::default()
+    }
 }

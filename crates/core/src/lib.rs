@@ -9,6 +9,7 @@ pub mod media_source;
 pub mod recorder;
 pub mod session;
 pub mod stream_proxy;
+pub mod transport;
 pub mod utils;
 
 pub use auth::{generate_sign, validate_sign, StreamAuth};

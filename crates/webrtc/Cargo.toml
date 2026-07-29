@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# AAC -> Opus transcoding for WebRTC playback. Needs `libopus` at build time.
+transcode = ["dep:opus"]
+# AAC decoding (via libfdk-aac). Needs `libfdk-aac-dev` at build time.
+aac-transcode = ["transcode", "dep:aac"]
+
 [dependencies]
 zlmediakit-core = { path = "../core" }
 tokio = { workspace = true }
@@ -16,3 +23,7 @@ serde_json = { workspace = true }
 dashmap = { workspace = true }
 uuid = { workspace = true }
 webrtc = "0.12"
+
+# Optional, only pulled in with the `transcode` / `aac-transcode` features.
+opus = { version = "0.3", optional = true }
+aac = { version = "0.0", optional = true }

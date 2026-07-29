@@ -3,13 +3,13 @@ use dashmap::DashMap;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::recorder::RecorderControl;
 use zlmediakit_core::stream_proxy::StreamProxyControl;
+use zlmediakit_core::transport::TransportStream;
 use zlmediakit_hls::muxer::{self, HlsSegment};
 
 use zlmediakit_flv::FlvMuxer;
@@ -18,7 +18,7 @@ pub static HLS_SEGMENTS: once_cell::sync::Lazy<DashMap<String, Arc<RwLock<VecDeq
     once_cell::sync::Lazy::new(DashMap::new);
 
 pub struct HttpSession {
-    stream: TcpStream,
+    stream: TransportStream,
     peer_addr: String,
     source_manager: Arc<MediaSourceManager>,
     auth: Arc<StreamAuth>,
@@ -29,7 +29,7 @@ pub struct HttpSession {
 
 impl HttpSession {
     pub fn new(
-        stream: TcpStream,
+        stream: TransportStream,
         peer_addr: String,
         source_manager: Arc<MediaSourceManager>,
         auth: Arc<StreamAuth>,
@@ -457,8 +457,8 @@ impl HttpSession {
                         .await?;
                     return Ok(());
                 }
-                let (hls, flv) = Self::api_record_types(path);
-                self.recorder.start(&vhost, &app, &stream, hls, flv);
+                let (hls, flv, mp4) = Self::api_record_types(path);
+                self.recorder.start(&vhost, &app, &stream, hls, flv, mp4);
                 self.send_json(&serde_json::json!({"code": 0, "result": "record started"}))
                     .await?;
             }
@@ -487,13 +487,14 @@ impl HttpSession {
                 let state = self
                     .recorder
                     .is_recording(&vhost, &app, &stream)
-                    .unwrap_or((false, false));
+                    .unwrap_or((false, false, false));
                 self.send_json(&serde_json::json!({
                     "code": 0,
                     "result": {
-                        "recording": state.0 || state.1,
+                        "recording": state.0 || state.1 || state.2,
                         "hls": state.0,
                         "flv": state.1,
+                        "mp4": state.2,
                     }
                 }))
                 .await?;
@@ -605,8 +606,8 @@ impl HttpSession {
     }
 
     /// Decides which container formats to record from the `type` query param.
-    /// ZLMediaKit uses `type`: `hls`/`flv` (or `all`). Defaults to HLS.
-    fn api_record_types(path: &str) -> (bool, bool) {
+    /// ZLMediaKit uses `type`: `hls`/`flv`/`mp4` (or `all`). Defaults to HLS.
+    fn api_record_types(path: &str) -> (bool, bool, bool) {
         let q = Self::parse_query(path);
         let t = q
             .get("type")
@@ -615,7 +616,8 @@ impl HttpSession {
             .to_lowercase();
         let hls = t == "hls" || t == "all";
         let flv = t == "flv" || t == "all";
-        (hls, flv)
+        let mp4 = t == "mp4" || t == "all";
+        (hls, flv, mp4)
     }
 
     async fn send_json(&mut self, body: &serde_json::Value) -> anyhow::Result<()> {

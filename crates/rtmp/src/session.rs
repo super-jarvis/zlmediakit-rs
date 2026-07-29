@@ -3,16 +3,16 @@ use super::handshake::RtmpHandshake;
 use super::message::{RtmpMessage, RtmpMessageEncoder, RtmpMessageParser};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::event_bus::{Event, EventBus};
 use zlmediakit_core::media_frame::{CodecId, FrameType, MediaFrame};
 use zlmediakit_core::media_source::{MediaSource, MediaSourceManager};
+use zlmediakit_core::transport::TransportStream;
 
 pub struct RtmpSession {
-    stream: Option<TcpStream>,
+    stream: Option<TransportStream>,
     peer_addr: String,
     msg_parser: RtmpMessageParser,
     msg_encoder: RtmpMessageEncoder,
@@ -31,7 +31,7 @@ pub struct RtmpSession {
 
 impl RtmpSession {
     pub fn new(
-        stream: TcpStream,
+        stream: TransportStream,
         peer_addr: String,
         source_manager: Arc<MediaSourceManager>,
         event_bus: Arc<EventBus>,

@@ -62,8 +62,14 @@ pub struct RtmpConfig {
     pub enabled: bool,
     #[serde(default)]
     pub port: Option<u16>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub ssl: bool,
+    #[serde(default)]
+    pub ssl_cert: Option<String>,
+    #[serde(default)]
+    pub ssl_key: Option<String>,
+    #[serde(default)]
+    pub ssl_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,8 +78,14 @@ pub struct RtspConfig {
     pub enabled: bool,
     #[serde(default)]
     pub port: Option<u16>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub ssl: bool,
+    #[serde(default)]
+    pub ssl_cert: Option<String>,
+    #[serde(default)]
+    pub ssl_key: Option<String>,
+    #[serde(default)]
+    pub ssl_port: Option<u16>,
     #[serde(default = "default_true")]
     pub tcp_mode: bool,
 }
@@ -84,10 +96,28 @@ pub struct HttpConfig {
     pub enabled: bool,
     #[serde(default)]
     pub port: Option<u16>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub ssl: bool,
+    #[serde(default)]
+    pub ssl_cert: Option<String>,
+    #[serde(default)]
+    pub ssl_key: Option<String>,
+    #[serde(default)]
+    pub ssl_port: Option<u16>,
     #[serde(default = "default_true")]
     pub dir_root: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IceServer {
+    /// ICE server URLs, e.g. `stun:stun.l.google.com:19302` or
+    /// `turn:turn.example.com:3478?transport=udp`.
+    #[serde(default)]
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub credential: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +126,10 @@ pub struct WebRtcConfig {
     pub enabled: bool,
     #[serde(default)]
     pub port: Option<u16>,
+    /// ICE servers (STUN/TURN) used for NAT traversal. Empty means host
+    /// candidates only (same-LAN / open-Internet peers).
+    #[serde(default)]
+    pub ice_servers: Vec<IceServer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +246,7 @@ impl Default for WebRtcConfig {
         Self {
             enabled: true,
             port: None,
+            ice_servers: vec![],
         }
     }
 }

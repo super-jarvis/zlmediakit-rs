@@ -1,13 +1,16 @@
-use super::session::RtmpSession;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::event_bus::EventBus;
 use zlmediakit_core::media_source::MediaSourceManager;
+use zlmediakit_core::transport::{load_tls_config, TlsAcceptor, TransportStream};
+
+use crate::session::RtmpSession;
 
 pub struct RtmpServer {
     listener: TcpListener,
+    tls: Option<TlsAcceptor>,
     source_manager: Arc<MediaSourceManager>,
     event_bus: Arc<EventBus>,
     auth: Arc<StreamAuth>,
@@ -19,11 +22,19 @@ impl RtmpServer {
         source_manager: Arc<MediaSourceManager>,
         event_bus: Arc<EventBus>,
         auth: Arc<StreamAuth>,
+        ssl_cert: Option<String>,
+        ssl_key: Option<String>,
     ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
-        info!("RTMP server listening on {}", addr);
+        let tls = load_tls_config(ssl_cert.as_deref(), ssl_key.as_deref())?;
+        if tls.is_some() {
+            info!("RTMPS server listening on {}", addr);
+        } else {
+            info!("RTMP server listening on {}", addr);
+        }
         Ok(Self {
             listener,
+            tls,
             source_manager,
             event_bus,
             auth,
@@ -38,15 +49,43 @@ impl RtmpServer {
                     let event_bus = self.event_bus.clone();
                     let auth = self.auth.clone();
                     let peer = peer_addr.to_string();
-                    info!("RTMP connection from {}", peer);
 
-                    tokio::spawn(async move {
-                        let mut session =
-                            RtmpSession::new(stream, peer, source_manager, event_bus, auth);
-                        if let Err(e) = session.run().await {
-                            error!("RTMP session error: {}", e);
-                        }
-                    });
+                    if let Some(ref tls) = self.tls {
+                        let peer2 = peer.clone();
+                        tokio::spawn(async move {
+                            match tls.accept(stream).await {
+                                Ok(tls_stream) => {
+                                    let mut session = RtmpSession::new(
+                                        TransportStream::Tls(tls_stream),
+                                        peer2,
+                                        source_manager,
+                                        event_bus,
+                                        auth,
+                                    );
+                                    if let Err(e) = session.run().await {
+                                        error!("RTMPS session error: {}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("TLS accept from {} failed: {}", peer2, e);
+                                }
+                            }
+                        });
+                    } else {
+                        tokio::spawn(async move {
+                            info!("RTMP connection from {}", peer);
+                            let mut session = RtmpSession::new(
+                                TransportStream::Tcp(stream),
+                                peer,
+                                source_manager,
+                                event_bus,
+                                auth,
+                            );
+                            if let Err(e) = session.run().await {
+                                error!("RTMP session error: {}", e);
+                            }
+                        });
+                    }
                 }
                 Err(e) => {
                     error!("RTMP accept error: {}", e);

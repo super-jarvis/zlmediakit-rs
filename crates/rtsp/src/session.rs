@@ -6,7 +6,7 @@ use rand::RngExt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tracing::{debug, error, info, warn};
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::event_bus::{Event, EventBus};
@@ -14,9 +14,10 @@ use zlmediakit_core::media_frame::{
     AudioInfo, CodecId, FrameType, MediaFrame, TrackInfo, VideoInfo,
 };
 use zlmediakit_core::media_source::{MediaSource, MediaSourceManager};
+use zlmediakit_core::transport::TransportStream;
 
 pub struct RtspSession {
-    stream: Option<TcpStream>,
+    stream: Option<TransportStream>,
     peer_addr: String,
     client_ip: String,
     source_manager: Arc<MediaSourceManager>,
@@ -51,7 +52,7 @@ pub struct RtspSession {
 
 impl RtspSession {
     pub fn new(
-        stream: TcpStream,
+        stream: TransportStream,
         peer_addr: String,
         source_manager: Arc<MediaSourceManager>,
         event_bus: Arc<EventBus>,

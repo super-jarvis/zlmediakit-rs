@@ -39,7 +39,19 @@ dir_root = true
 [webrtc]
 enabled = true
 port = 9000
+# ICE servers for NAT traversal. Empty = host candidates only (same LAN /
+# open Internet). Uncomment to enable STUN and/or TURN:
+# ice_servers = [
+#   { urls = ["stun:stun.l.google.com:19302"] },
+#   { urls = ["turn:turn.example.com:3478?transport=udp"], username = "user", credential = "pass" },
+# ]
+ice_servers = []
 
+# Optional AAC->Opus audio transcoding for WebRTC playback is behind the
+# `transcode` Cargo feature (needs libopus / libfdk-aac at build time):
+#   cargo build --features zlmediakit-webrtc/transcode,zlmediakit-webrtc/aac-transcode
+
+# Record settings
 # Record settings
 [record]
 app = "record"

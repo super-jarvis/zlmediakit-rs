@@ -7,6 +7,7 @@ members = [
     "crates/http",
     "crates/flv",
     "crates/hls",
+    "crates/mp4",
     "crates/server",
     "crates/webrtc",
 ]
@@ -42,3 +43,7 @@ base64 = "0.23"
 rand = "0.10"
 hex = "0.4"
 log = "0.4"
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
