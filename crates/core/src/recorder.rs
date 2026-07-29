@@ -43,7 +43,15 @@ impl RecorderControl {
 
     /// Asks the supervisor to start recording the given stream. Returns false
     /// only if the command channel is closed (server shutting down).
-    pub fn start(&self, vhost: &str, app: &str, stream: &str, hls: bool, flv: bool, mp4: bool) -> bool {
+    pub fn start(
+        &self,
+        vhost: &str,
+        app: &str,
+        stream: &str,
+        hls: bool,
+        flv: bool,
+        mp4: bool,
+    ) -> bool {
         self.tx
             .send(RecorderCommand {
                 vhost: vhost.to_string(),

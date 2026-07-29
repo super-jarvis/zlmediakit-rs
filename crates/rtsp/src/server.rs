@@ -41,6 +41,7 @@ impl RtspServer {
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
+        let tls = self.tls.clone();
         loop {
             match self.listener.accept().await {
                 Ok((stream, peer_addr)) => {
@@ -49,14 +50,15 @@ impl RtspServer {
                     let auth = self.auth.clone();
                     let peer = peer_addr.to_string();
 
-                    if let Some(ref tls) = self.tls {
+                    if let Some(ref tls) = tls {
+                        let tls = tls.clone();
                         let peer2 = peer.clone();
                         tokio::spawn(async move {
                             match tls.accept(stream).await {
                                 Ok(tls_stream) => {
                                     info!("RTSPS connection from {}", peer2);
                                     let mut session = RtspSession::new(
-                                        TransportStream::Tls(tls_stream),
+                                        TransportStream::from_tls_accepted(tls_stream),
                                         peer2,
                                         source_manager,
                                         event_bus,

@@ -10,14 +10,13 @@
 //! conversion the rest of the pipeline expects.
 
 use anyhow::{anyhow, Result};
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
-use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
@@ -67,6 +66,7 @@ pub async fn whip_publish(
     resource: String,
     ice_servers: Vec<IceServer>,
 ) -> Result<(String, WhipSession)> {
+    crate::init_crypto();
     let mut m = MediaEngine::default();
     m.register_codec(
         codec_params(H264_MIME, 90_000, 0, H264_CAP, 102),
@@ -117,7 +117,9 @@ pub async fn whip_publish(
 
     let src = source.clone();
     pc.on_track(Box::new(
-        move |track: Arc<TrackRemote>, _recv: Arc<RTCRtpReceiver>, trans: Arc<RTCRtpTransceiver>| {
+        move |track: Arc<TrackRemote>,
+              _recv: Arc<RTCRtpReceiver>,
+              trans: Arc<RTCRtpTransceiver>| {
             let src = src.clone();
             let kind = trans.kind();
             Box::pin(async move {
@@ -148,7 +150,13 @@ pub async fn whip_publish(
     Ok((answer_sdp, WhipSession { pc, resource }))
 }
 
-fn codec_params(mime: &str, clock: u32, channels: u8, fmtp: &str, pt: u8) -> RTCRtpCodecParameters {
+fn codec_params(
+    mime: &str,
+    clock: u32,
+    channels: u16,
+    fmtp: &str,
+    pt: u8,
+) -> RTCRtpCodecParameters {
     RTCRtpCodecParameters {
         capability: RTCRtpCodecCapability {
             mime_type: mime.to_owned(),
@@ -193,8 +201,7 @@ async fn receive_video(track: Arc<TrackRemote>, source: Arc<MediaSource>) {
             // SPS/PPS only: emit the AVCC decoder config once both are known.
             if sps.is_some() && pps.is_some() {
                 if let Some(cfg) = build_avcc_config(sps.as_deref(), pps.as_deref()) {
-                    let mut f =
-                        MediaFrame::new_video(0, CodecId::H264, seq, ts, ts, cfg, true);
+                    let mut f = MediaFrame::new_video(0, CodecId::H264, seq, ts, ts, cfg, true);
                     f.config_frame = true;
                     source.publish_and_cache(f).await;
                     config_sent = true;
@@ -204,8 +211,7 @@ async fn receive_video(track: Arc<TrackRemote>, source: Arc<MediaSource>) {
             // VCL frame: ensure the decoder config was sent first.
             if !config_sent {
                 if let Some(cfg) = build_avcc_config(sps.as_deref(), pps.as_deref()) {
-                    let mut f =
-                        MediaFrame::new_video(0, CodecId::H264, seq, ts, ts, cfg, true);
+                    let mut f = MediaFrame::new_video(0, CodecId::H264, seq, ts, ts, cfg, true);
                     f.config_frame = true;
                     source.publish_and_cache(f).await;
                     config_sent = true;
@@ -214,7 +220,13 @@ async fn receive_video(track: Arc<TrackRemote>, source: Arc<MediaSource>) {
             if let Some(sample) = build_avcc_sample(&annexb, key) {
                 source
                     .publish_and_cache(MediaFrame::new_video(
-                        0, CodecId::H264, seq, ts, ts, sample, key,
+                        0,
+                        CodecId::H264,
+                        seq,
+                        ts,
+                        ts,
+                        sample,
+                        key,
                     ))
                     .await;
             }
@@ -254,9 +266,9 @@ fn split_nalus(annexb: &[u8]) -> Vec<(u8, Bytes)> {
     let n = annexb.len();
     let mut i = 0;
     while i < n {
-        if i + 4 <= n && &annexb[i..i + 4] == [0, 0, 0, 1] {
+        if i + 4 <= n && annexb[i..i + 4] == [0, 0, 0, 1] {
             i += 4;
-        } else if i + 3 <= n && &annexb[i..i + 3] == [0, 0, 1] {
+        } else if i + 3 <= n && annexb[i..i + 3] == [0, 0, 1] {
             i += 3;
         } else {
             i += 1;
@@ -264,10 +276,10 @@ fn split_nalus(annexb: &[u8]) -> Vec<(u8, Bytes)> {
         }
         let start = i;
         while i < n {
-            if i + 4 <= n && &annexb[i..i + 4] == [0, 0, 0, 1] {
+            if i + 4 <= n && annexb[i..i + 4] == [0, 0, 0, 1] {
                 break;
             }
-            if i + 3 <= n && &annexb[i..i + 3] == [0, 0, 1] {
+            if i + 3 <= n && annexb[i..i + 3] == [0, 0, 1] {
                 break;
             }
             i += 1;
@@ -294,15 +306,15 @@ fn build_avcc_config(sps: Option<&[u8]>, pps: Option<&[u8]>) -> Option<Bytes> {
     // FLV header: [key-frame(1)<<4 | codec 7, avc_packet_type=0, cts=0,0,0]
     out.extend_from_slice(&[0x17, 0x00, 0x00, 0x00, 0x00]);
     // AVCDecoderConfigurationRecord
-    out.push(0x01); // configurationVersion
-    out.push(sps[1]); // AVCProfileIndication
-    out.push(sps[2]); // profile_compatibility
-    out.push(sps[3]); // AVCLevelIndication
-    out.push(0xFF); // 6 bits reserved(111111) | 2 bits lengthSizeMinusOne=3
-    out.push(0xE1); // 3 bits reserved(111) | 5 bits numSPS=1
+    out.put_u8(0x01); // configurationVersion
+    out.put_u8(sps[1]); // AVCProfileIndication
+    out.put_u8(sps[2]); // profile_compatibility
+    out.put_u8(sps[3]); // AVCLevelIndication
+    out.put_u8(0xFF); // 6 bits reserved(111111) | 2 bits lengthSizeMinusOne=3
+    out.put_u8(0xE1); // 3 bits reserved(111) | 5 bits numSPS=1
     out.extend_from_slice(&(sps.len() as u16).to_be_bytes());
     out.extend_from_slice(sps);
-    out.push(0x01); // numPPS
+    out.put_u8(0x01); // numPPS
     out.extend_from_slice(&(pps.len() as u16).to_be_bytes());
     out.extend_from_slice(pps);
     Some(out.freeze())
@@ -312,8 +324,8 @@ fn build_avcc_config(sps: Option<&[u8]>, pps: Option<&[u8]>) -> Option<Bytes> {
 fn build_avcc_sample(annexb: &[u8], key: bool) -> Option<Bytes> {
     let mut out = BytesMut::new();
     let frame_type: u8 = if key { 0x10 } else { 0x20 };
-    out.push(frame_type | 7); // (frame_type<<4) | codec 7 (AVC)
-    out.push(0x01); // avc_packet_type = 1 (NALU)
+    out.put_u8(frame_type | 7); // (frame_type<<4) | codec 7 (AVC)
+    out.put_u8(0x01); // avc_packet_type = 1 (NALU)
     out.extend_from_slice(&[0, 0, 0]); // composition time offset
     for (_, nalu) in split_nalus(annexb) {
         out.extend_from_slice(&(nalu.len() as u32).to_be_bytes());

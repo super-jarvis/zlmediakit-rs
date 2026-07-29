@@ -12,6 +12,7 @@ use zlmediakit_core::stream_proxy::StreamProxyControl;
 use zlmediakit_core::transport::TransportStream;
 use zlmediakit_hls::muxer::{self, HlsSegment};
 
+use crate::ws::{upgrade_response, WsSession};
 use zlmediakit_flv::FlvMuxer;
 
 pub static HLS_SEGMENTS: once_cell::sync::Lazy<DashMap<String, Arc<RwLock<VecDeque<HlsSegment>>>>> =
@@ -47,7 +48,7 @@ impl HttpSession {
         }
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub async fn run(mut self) -> anyhow::Result<()> {
         let mut read_buf = [0u8; 4096];
         match self.stream.read(&mut read_buf).await {
             Ok(0) => return Ok(()),
@@ -69,10 +70,29 @@ impl HttpSession {
             return Ok(());
         }
 
-        let method = parts[0];
+        let _method = parts[0];
         let path = parts[1];
 
-        debug!("HTTP {} {} from {}", method, path, self.peer_addr);
+        debug!("HTTP {} {} from {}", _method, path, self.peer_addr);
+
+        // WebSocket upgrade detection
+        let is_ws = request_str.contains("Upgrade: websocket")
+            || request_str.contains("upgrade: websocket");
+        if is_ws {
+            let ws_key = request_str
+                .lines()
+                .find(|l| l.to_lowercase().starts_with("sec-websocket-key:"))
+                .and_then(|l| l.split_once(':'))
+                .map(|(_, v)| v.trim())
+                .unwrap_or("");
+
+            if !ws_key.is_empty() {
+                let response = upgrade_response(ws_key);
+                self.stream.write_all(response.as_bytes()).await?;
+                let mut ws = WsSession::new(self.stream, self.source_manager, self.auth);
+                return ws.run_flv(path).await;
+            }
+        }
 
         // Route on the path without any query string; the handlers still
         // receive the full `path` so they can extract `?sign=` and other params.
@@ -771,6 +791,7 @@ button.danger:hover {{ background:#f85149; }}
       <option value="auto">Auto</option>
       <option value="hls">HLS</option>
       <option value="flv">HTTP-FLV</option>
+      <option value="wsflv">WebSocket-FLV</option>
     </select>
   </div>
   <div id="player-container" style="margin-top:8px;display:none;">
@@ -787,6 +808,7 @@ button.danger:hover {{ background:#f85149; }}
   <tr><td>HTTP-FLV</td><td><code>http://host:{0}/live/stream.flv</code></td></tr>
   <tr><td>HLS</td><td><code>http://host:{0}/live/stream/hls.m3u8</code></td></tr>
   <tr><td>HLS (alt)</td><td><code>http://host:{0}/live/stream.m3u8</code></td></tr>
+  <tr><td>WebSocket-FLV</td><td><code>ws://host:{0}/live/stream.flv</code></td></tr>
   <tr><td>API</td><td><code>http://host:{0}/index/api/getMediaList</code></td></tr>
 </table>
 </div>
@@ -842,7 +864,9 @@ function closeStream(app, stream) {{
 
 function setStreamUrl(app, stream) {{
   const sel = document.getElementById('player-type').value;
-  if (sel === 'hls' || sel === 'auto')
+  if (sel === 'wsflv')
+    document.getElementById('stream-url').value = 'ws://' + window.location.host + '/' + app + '/' + stream + '.flv';
+  else if (sel === 'hls' || sel === 'auto')
     document.getElementById('stream-url').value = '/' + app + '/' + stream + '/hls.m3u8';
   else
     document.getElementById('stream-url').value = '/' + app + '/' + stream + '.flv';
@@ -862,7 +886,7 @@ function playStream() {{
   errEl.style.display = 'none';
   container.style.display = 'block';
 
-  const isAbsolute = url.startsWith('http://') || url.startsWith('https://');
+  const isAbsolute = url.startsWith('http://') || url.startsWith('https://') || url.startsWith('ws://');
   const fullUrl = isAbsolute ? url : window.location.protocol + '//' + window.location.host + url;
 
   if (url.endsWith('.m3u8') || playerType === 'hls') {{
@@ -883,10 +907,11 @@ function playStream() {{
       errEl.textContent = 'HLS not supported in this browser';
       errEl.style.display = 'block';
     }}
-  }} else if (url.endsWith('.flv') || playerType === 'flv') {{
-    info.textContent = 'HTTP-FLV: ' + fullUrl;
+  }} else if (url.startsWith('ws://') || url.endsWith('.flv') || playerType === 'flv' || playerType === 'wsflv') {{
+    const label = url.startsWith('ws://') ? 'WebSocket-FLV' : 'HTTP-FLV';
+    info.textContent = label + ': ' + (url.startsWith('ws://') ? url : fullUrl);
     if (flvjs.isSupported()) {{
-      const f = flvjs.createPlayer({{ type: 'flv', url: fullUrl }}, {{ enableWorker: false }});
+      const f = flvjs.createPlayer({{ type: 'flv', url: url.startsWith('ws://') ? url : fullUrl, isLive: true }}, {{ enableWorker: false }});
       f.attachMediaElement(video);
       f.load();
       f.play();

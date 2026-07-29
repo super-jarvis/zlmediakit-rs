@@ -245,7 +245,7 @@ async fn main() -> Result<()> {
         let sup_sm = source_manager.clone();
         info!(
             "Recorder supervisor started (auto hls={}, flv={}, mp4={}) -> {}",
-             config.record.hls, config.record.flv, config.record.mp4, rec_base
+            config.record.hls, config.record.flv, config.record.mp4, rec_base
         );
         let rec = recorder_control.clone();
         let handle = tokio::spawn(async move {

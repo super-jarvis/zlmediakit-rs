@@ -45,6 +45,7 @@ impl HttpServer {
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
+        let tls = self.tls.clone();
         loop {
             match self.listener.accept().await {
                 Ok((stream, peer_addr)) => {
@@ -54,13 +55,14 @@ impl HttpServer {
                     let proxy = self.proxy.clone();
                     let peer = peer_addr.to_string();
 
-                    if let Some(ref tls) = self.tls {
+                    if let Some(ref tls) = tls {
+                        let tls = tls.clone();
                         let peer2 = peer.clone();
                         tokio::spawn(async move {
                             match tls.accept(stream).await {
                                 Ok(tls_stream) => {
-                                    let mut session = HttpSession::new(
-                                        TransportStream::Tls(tls_stream),
+                                    let session = HttpSession::new(
+                                        TransportStream::from_tls_accepted(tls_stream),
                                         peer2,
                                         source_manager,
                                         auth,
@@ -78,7 +80,7 @@ impl HttpServer {
                         });
                     } else {
                         tokio::spawn(async move {
-                            let mut session = HttpSession::new(
+                            let session = HttpSession::new(
                                 TransportStream::Tcp(stream),
                                 peer,
                                 source_manager,

@@ -70,6 +70,7 @@ pub async fn whep_play(
     resource: String,
     ice_servers: Vec<IceServer>,
 ) -> Result<(String, WhepSession)> {
+    crate::init_crypto();
     let mut m = MediaEngine::default();
     // Register exactly the codecs we can send. The `TrackLocalStaticSample`
     // binds to a matching registered codec to pick the right RTP payloader.
@@ -105,7 +106,10 @@ pub async fn whep_play(
     )?;
 
     let api = APIBuilder::new().with_media_engine(m).build();
-    let pc = Arc::new(api.new_peer_connection(build_rtc_config(&ice_servers)).await?);
+    let pc = Arc::new(
+        api.new_peer_connection(build_rtc_config(&ice_servers))
+            .await?,
+    );
 
     // Non-trickle WHEP: wait until ICE gathering completes so candidates are
     // embedded in the returned answer SDP.
@@ -238,7 +242,10 @@ pub async fn whep_play(
         .ok_or_else(|| anyhow!("webrtc: no local description after gathering"))?;
     let answer_sdp = local.sdp.clone();
 
+    #[cfg(feature = "transcode")]
     spawn_pump(source, video_track, audio_track, transcoder);
+    #[cfg(not(feature = "transcode"))]
+    spawn_pump(source, video_track, audio_track);
 
     info!("webrtc: WHEP session {} negotiated", resource);
     Ok((answer_sdp, WhepSession { pc, resource }))
@@ -372,20 +379,30 @@ async fn push_frame(
         }
         CodecId::AAC => {
             // Transcode AAC -> Opus so WebRTC can carry it.
-            if let (Some(a), Some(t)) = (audio, transcoder) {
-                match t.lock().await.transcode(&f.data) {
-                    Ok(opus_bytes) => {
-                        let sample = webrtc::media::Sample {
-                            data: Bytes::from(opus_bytes),
-                            timestamp: SystemTime::now(),
-                            duration: Duration::from_millis(20),
-                            ..Default::default()
-                        };
-                        if let Err(e) = a.write_sample(&sample).await {
-                            debug!("webrtc: transcoded audio write_sample error: {}", e);
-                        }
+            if let Some(t) = transcoder {
+                let mut t = t.lock().await;
+                if f.config_frame {
+                    // First AAC frame carries the AudioSpecificConfig.
+                    if let Err(e) = t.configure(&f.data) {
+                        debug!("webrtc: aac decoder config error: {}", e);
                     }
-                    Err(e) => debug!("webrtc: transcode error: {}", e),
+                } else if let Some(a) = audio {
+                    match t.transcode(&f.data) {
+                        Ok(packets) => {
+                            for opus_bytes in packets {
+                                let sample = webrtc::media::Sample {
+                                    data: Bytes::from(opus_bytes),
+                                    timestamp: SystemTime::now(),
+                                    duration: Duration::from_millis(20),
+                                    ..Default::default()
+                                };
+                                if let Err(e) = a.write_sample(&sample).await {
+                                    debug!("webrtc: transcoded audio write_sample error: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => debug!("webrtc: transcode error: {}", e),
+                    }
                 }
             }
         }

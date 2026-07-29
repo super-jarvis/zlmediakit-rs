@@ -80,6 +80,97 @@ impl H265Parser {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_annexb_empty() {
+        assert!(H265Parser::parse_annexb(b"").is_empty());
+    }
+
+    #[test]
+    fn parse_annexb_single_nal() {
+        let data = b"\x00\x00\x01\x40\x01\x0c\x01\xff";
+        let nals = H265Parser::parse_annexb(data);
+        assert_eq!(nals.len(), 1);
+    }
+
+    #[test]
+    fn parse_annexb_multiple() {
+        let data = b"\x00\x00\x01\x40\x01\x0c\x00\x00\x01\x42\x01\x01";
+        let nals = H265Parser::parse_annexb(data);
+        assert_eq!(nals.len(), 2);
+    }
+
+    #[test]
+    fn parse_annexb_four_byte_startcode() {
+        let data = b"\x00\x00\x00\x01\x40\x01\x0c";
+        let nals = H265Parser::parse_annexb(data);
+        assert_eq!(nals.len(), 1);
+    }
+
+    #[test]
+    fn is_keyframe_bla_wrap() {
+        // NAL unit type 16 (BLA_W_LP) >> 1 & 0x3F = 8, not a keyframe
+        // IDR_W_RADL (19) >> 1 & 0x3F = 9 -> not a keyframe by the logic
+        // Let me re-check the logic...
+        // is_keyframe checks: nalu_type = (nal_type >> 1) & 0x3F
+        // For keyframe: 16 <= nalu_type <= 21
+        // So if nal_type = 32, then (32 >> 1) & 0x3F = 16 -> keyframe
+        assert!(H265Parser::is_keyframe(32)); // VPS type VPS_NUT -> but let me think...
+    }
+
+    #[test]
+    fn is_keyframe_idr() {
+        // nal_type where (nal_type >> 1) & 0x3F = 19 => nal_type = 38 or 39
+        // IDR_W_RADL = 19, so nal_type should be 38 or 39
+        assert!(H265Parser::is_keyframe(38));
+        assert!(H265Parser::is_keyframe(39));
+    }
+
+    #[test]
+    fn is_not_keyframe() {
+        assert!(!H265Parser::is_keyframe(0)); // TRAIL_N
+        assert!(!H265Parser::is_keyframe(1));
+    }
+
+    #[test]
+    fn extract_config_found() {
+        let vps = b"\x40\x01\x0c\x01\xff\xff\x01\x60\x00\x00\x03\x00\xb0\x00\x00\x03\x00\x00\x03\x00\x5d\xa0\x02\x80\x80\x2d\x20";
+        let sps = b"\x42\x01\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f";
+        let pps = b"\x44\x01\x02\x03";
+        let mut data = Vec::new();
+        data.extend_from_slice(b"\x00\x00\x01");
+        data.extend_from_slice(vps);
+        data.extend_from_slice(b"\x00\x00\x01");
+        data.extend_from_slice(sps);
+        data.extend_from_slice(b"\x00\x00\x01");
+        data.extend_from_slice(pps);
+        let (rv, rs, rp) = H265Parser::extract_config(&data).unwrap();
+        assert_eq!(&rv[..2], b"\x40\x01");
+        assert_eq!(&rs[..2], b"\x42\x01");
+        assert_eq!(&rp[..2], b"\x44\x01");
+    }
+
+    #[test]
+    fn extract_config_missing_vps() {
+        let sps = b"\x42\x01\x01";
+        let pps = b"\x44\x01\x02";
+        let mut data = Vec::new();
+        data.extend_from_slice(b"\x00\x00\x01");
+        data.extend_from_slice(sps);
+        data.extend_from_slice(b"\x00\x00\x01");
+        data.extend_from_slice(pps);
+        assert!(H265Parser::extract_config(&data).is_none());
+    }
+
+    #[test]
+    fn extract_config_empty() {
+        assert!(H265Parser::extract_config(b"").is_none());
+    }
+}
+
 impl Default for H265Parser {
     fn default() -> Self {
         Self::new()

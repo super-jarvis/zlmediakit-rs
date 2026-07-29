@@ -26,3 +26,17 @@ pub mod transcode;
 pub use server::WebRtcServer;
 pub use whep::{whep_play, WhepSession};
 pub use whip::{whip_publish, WhipSession};
+
+/// Install a default rustls `CryptoProvider`.
+///
+/// The `webrtc` crate depends on `rustls` with the `ring` provider enabled, but
+/// other crates in this workspace (notably the HTTP/TLS stack) also enable
+/// `aws-lc-rs` on the same `rustls` build. When both provider features are
+/// present rustls will not auto-select one, and every DTLS/SRTP handshake fails
+/// with *"Could not automatically determine the process-level CryptoProvider"*.
+/// Calling this once (idempotent) before any `PeerConnection` is created forces
+/// the `ring` provider as the process default.
+pub fn init_crypto() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+}

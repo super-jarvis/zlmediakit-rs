@@ -203,6 +203,9 @@ impl Default for RtmpConfig {
             enabled: true,
             port: None,
             ssl: false,
+            ssl_cert: None,
+            ssl_key: None,
+            ssl_port: None,
         }
     }
 }
@@ -213,6 +216,9 @@ impl Default for RtspConfig {
             enabled: true,
             port: None,
             ssl: false,
+            ssl_cert: None,
+            ssl_key: None,
+            ssl_port: None,
             tcp_mode: true,
         }
     }
@@ -224,6 +230,9 @@ impl Default for HttpConfig {
             enabled: true,
             port: None,
             ssl: false,
+            ssl_cert: None,
+            ssl_key: None,
+            ssl_port: None,
             dir_root: true,
         }
     }
@@ -270,6 +279,114 @@ impl Default for ServerConfig {
             webrtc: WebRtcConfig::default(),
             webrtc_port: default_webrtc_port(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_config_defaults() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.rtmp_port, 1935);
+        assert_eq!(cfg.rtsp_port, 8554);
+        assert_eq!(cfg.http_port, 8080);
+        assert_eq!(cfg.api_port, 8081);
+        assert_eq!(cfg.default_vhost, "__defaultVhost__");
+        assert!(cfg.rtmp.enabled);
+        assert!(cfg.rtsp.enabled);
+        assert!(cfg.http.enabled);
+        assert!(cfg.http.dir_root);
+    }
+
+    #[test]
+    fn rtmp_config_default() {
+        let cfg = RtmpConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.port, None);
+        assert!(!cfg.ssl);
+        assert!(cfg.ssl_cert.is_none());
+        assert!(cfg.ssl_key.is_none());
+        assert!(cfg.ssl_port.is_none());
+    }
+
+    #[test]
+    fn rtsp_config_default() {
+        let cfg = RtspConfig::default();
+        assert!(cfg.enabled);
+        assert!(cfg.tcp_mode);
+        assert!(!cfg.ssl);
+    }
+
+    #[test]
+    fn http_config_default() {
+        let cfg = HttpConfig::default();
+        assert!(cfg.enabled);
+        assert!(cfg.dir_root);
+        assert!(!cfg.ssl);
+    }
+
+    #[test]
+    fn record_config_default() {
+        let cfg = RecordConfig::default();
+        assert_eq!(cfg.app, "record");
+        assert!(!cfg.hls);
+        assert!(!cfg.flv);
+        assert!(!cfg.mp4);
+    }
+
+    #[test]
+    fn toml_roundtrip() {
+        let cfg = ServerConfig::default();
+        let toml_str = toml::to_string(&cfg).unwrap();
+        let parsed: ServerConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.rtmp_port, cfg.rtmp_port);
+        assert_eq!(parsed.rtsp_port, cfg.rtsp_port);
+        assert_eq!(parsed.http_port, cfg.http_port);
+        assert_eq!(parsed.api_port, cfg.api_port);
+        assert_eq!(parsed.default_vhost, cfg.default_vhost);
+        assert_eq!(parsed.rtmp.enabled, cfg.rtmp.enabled);
+        assert_eq!(parsed.http.dir_root, cfg.http.dir_root);
+    }
+
+    #[test]
+    fn toml_with_overrides() {
+        let toml_str = r#"
+rtmp_port = 19350
+rtsp_port = 8554
+http_port = 8080
+api_port = 9090
+
+[rtmp]
+enabled = false
+port = 1935
+
+[http]
+enabled = true
+dir_root = false
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.rtmp_port, 19350);
+        assert_eq!(cfg.rtsp_port, 8554);
+        assert_eq!(cfg.http_port, 8080);
+        assert!(!cfg.rtmp.enabled);
+        assert!(!cfg.http.dir_root);
+    }
+
+    #[test]
+    fn webrtc_config_default() {
+        let cfg = WebRtcConfig::default();
+        assert!(cfg.enabled);
+        assert!(cfg.ice_servers.is_empty());
+        assert!(cfg.port.is_none());
+    }
+
+    #[test]
+    fn general_config_default() {
+        let cfg = GeneralConfig::default();
+        assert!(cfg.flow_threshold > 0);
+        assert!(cfg.stream_none_reader_delay > 0);
     }
 }
 

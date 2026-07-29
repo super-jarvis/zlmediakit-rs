@@ -68,7 +68,10 @@ impl Mp4Recorder {
 
         let output = muxer.finalize();
         if output.is_empty() {
-            info!("MP4 record: no frames received, skipping {}", path.display());
+            info!(
+                "MP4 record: no frames received, skipping {}",
+                path.display()
+            );
             return Ok(());
         }
 
@@ -77,7 +80,11 @@ impl Mp4Recorder {
         file.write_all(&output).await?;
         file.flush().await?;
 
-        info!("MP4 record: finished {} ({} bytes)", path.display(), output.len());
+        info!(
+            "MP4 record: finished {} ({} bytes)",
+            path.display(),
+            output.len()
+        );
         Ok(())
     }
 }

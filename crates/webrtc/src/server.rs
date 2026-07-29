@@ -34,6 +34,7 @@ impl WebRtcServer {
         source_manager: Arc<MediaSourceManager>,
         ice_servers: Vec<IceServer>,
     ) -> Result<Self> {
+        crate::init_crypto();
         let listener = TcpListener::bind(addr).await?;
         info!("WebRTC (WHEP/WHIP) server listening on {}", addr);
         Ok(Self {

@@ -3,12 +3,6 @@
 version = 4
 
 [[package]]
-name = "aac"
-version = "0.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f541b6b07998a999454a2869a0ad0da750e01f8621d1e492f98bfa496febc839"
-
-[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -720,6 +714,24 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "fdk-aac"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bb67e142688083cb9afb63f2424203fc98c4e7afb494bf912b60b55513b177e"
+dependencies = [
+ "fdk-aac-sys",
+]
+
+[[package]]
+name = "fdk-aac-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24516d2611506d5cb1833555adc75f6baf9fe2706b9c13e6fc33a6b22c51ca83"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -1720,6 +1732,15 @@ dependencies = [
  "rustls-webpki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
@@ -2995,6 +3016,7 @@ dependencies = [
  "futures",
  "parking_lot",
  "rand 0.10.2",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3040,6 +3062,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.23.0",
  "bytes",
  "chrono",
  "dashmap",
@@ -3047,6 +3070,7 @@ dependencies = [
  "once_cell",
  "serde",
  "serde_json",
+ "sha1",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -3133,11 +3157,12 @@ dependencies = [
 name = "zlmediakit-webrtc"
 version = "0.1.0"
 dependencies = [
- "aac",
  "anyhow",
  "bytes",
  "dashmap",
+ "fdk-aac",
  "opus",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

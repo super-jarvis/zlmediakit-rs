@@ -6,9 +6,9 @@
 //! media packets — exercising ICE, DTLS, SRTP and the RTP payloader.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
@@ -16,6 +16,7 @@ use tokio::time::timeout;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
+use webrtc::media::Sample;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
@@ -25,8 +26,6 @@ use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
 use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
 use webrtc::rtp_transceiver::RTCRtpTransceiver;
 use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
-use webrtc::media::Sample;
-use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_remote::TrackRemote;
 use zlmediakit_core::media_frame::{CodecId, MediaFrame, TrackInfo, VideoInfo};
@@ -80,6 +79,7 @@ fn avcc_sample(key: bool, seq: u32) -> Bytes {
 
 #[tokio::test]
 async fn whep_e2e_receives_media() {
+    zlmediakit_webrtc::init_crypto();
     // 1. Publish a synthetic H.264 stream.
     let mgr = Arc::new(MediaSourceManager::new());
     let source = mgr.get_or_create("__defaultVhost__", "live", "webrtctest");
@@ -200,7 +200,7 @@ async fn whep_e2e_receives_media() {
     let offer_sdp = client_pc.local_description().await.unwrap().sdp.clone();
 
     // 3. Server answers and starts pumping.
-    let (answer_sdp, _session) = whep_play(&offer_sdp, source.clone(), "test".to_string())
+    let (answer_sdp, _session) = whep_play(&offer_sdp, source.clone(), "test".to_string(), vec![])
         .await
         .expect("whep_play should negotiate");
 
@@ -296,10 +296,13 @@ fn http_parse(buf: &[u8]) -> (u16, String, String) {
     (status, body, location)
 }
 
-async fn http_exchange(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, String, String) {
-    let mut stream = TcpStream::connect(("127.0.0.1", port))
-        .await
-        .unwrap();
+async fn http_exchange(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> (u16, String, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let body_str = body.unwrap_or("");
     let req = format!(
         "{} {} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -328,6 +331,7 @@ async fn http_exchange(port: u16, method: &str, path: &str, body: Option<&str>) 
 
 #[tokio::test]
 async fn whep_http_e2e_receives_media() {
+    zlmediakit_webrtc::init_crypto();
     let mgr = Arc::new(MediaSourceManager::new());
     let source = mgr.get_or_create("__defaultVhost__", "live", "webrtchttp");
     source
@@ -365,9 +369,13 @@ async fn whep_http_e2e_receives_media() {
     }
 
     // Start the real WHEP HTTP server.
-    let srv = WebRtcServer::new(&format!("127.0.0.1:{}", TEST_HTTP_PORT), mgr.clone())
-        .await
-        .unwrap();
+    let srv = WebRtcServer::new(
+        &format!("127.0.0.1:{}", TEST_HTTP_PORT),
+        mgr.clone(),
+        vec![],
+    )
+    .await
+    .unwrap();
     tokio::spawn(async move {
         let _ = srv.run().await;
     });
@@ -502,7 +510,7 @@ async fn whep_http_e2e_receives_media() {
     );
 
     // DELETE to tear down.
-    let (del_status, _, _) = http_exchange("DELETE", &location, None).await;
+    let (del_status, _, _) = http_exchange(TEST_HTTP_PORT, "DELETE", &location, None).await;
     assert_eq!(del_status, 200, "WHEP DELETE should return 200");
 
     println!("WHEP HTTP e2e OK: received {} RTP packets", count);
@@ -521,8 +529,8 @@ fn h264_cap() -> RTCRtpCodecCapability {
         mime_type: webrtc::api::media_engine::MIME_TYPE_H264.to_owned(),
         clock_rate: 90_000,
         channels: 0,
-        sdp_fmtp_line:
-            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f".to_string(),
+        sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+            .to_string(),
         rtcp_feedback: vec![],
     }
 }
@@ -556,33 +564,52 @@ fn opus_params(pt: u8) -> RTCRtpCodecParameters {
 fn annexb_frame(nalu_type: u8, payload: &[u8]) -> Bytes {
     let mut b = bytes::BytesMut::new();
     b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-    b.push(nalu_type);
+    b.put_u8(nalu_type);
     b.extend_from_slice(payload);
     b.freeze()
 }
 
 #[tokio::test]
 async fn whip_e2e_publish_then_play() {
+    zlmediakit_webrtc::init_crypto();
     let mgr = Arc::new(MediaSourceManager::new());
     let vhost = "__defaultVhost__";
     let app = "live";
     let stream = "whiploop";
 
-    let srv = WebRtcServer::new(&format!("127.0.0.1:{}", TEST_WHIP_HTTP_PORT), mgr.clone())
-        .await
-        .unwrap();
+    let srv = WebRtcServer::new(
+        &format!("127.0.0.1:{}", TEST_WHIP_HTTP_PORT),
+        mgr.clone(),
+        vec![],
+    )
+    .await
+    .unwrap();
     tokio::spawn(async move {
         let _ = srv.run().await;
     });
 
     // ---- WHIP publisher (browser-equivalent, sendonly) ----
     let mut pm = MediaEngine::default();
-    pm.register_codec(h264_params(102), RTPCodecType::Video).unwrap();
-    pm.register_codec(opus_params(111), RTPCodecType::Audio).unwrap();
+    pm.register_codec(h264_params(102), RTPCodecType::Video)
+        .unwrap();
+    pm.register_codec(opus_params(111), RTPCodecType::Audio)
+        .unwrap();
     let papi = APIBuilder::new().with_media_engine(pm).build();
-    let pub_pc = Arc::new(papi.new_peer_connection(RTCConfiguration::default()).await.unwrap());
-    let v_track = Arc::new(TrackLocalStaticSample::new(h264_cap(), "video".into(), "zlm".into()));
-    let a_track = Arc::new(TrackLocalStaticSample::new(opus_cap(), "audio".into(), "zlm".into()));
+    let pub_pc = Arc::new(
+        papi.new_peer_connection(RTCConfiguration::default())
+            .await
+            .unwrap(),
+    );
+    let v_track = Arc::new(TrackLocalStaticSample::new(
+        h264_cap(),
+        "video".into(),
+        "zlm".into(),
+    ));
+    let a_track = Arc::new(TrackLocalStaticSample::new(
+        opus_cap(),
+        "audio".into(),
+        "zlm".into(),
+    ));
     let _ = pub_pc.add_track(v_track.clone()).await;
     let _ = pub_pc.add_track(a_track.clone()).await;
 
@@ -647,16 +674,24 @@ async fn whip_e2e_publish_then_play() {
 
     // ---- WHEP player (browser-equivalent, recvonly) ----
     let mut wm = MediaEngine::default();
-    wm.register_codec(h264_params(102), RTPCodecType::Video).unwrap();
-    wm.register_codec(opus_params(111), RTPCodecType::Audio).unwrap();
+    wm.register_codec(h264_params(102), RTPCodecType::Video)
+        .unwrap();
+    wm.register_codec(opus_params(111), RTPCodecType::Audio)
+        .unwrap();
     let wapi = APIBuilder::new().with_media_engine(wm).build();
-    let play_pc = Arc::new(wapi.new_peer_connection(RTCConfiguration::default()).await.unwrap());
+    let play_pc = Arc::new(
+        wapi.new_peer_connection(RTCConfiguration::default())
+            .await
+            .unwrap(),
+    );
 
     let received = Arc::new(Mutex::new(0u32));
     {
         let received = received.clone();
         play_pc.on_track(Box::new(
-            move |track: Arc<TrackRemote>, _recv: Arc<RTCRtpReceiver>, _trans: Arc<RTCRtpTransceiver>| {
+            move |track: Arc<TrackRemote>,
+                  _recv: Arc<RTCRtpReceiver>,
+                  _trans: Arc<RTCRtpTransceiver>| {
                 let received = received.clone();
                 Box::pin(async move {
                     let mut buf = vec![0u8; 2000];

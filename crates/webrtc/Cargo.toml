@@ -10,7 +10,7 @@ default = []
 # AAC -> Opus transcoding for WebRTC playback. Needs `libopus` at build time.
 transcode = ["dep:opus"]
 # AAC decoding (via libfdk-aac). Needs `libfdk-aac-dev` at build time.
-aac-transcode = ["transcode", "dep:aac"]
+aac-transcode = ["transcode", "dep:fdk-aac"]
 
 [dependencies]
 zlmediakit-core = { path = "../core" }
@@ -23,7 +23,13 @@ serde_json = { workspace = true }
 dashmap = { workspace = true }
 uuid = { workspace = true }
 webrtc = "0.12"
+# Pulled in directly so we can explicitly install a rustls CryptoProvider.
+# When both `ring` (via webrtc) and `aws-lc-rs` (via the http crate's TLS
+# stack) get unified into one `rustls` build, rustls refuses to auto-pick a
+# provider; we install `ring` ourselves before any peer connection is made.
+rustls = { version = "0.23", features = ["ring"], default-features = false }
 
 # Optional, only pulled in with the `transcode` / `aac-transcode` features.
 opus = { version = "0.3", optional = true }
-aac = { version = "0.0", optional = true }
+# AAC decoding (via libfdk-aac). Needs `libfdk-aac-dev` at build time.
+fdk-aac = { version = "0.8", optional = true }

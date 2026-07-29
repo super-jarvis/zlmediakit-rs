@@ -362,6 +362,19 @@ impl RtspSession {
             return self.send_response(&response).await;
         }
 
+        // If DESCRIBE was skipped, look up the source now.
+        if self.source.is_none() {
+            self.source = self
+                .source_manager
+                .get("__defaultVhost__", &self.app, &self.stream_name);
+        }
+
+        if self.source.is_none() {
+            let response =
+                RtspResponse::new(404, "Not Found").with_header("CSeq", &self.cseq.to_string());
+            return self.send_response(&response).await;
+        }
+
         let response = RtspResponse::new(200, "OK")
             .with_header("CSeq", &self.cseq.to_string())
             .with_header("Session", &self.session_id);
@@ -1050,7 +1063,7 @@ impl RtspSession {
     }
 
     async fn send_interleaved_rtp(
-        stream: &mut tokio::net::TcpStream,
+        stream: &mut TransportStream,
         channel: u8,
         rtp_packets: Vec<Vec<u8>>,
     ) -> anyhow::Result<()> {
@@ -1088,7 +1101,7 @@ impl RtspSession {
     }
 
     async fn send_interleaved_frame(
-        stream: &mut tokio::net::TcpStream,
+        stream: &mut TransportStream,
         frame: &MediaFrame,
         seq: &mut u16,
         ssrc: u32,

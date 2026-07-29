@@ -107,6 +107,122 @@ impl H264Parser {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_annexb_empty() {
+        let nals = H264Parser::parse_annexb(b"");
+        assert!(nals.is_empty());
+    }
+
+    #[test]
+    fn parse_annexb_no_startcode() {
+        let nals = H264Parser::parse_annexb(b"no start code here");
+        assert!(nals.is_empty());
+    }
+
+    #[test]
+    fn parse_annexb_single_nal() {
+        let data = b"\x00\x00\x01\x67\x42\x00\x1e\xa6";
+        let nals = H264Parser::parse_annexb(data);
+        assert_eq!(nals.len(), 1);
+        assert_eq!(&nals[0][..], b"\x67\x42\x00\x1e\xa6");
+    }
+
+    #[test]
+    fn parse_annexb_multiple_nals() {
+        let data = b"\x00\x00\x01\x67\x42\x00\x1e\xa6\x00\x00\x01\x68\xce\x3c\x80";
+        let nals = H264Parser::parse_annexb(data);
+        assert_eq!(nals.len(), 2);
+        assert_eq!(&nals[0][..], b"\x67\x42\x00\x1e\xa6");
+        assert_eq!(&nals[1][..], b"\x68\xce\x3c\x80");
+    }
+
+    #[test]
+    fn parse_annexb_four_byte_startcode() {
+        let data = b"\x00\x00\x00\x01\x67\x42\x00\x1e";
+        let nals = H264Parser::parse_annexb(data);
+        assert_eq!(nals.len(), 1);
+        assert_eq!(&nals[0][..], b"\x67\x42\x00\x1e");
+    }
+
+    #[test]
+    fn parse_annexb_mixed_startcodes() {
+        let data = b"\x00\x00\x01\x67\x00\x00\x00\x01\x68\x00\x00\x01\x65";
+        let nals = H264Parser::parse_annexb(data);
+        assert_eq!(nals.len(), 3);
+    }
+
+    #[test]
+    fn is_keyframe_idr() {
+        assert!(H264Parser::is_keyframe(0x65)); // 5 = IDR
+    }
+
+    #[test]
+    fn is_keyframe_sps() {
+        assert!(H264Parser::is_keyframe(0x67)); // 7 = SPS
+    }
+
+    #[test]
+    fn is_keyframe_pps() {
+        assert!(H264Parser::is_keyframe(0x68)); // 8 = PPS
+    }
+
+    #[test]
+    fn is_not_keyframe() {
+        assert!(!H264Parser::is_keyframe(0x61)); // 1 = non-IDR
+    }
+
+    #[test]
+    fn parse_sps_valid() {
+        let sps = b"\x67\x42\x00\x1e\xa6\x01\xe0\x80";
+        let info = H264Parser::parse_sps(sps).unwrap();
+        assert!(info.sps.is_some());
+        // width = (data[3] << 8) | data[4] = (0x1e << 8) | 0xa6 = 0x1ea6
+        assert_eq!(info.width, 0x1ea6);
+        // height = (data[5] << 8) | data[6] = (0x01 << 8) | 0xe0 = 0x01e0
+        assert_eq!(info.height, 0x01e0);
+    }
+
+    #[test]
+    fn parse_sps_not_sps() {
+        let non_sps = b"\x65\x42\x00\x1e";
+        assert!(H264Parser::parse_sps(non_sps).is_none());
+    }
+
+    #[test]
+    fn parse_sps_empty() {
+        assert!(H264Parser::parse_sps(b"").is_none());
+    }
+
+    #[test]
+    fn extract_config_found() {
+        let data = b"\x00\x00\x01\x67\x42\x00\x1e\xa6\x00\x00\x01\x68\xce\x3c\x80";
+        let (sps, pps) = H264Parser::extract_config(data).unwrap();
+        assert_eq!(&sps[..], b"\x67\x42\x00\x1e\xa6");
+        assert_eq!(&pps[..], b"\x68\xce\x3c\x80");
+    }
+
+    #[test]
+    fn extract_config_missing_sps() {
+        let data = b"\x00\x00\x01\x68\xce\x3c\x80";
+        assert!(H264Parser::extract_config(data).is_none());
+    }
+
+    #[test]
+    fn extract_config_missing_pps() {
+        let data = b"\x00\x00\x01\x67\x42\x00\x1e";
+        assert!(H264Parser::extract_config(data).is_none());
+    }
+
+    #[test]
+    fn extract_config_empty() {
+        assert!(H264Parser::extract_config(b"").is_none());
+    }
+}
+
 impl Default for H264Parser {
     fn default() -> Self {
         Self::new()

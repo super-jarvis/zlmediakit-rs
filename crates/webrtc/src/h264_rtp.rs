@@ -7,7 +7,7 @@
 //! NALUs), which the WHIP layer converts to the AVCC layout the rest of the
 //! pipeline expects.
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 const NALU_TYPE_MASK: u8 = 0x1F;
 const FU_A_TYPE: u8 = 28;
@@ -53,7 +53,7 @@ impl H264RtpDepacketizer {
                 let reconstructed = (nalu_header & 0xE0) | (fu_header & NALU_TYPE_MASK);
                 self.fu_nalu.clear();
                 self.fu_nalu.extend_from_slice(START_CODE);
-                self.fu_nalu.push(reconstructed);
+                self.fu_nalu.put_u8(reconstructed);
                 self.fu_nalu.extend_from_slice(&payload[2..]);
                 self.fu_active = true;
             } else if self.fu_active {

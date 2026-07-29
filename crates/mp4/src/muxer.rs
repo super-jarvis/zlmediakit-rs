@@ -20,6 +20,7 @@ struct SampleEntry {
     data: Bytes,
     timestamp: u32,
     duration: u32,
+    #[allow(dead_code)]
     is_sync: bool,
 }
 
@@ -105,19 +106,33 @@ impl Mp4Muxer {
         }
 
         self.compute_durations();
-        let video_samples: Vec<&SampleEntry> = self.samples.iter().filter(|s| s.track_id == 0).collect();
-        let audio_samples: Vec<&SampleEntry> = self.samples.iter().filter(|s| s.track_id == 1).collect();
+        let video_samples: Vec<&SampleEntry> =
+            self.samples.iter().filter(|s| s.track_id == 0).collect();
+        let audio_samples: Vec<&SampleEntry> =
+            self.samples.iter().filter(|s| s.track_id == 1).collect();
 
         let has_video = !video_samples.is_empty();
         let has_audio = !audio_samples.is_empty();
 
         let video_timescale: u32 = 90000;
-        let audio_timescale = if self.sample_rate > 0 { self.sample_rate } else { 44100 };
+        let audio_timescale = if self.sample_rate > 0 {
+            self.sample_rate
+        } else {
+            44100
+        };
 
         let video_duration_media: u64 = video_samples.iter().map(|s| s.duration as u64).sum();
         let audio_duration_media: u64 = audio_samples.iter().map(|s| s.duration as u64).sum();
-        let video_duration_ms = if has_video { video_duration_media * 1000 / video_timescale as u64 } else { 0 };
-        let audio_duration_ms = if has_audio { audio_duration_media * 1000 / audio_timescale as u64 } else { 0 };
+        let video_duration_ms = if has_video {
+            video_duration_media * 1000 / video_timescale as u64
+        } else {
+            0
+        };
+        let audio_duration_ms = if has_audio {
+            audio_duration_media * 1000 / audio_timescale as u64
+        } else {
+            0
+        };
         let duration_ms = video_duration_ms.max(audio_duration_ms);
 
         let mut ftyp = BytesMut::new();
@@ -140,11 +155,17 @@ impl Mp4Muxer {
             }
         }
 
-        let video_sample_sizes: Vec<u32> = video_samples.iter().map(|s| s.data.len() as u32).collect();
-        let audio_sample_sizes: Vec<u32> = audio_samples.iter().map(|s| s.data.len() as u32).collect();
+        let video_sample_sizes: Vec<u32> =
+            video_samples.iter().map(|s| s.data.len() as u32).collect();
+        let audio_sample_sizes: Vec<u32> =
+            audio_samples.iter().map(|s| s.data.len() as u32).collect();
 
         let mut moov = BytesMut::new();
-        write_mvhd(&mut moov, duration_ms as u32, if has_video && has_audio { 3 } else { 2 });
+        write_mvhd(
+            &mut moov,
+            duration_ms as u32,
+            if has_video && has_audio { 3 } else { 2 },
+        );
 
         if has_video {
             let codec = self.video_codec.unwrap_or(CodecId::H264);
@@ -220,11 +241,19 @@ impl Mp4Muxer {
             } else {
                 if let Some(prev) = last_ts_a {
                     let d = s.timestamp.saturating_sub(prev).max(1);
-                    let sr = if self.sample_rate > 0 { self.sample_rate } else { 44100 };
+                    let sr = if self.sample_rate > 0 {
+                        self.sample_rate
+                    } else {
+                        44100
+                    };
                     let d_scaled = (d as u64 * sr as u64 / 1000) as u32;
                     s.duration = d_scaled.max(1);
                 } else {
-                    let sr = if self.sample_rate > 0 { self.sample_rate } else { 44100 };
+                    let sr = if self.sample_rate > 0 {
+                        self.sample_rate
+                    } else {
+                        44100
+                    };
                     let frame_dur = sr / 44; // ~23ms per AAC frame
                     s.duration = frame_dur.max(1);
                 }
@@ -340,7 +369,13 @@ fn write_trak(
 ) {
     let mut trak = BytesMut::new();
 
-    write_tkhd(&mut trak, track_id, duration / (1000 / timescale.min(1000)), width, height);
+    write_tkhd(
+        &mut trak,
+        track_id,
+        duration / (1000 / timescale.min(1000)),
+        width,
+        height,
+    );
 
     let mut minf = BytesMut::new();
     if *handler_type == *b"vide" {
@@ -349,7 +384,18 @@ fn write_trak(
         write_smhd(&mut minf);
     }
     write_dinf(&mut minf);
-    write_stbl(&mut minf, codec, config, width, height, timescale, sample_sizes, samples, mdat_offset, before_mdat);
+    write_stbl(
+        &mut minf,
+        codec,
+        config,
+        width,
+        height,
+        timescale,
+        sample_sizes,
+        samples,
+        mdat_offset,
+        before_mdat,
+    );
 
     let mut mdia = BytesMut::new();
     write_mdhd(&mut mdia, timescale, duration);
@@ -648,9 +694,9 @@ fn write_stco(buf: &mut BytesMut, chunk_offset: u32) {
 fn parse_avcc_config(data: &[u8]) -> Vec<u8> {
     if data.len() < 5 {
         return vec![
-            1, // configurationVersion
+            1,    // configurationVersion
             0x42, // AVCProfileIndication
-            0, // profile_compatibility
+            0,    // profile_compatibility
             0x1e, // AVCLevelIndication
             0xff, // lengthSizeMinusOne (4 bytes)
             0xe1, // numOfSequenceParameterSets
@@ -665,8 +711,16 @@ fn parse_avcc_config(data: &[u8]) -> Vec<u8> {
     avcc.push(0xff);
 
     let nals = split_nalus_avcc(data);
-    let sps_list: Vec<&[u8]> = nals.iter().filter(|n| n[0] & 0x1f == 7).map(|n| n.as_ref()).collect();
-    let pps_list: Vec<&[u8]> = nals.iter().filter(|n| n[0] & 0x1f == 8).map(|n| n.as_ref()).collect();
+    let sps_list: Vec<&[u8]> = nals
+        .iter()
+        .filter(|n| n[0] & 0x1f == 7)
+        .map(|n| n.as_ref())
+        .collect();
+    let pps_list: Vec<&[u8]> = nals
+        .iter()
+        .filter(|n| n[0] & 0x1f == 8)
+        .map(|n| n.as_ref())
+        .collect();
 
     avcc.push(0xe0 | sps_list.len() as u8);
     for sps in &sps_list {
@@ -686,9 +740,21 @@ fn parse_hvcc_config(data: &[u8]) -> Vec<u8> {
         return vec![1];
     }
     let nals = split_nalus_avcc(data);
-    let vps_list: Vec<&[u8]> = nals.iter().filter(|n| (n[0] >> 1) == 16).map(|n| n.as_ref()).collect();
-    let sps_list: Vec<&[u8]> = nals.iter().filter(|n| (n[0] >> 1) == 17).map(|n| n.as_ref()).collect();
-    let pps_list: Vec<&[u8]> = nals.iter().filter(|n| (n[0] >> 1) == 18).map(|n| n.as_ref()).collect();
+    let vps_list: Vec<&[u8]> = nals
+        .iter()
+        .filter(|n| (n[0] >> 1) == 16)
+        .map(|n| n.as_ref())
+        .collect();
+    let sps_list: Vec<&[u8]> = nals
+        .iter()
+        .filter(|n| (n[0] >> 1) == 17)
+        .map(|n| n.as_ref())
+        .collect();
+    let pps_list: Vec<&[u8]> = nals
+        .iter()
+        .filter(|n| (n[0] >> 1) == 18)
+        .map(|n| n.as_ref())
+        .collect();
 
     let mut hvcc = Vec::new();
     hvcc.push(1); // configurationVersion
@@ -821,6 +887,170 @@ fn config_to_sample_rate(config: &[u8]) -> u32 {
         }
     } else {
         44100
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use zlmediakit_core::media_frame::{CodecId, MediaFrame};
+
+    fn h264_config() -> MediaFrame {
+        // FLV AVC sequence header (packet type 0) with SPS and PPS
+        let data = vec![
+            0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x42, 0x00, 0x1e, 0xff, 0xe1, 0x00, 0x05, 0x67,
+            0x42, 0x00, 0x1e, 0xa6, 0x01, 0x68, 0xce, 0x3c, 0x80,
+        ];
+        MediaFrame::new_video(0, CodecId::H264, 0, 0, 0, Bytes::from(data), true)
+    }
+
+    fn h264_key_frame(pts: u32, payload: &[u8]) -> MediaFrame {
+        let mut data = vec![0x17, 0x01, 0x00, 0x00, 0x00];
+        data.extend_from_slice(payload);
+        MediaFrame::new_video(
+            0,
+            CodecId::H264,
+            pts,
+            pts as u64,
+            pts as u64,
+            Bytes::from(data),
+            true,
+        )
+    }
+
+    fn h264_inter_frame(pts: u32, payload: &[u8]) -> MediaFrame {
+        let mut data = vec![0x27, 0x01, 0x00, 0x00, 0x00];
+        data.extend_from_slice(payload);
+        MediaFrame::new_video(
+            0,
+            CodecId::H264,
+            pts,
+            pts as u64,
+            pts as u64,
+            Bytes::from(data),
+            false,
+        )
+    }
+
+    fn aac_config() -> MediaFrame {
+        let data = vec![0xAF, 0x00, 0x12, 0x10]; // AAC sequence header
+        MediaFrame::new_audio(1, CodecId::AAC, 0, 0, 0, Bytes::from(data))
+    }
+
+    fn aac_frame(pts: u32) -> MediaFrame {
+        MediaFrame::new_audio(
+            1,
+            CodecId::AAC,
+            pts,
+            pts as u64,
+            pts as u64,
+            Bytes::from(vec![0x12, 0x10, 0x01, 0x02]),
+        )
+    }
+
+    #[test]
+    fn new_muxer_empty() {
+        let mut muxer = Mp4Muxer::new();
+        let out = muxer.finalize();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn finalize_with_video_only() {
+        let mut muxer = Mp4Muxer::new();
+        muxer.push_frame(&h264_config());
+        muxer.push_frame(&h264_key_frame(0, &[0x01, 0x02, 0x03]));
+        muxer.push_frame(&h264_inter_frame(33, &[0x04, 0x05]));
+        muxer.push_frame(&h264_inter_frame(66, &[0x06, 0x07]));
+        let out = muxer.finalize();
+        assert!(!out.is_empty());
+        // Should start with ftyp box
+        assert_eq!(&out[4..8], b"ftyp");
+        // Should contain moov box
+        assert!(out.windows(4).any(|w| w == b"moov"));
+        // Should contain mdat box
+        assert!(out.windows(4).any(|w| w == b"mdat"));
+        // Should contain avc1 and avcC
+        assert!(out.windows(4).any(|w| w == b"avc1"));
+        assert!(out.windows(4).any(|w| w == b"avcC"));
+    }
+
+    #[test]
+    fn finalize_with_audio_only() {
+        let mut muxer = Mp4Muxer::new();
+        muxer.push_frame(&aac_config());
+        muxer.push_frame(&aac_frame(0));
+        muxer.push_frame(&aac_frame(23));
+        let out = muxer.finalize();
+        assert!(!out.is_empty());
+        assert!(out.windows(4).any(|w| w == b"mp4a"));
+        assert!(out.windows(4).any(|w| w == b"esds"));
+    }
+
+    #[test]
+    fn finalize_with_video_and_audio() {
+        let mut muxer = Mp4Muxer::new();
+        muxer.push_frame(&h264_config());
+        muxer.push_frame(&aac_config());
+        muxer.push_frame(&h264_key_frame(0, &[0x01]));
+        muxer.push_frame(&aac_frame(10));
+        muxer.push_frame(&h264_inter_frame(33, &[0x02]));
+        muxer.push_frame(&aac_frame(40));
+        let out = muxer.finalize();
+        assert!(!out.is_empty());
+        assert!(out.windows(4).any(|w| w == b"moov"));
+        assert!(out.windows(4).any(|w| w == b"mdat"));
+        assert!(out.windows(4).any(|w| w == b"mp4a"));
+    }
+
+    #[test]
+    fn compute_durations_handles_empty() {
+        let mut muxer = Mp4Muxer::new();
+        muxer.compute_durations();
+        // Should not panic
+    }
+
+    #[test]
+    fn make_box_creates_correct_format() {
+        let data = b"\x00\x00\x00\x01";
+        let box_data = make_box(b"test", data);
+        assert_eq!(box_data.len(), 12);
+        assert_eq!(&box_data[0..4], &12u32.to_be_bytes());
+        assert_eq!(&box_data[4..8], b"test");
+        assert_eq!(&box_data[8..], data);
+    }
+
+    #[test]
+    fn write_ftyp_produces_valid_box() {
+        let mut buf = BytesMut::new();
+        write_ftyp(&mut buf);
+        assert_eq!(&buf[4..8], b"ftyp");
+        assert_eq!(&buf[8..12], b"isom");
+    }
+
+    #[test]
+    fn write_stsd_for_audio() {
+        let mut buf = BytesMut::new();
+        let codec = CodecId::AAC;
+        let config = b"\x12\x10";
+        write_stsd(&mut buf, &codec, config, 0, 0, 44100);
+        assert!(buf.windows(4).any(|w| w == b"mp4a"));
+        assert!(buf.windows(4).any(|w| w == b"esds"));
+    }
+
+    #[test]
+    fn push_frame_order_preserved() {
+        let mut muxer = Mp4Muxer::new();
+        let mut cfg = h264_config();
+        cfg.config_frame = true;
+        muxer.push_frame(&cfg);
+        muxer.push_frame(&h264_key_frame(0, &[0xAA]));
+        muxer.push_frame(&h264_inter_frame(33, &[0xBB]));
+        muxer.push_frame(&h264_key_frame(66, &[0xCC]));
+        muxer.finalize();
+        assert_eq!(muxer.samples.len(), 3);
+        assert_eq!(&muxer.samples[0].data[..], b"\x17\x01\x00\x00\x00\xAA");
     }
 }
 
