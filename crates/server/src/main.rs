@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
 use zlmediakit_core::auth::StreamAuth;
@@ -13,7 +13,9 @@ use zlmediakit_core::event_bus::{Event, EventBus};
 use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::media_source::{MediaSource, MediaSourceManager};
 use zlmediakit_core::recorder::{RecorderCommand, RecorderControl};
+use zlmediakit_core::ffmpeg_source::{FFmpegCmd, FFmpegSourceControl, FFmpegTable};
 use zlmediakit_core::stream_proxy::{ProxyCmd, ProxyTable, StreamProxyControl};
+use zlmediakit_core::stream_pusher::{PusherCmd, PusherTable, StreamPusherControl};
 use zlmediakit_flv::FlvRecorder;
 use zlmediakit_hls::HlsRecorder;
 use zlmediakit_http::{HttpServer, HttpServerConfig};
@@ -115,6 +117,12 @@ async fn main() -> Result<()> {
     let (proxy_control, proxy_active, proxy_cmd_rx) = StreamProxyControl::new();
     let proxy_control = Arc::new(proxy_control);
 
+    let (pusher_control, pusher_active, pusher_cmd_rx) = StreamPusherControl::new();
+    let pusher_control = Arc::new(pusher_control);
+
+    let (ffmpeg_control, ffmpeg_active, ffmpeg_cmd_rx) = FFmpegSourceControl::new();
+    let ffmpeg_control = Arc::new(ffmpeg_control);
+
     info!("========================================");
     info!("  ZLMediaKit-RS v{}", env!("CARGO_PKG_VERSION"));
     info!("  High Performance Streaming Server");
@@ -197,6 +205,8 @@ async fn main() -> Result<()> {
         let http_auth = auth.clone();
         let rec = recorder_control.clone();
         let proxy = proxy_control.clone();
+        let pusher = pusher_control.clone();
+        let ffmpeg = ffmpeg_control.clone();
         let http_cert = ssl_cert.clone();
         let http_key = ssl_key.clone();
         let http_www = www_root.clone();
@@ -209,6 +219,8 @@ async fn main() -> Result<()> {
                 hook: http_hook,
                 recorder: rec,
                 proxy,
+                pusher,
+                ffmpeg,
                 record_root: std::path::PathBuf::from(&http_record_root),
                 www_root: http_www,
                 ssl_cert: http_cert,
@@ -236,6 +248,8 @@ async fn main() -> Result<()> {
         let api_auth = auth.clone();
         let rec = recorder_control.clone();
         let proxy = proxy_control.clone();
+        let pusher = pusher_control.clone();
+        let ffmpeg = ffmpeg_control.clone();
         let api_cert = ssl_cert.clone();
         let api_key = ssl_key.clone();
         let api_www = www_root.clone();
@@ -248,6 +262,8 @@ async fn main() -> Result<()> {
                 hook: api_hook,
                 recorder: rec,
                 proxy,
+                pusher,
+                ffmpeg,
                 record_root: std::path::PathBuf::from(&api_record_root),
                 www_root: api_www,
                 ssl_cert: api_cert,
@@ -289,11 +305,13 @@ async fn main() -> Result<()> {
     // SRT ingest server: accepts SRT connections and publishes the received
     // stream to the MediaSourceManager. Runs in a blocking thread since
     // the SRT API is synchronous.
+    let mut stop_signals: Vec<Arc<AtomicBool>> = Vec::new();
+
     if config.srt.enabled {
         let srt_addr = format!("0.0.0.0:{}", config.srt.port);
         let srt_sm = source_manager.clone();
         let srt_stop = Arc::new(AtomicBool::new(false));
-        let srt_stop_handle = srt_stop.clone();
+        stop_signals.push(srt_stop.clone());
         let srt_latency = config.srt.latency_ms;
         let srt_passphrase = config.srt.passphrase.clone();
         let handle = tokio::task::spawn_blocking(move || {
@@ -308,11 +326,6 @@ async fn main() -> Result<()> {
             }
         });
         handles.push(handle);
-        // Store the stop signal for cleanup
-        let stop_signal = srt_stop_handle;
-        // NOTE: In a full implementation, we'd store stop_signal and set it
-        // to true during shutdown. For now, Ctrl+C aborts the task.
-        drop(stop_signal);
     }
 
     // Recorder supervisor: always runs so the HTTP API can start/stop recording
@@ -364,6 +377,31 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Stream pusher supervisor: drains `addStreamPusher` commands and spawns
+    // push tasks. Each task watches for the local stream to become available
+    // and pushes it to the configured remote URL.
+    {
+        let sup_sm = source_manager.clone();
+        let sup_eb = event_bus.clone();
+        let sup_active = pusher_active.clone();
+        info!("Stream pusher supervisor started");
+        let handle = tokio::spawn(async move {
+            run_pusher_supervisor(pusher_cmd_rx, sup_eb, sup_sm, sup_active).await;
+        });
+        handles.push(handle);
+    }
+
+    // FFmpeg source supervisor: drains `addFFmpegSource` commands and spawns
+    // ffmpeg subprocesses that pull from a remote URL and push to localhost.
+    {
+        let sup_rtmp_port = config.rtmp_port;
+        info!("FFmpeg source supervisor started");
+        let handle = tokio::spawn(async move {
+            run_ffmpeg_supervisor(ffmpeg_cmd_rx, ffmpeg_active, sup_rtmp_port).await;
+        });
+        handles.push(handle);
+    }
+
     // Cluster push relay: when a stream is published locally, push it to
     // configured remote peers (RTMP push).
     if config.cluster.enabled && !config.cluster.push_to.is_empty() {
@@ -385,6 +423,12 @@ async fn main() -> Result<()> {
     tokio::signal::ctrl_c().await?;
     info!("Shutting down...");
 
+    // Signal blocking servers (e.g. SRT) to stop.
+    for sig in &stop_signals {
+        sig.store(true, Ordering::Relaxed);
+    }
+
+    // Abort async tasks.
     for handle in handles {
         handle.abort();
     }
@@ -550,6 +594,151 @@ async fn run_proxy_supervisor(
     }
 }
 
+/// Drains `PusherCmd` commands from the HTTP API and watches the EventBus
+/// for stream publish events. When a local stream matching a pusher request
+/// becomes available, it spawns an RTMP push task to the remote URL.
+async fn run_pusher_supervisor(
+    mut cmd_rx: mpsc::UnboundedReceiver<PusherCmd>,
+    event_bus: Arc<EventBus>,
+    source_manager: Arc<MediaSourceManager>,
+    active: PusherTable,
+) {
+    use std::collections::HashMap;
+    use tokio::sync::Notify;
+
+    let mut event_rx = event_bus.subscribe();
+    // Track pending pushers that haven't matched a stream yet.
+    // Keyed by (vhost,app,stream), value = (dst_url, stop, stopped).
+    let mut pending: HashMap<String, (String, Arc<Notify>, Arc<AtomicBool>)> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(c) => {
+                        let key = format!("{}/{}/{}", c.vhost, c.app, c.stream);
+                        // Check if the stream is already live.
+                        if source_manager.get(&c.vhost, &c.app, &c.stream).is_some() {
+                            spawn_push_task(c, source_manager.clone(), active.clone());
+                        } else {
+                            pending.insert(key, (c.dst_url, c.stop, c.stopped));
+                        }
+                    }
+                    None => break,
+                }
+            }
+            event = event_rx.recv() => {
+                match event {
+                    Ok(Event::StreamPublish { vhost, app, stream, .. }) => {
+                        let key = format!("{}/{}/{}", vhost, app, stream);
+                        if let Some((dst_url, stop, stopped)) = pending.remove(&key) {
+                            let cmd = PusherCmd {
+                                dst_url,
+                                vhost,
+                                app,
+                                stream,
+                                stop,
+                                stopped,
+                            };
+                            spawn_push_task(cmd, source_manager.clone(), active.clone());
+                        }
+                    }
+                    Ok(Event::StreamUnPublish { .. }) => {}
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
+fn spawn_push_task(
+    cmd: PusherCmd,
+    source_manager: Arc<MediaSourceManager>,
+    active: PusherTable,
+) {
+    let key = format!("{}/{}/{}", cmd.vhost, cmd.app, cmd.stream);
+    tokio::spawn(async move {
+        info!("Stream pusher: {}/{}/{} -> {}", cmd.vhost, cmd.app, cmd.stream, cmd.dst_url);
+        if let Err(e) = rtmp_push_client::start(
+            &cmd.dst_url,
+            &cmd.vhost,
+            &cmd.app,
+            &cmd.stream,
+            source_manager,
+            cmd.stop,
+            cmd.stopped,
+        )
+        .await
+        {
+            warn!("Stream pusher error {}/{}: {}", cmd.vhost, cmd.app, e);
+        }
+        info!("Stream pusher ended: {}", key);
+        active.remove(&key);
+    });
+}
+
+/// Drains `FFmpegCmd` commands from the HTTP API and spawns ffmpeg
+/// subprocesses that pull from a remote source URL and push to the local
+/// RTMP server. Each process is tracked by its (vhost,app,stream) key for
+/// later cleanup via `delFFmpegSource`.
+async fn run_ffmpeg_supervisor(
+    mut cmd_rx: mpsc::UnboundedReceiver<FFmpegCmd>,
+    active: FFmpegTable,
+    rtmp_port: u16,
+) {
+    use std::collections::HashMap;
+    use tokio::process::Command;
+
+    let mut children: HashMap<String, tokio::process::Child> = HashMap::new();
+
+    while let Some(cmd) = cmd_rx.recv().await {
+        let key = format!("{}/{}/{}", cmd.vhost, cmd.app, cmd.stream);
+
+        // If the dst_url wasn't provided, construct one pointing at localhost.
+        let dst_url = if cmd.dst_url.is_empty() {
+            format!("rtmp://127.0.0.1:{}/{}/{}", rtmp_port, cmd.app, cmd.stream)
+        } else {
+            cmd.dst_url.clone()
+        };
+
+        match Command::new("ffmpeg")
+            .args([
+                "-i", &cmd.src_url,
+                "-c", "copy",
+                "-f", "flv",
+                "-timeout", &cmd.timeout_ms.to_string(),
+                &dst_url,
+            ])
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => {
+                info!("FFmpeg source started: {} -> {} (pid={:?})", cmd.src_url, dst_url, child.id());
+                children.insert(key, child);
+            }
+            Err(e) => {
+                warn!("Failed to spawn ffmpeg for {}: {}", cmd.src_url, e);
+                active.remove(&key);
+            }
+        }
+
+        // Clean up any finished children.
+        let mut to_remove = Vec::new();
+        for (k, child) in children.iter_mut() {
+            if child.try_wait().ok().flatten().is_some() {
+                to_remove.push(k.clone());
+            }
+        }
+        for k in to_remove {
+            info!("FFmpeg source process ended: {}", k);
+            active.remove(&k);
+            children.remove(&k);
+        }
+    }
+}
+
 /// Watches the EventBus for `StreamPublish` events and pushes the stream
 /// to configured cluster peers via RTMP push.
 async fn run_cluster_push_relay(
@@ -557,8 +746,6 @@ async fn run_cluster_push_relay(
     source_manager: Arc<MediaSourceManager>,
     peers: Vec<zlmediakit_core::config::ClusterPeerConfig>,
 ) {
-    use std::sync::atomic::AtomicBool;
-
     let mut rx = event_bus.subscribe();
     info!("Cluster push relay supervisor started");
 

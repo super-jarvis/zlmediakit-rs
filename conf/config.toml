@@ -84,6 +84,13 @@ ice_servers = []
 #  { url = "rtmp://192.168.1.11/live", vhost = "__defaultVhost__", app = "live" },
 #]
 
+# Stream proxy: automatically pull remote streams on startup.
+#[proxy]
+#enabled = false
+#pulls = [
+#  { url = "rtmp://192.168.1.100/live/camera1" },
+#]
+
 # Record settings
 [record]
 app = "record"

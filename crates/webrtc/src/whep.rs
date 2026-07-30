@@ -258,14 +258,15 @@ fn spawn_pump(
     audio: Option<Arc<TrackLocalStaticSample>>,
 ) {
     tokio::spawn(async move {
+        let base_time = SystemTime::now();
         let cached = source.get_latest_gop_frames().await;
         for f in &cached {
-            push_frame(f, &video, &audio).await;
+            push_frame(f, &video, &audio, base_time).await;
         }
         let mut rx = source.subscribe();
         loop {
             match rx.recv().await {
-                Ok(f) => push_frame(&f, &video, &audio).await,
+                Ok(f) => push_frame(&f, &video, &audio, base_time).await,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             }
@@ -279,7 +280,9 @@ async fn push_frame(
     f: &MediaFrame,
     video: &Option<Arc<TrackLocalStaticSample>>,
     audio: &Option<Arc<TrackLocalStaticSample>>,
+    base_time: SystemTime,
 ) {
+    let ts = base_time + Duration::from_millis(f.dts);
     match f.codec {
         CodecId::H264 => {
             if let Some(v) = video {
@@ -289,7 +292,7 @@ async fn push_frame(
                 }
                 let sample = webrtc::media::Sample {
                     data: annexb,
-                    timestamp: SystemTime::now(),
+                    timestamp: ts,
                     duration: Duration::from_millis(40),
                     ..Default::default()
                 };
@@ -302,7 +305,7 @@ async fn push_frame(
             if let Some(a) = audio {
                 let sample = webrtc::media::Sample {
                     data: f.data.clone(),
-                    timestamp: SystemTime::now(),
+                    timestamp: ts,
                     duration: Duration::from_millis(20),
                     ..Default::default()
                 };
@@ -323,14 +326,15 @@ fn spawn_pump(
     transcoder: Option<Arc<tokio::sync::Mutex<AudioTranscoder>>>,
 ) {
     tokio::spawn(async move {
+        let base_time = SystemTime::now();
         let cached = source.get_latest_gop_frames().await;
         for f in &cached {
-            push_frame(f, &video, &audio, &transcoder).await;
+            push_frame(f, &video, &audio, &transcoder, base_time).await;
         }
         let mut rx = source.subscribe();
         loop {
             match rx.recv().await {
-                Ok(f) => push_frame(&f, &video, &audio, &transcoder).await,
+                Ok(f) => push_frame(&f, &video, &audio, &transcoder, base_time).await,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             }
@@ -345,7 +349,9 @@ async fn push_frame(
     video: &Option<Arc<TrackLocalStaticSample>>,
     audio: &Option<Arc<TrackLocalStaticSample>>,
     transcoder: &Option<Arc<tokio::sync::Mutex<AudioTranscoder>>>,
+    base_time: SystemTime,
 ) {
+    let ts = base_time + Duration::from_millis(f.dts);
     match f.codec {
         CodecId::H264 => {
             if let Some(v) = video {
@@ -355,7 +361,7 @@ async fn push_frame(
                 }
                 let sample = webrtc::media::Sample {
                     data: annexb,
-                    timestamp: SystemTime::now(),
+                    timestamp: ts,
                     duration: Duration::from_millis(40),
                     ..Default::default()
                 };
@@ -368,7 +374,7 @@ async fn push_frame(
             if let Some(a) = audio {
                 let sample = webrtc::media::Sample {
                     data: f.data.clone(),
-                    timestamp: SystemTime::now(),
+                    timestamp: ts,
                     duration: Duration::from_millis(20),
                     ..Default::default()
                 };
@@ -392,7 +398,7 @@ async fn push_frame(
                             for opus_bytes in packets {
                                 let sample = webrtc::media::Sample {
                                     data: Bytes::from(opus_bytes),
-                                    timestamp: SystemTime::now(),
+                                    timestamp: ts,
                                     duration: Duration::from_millis(20),
                                     ..Default::default()
                                 };

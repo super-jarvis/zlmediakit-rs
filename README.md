@@ -167,6 +167,12 @@ www_root = "./www"
 [webrtc]
 enabled = true
 # ice_servers = ["stun:stun.l.google.com:19302"]
+#
+# WebRTC 支持：
+# - WHEP（WebRTC-HTTP Egress Protocol）拉流：浏览器通过 WHEP 播放已发布的流
+# - WHIP（WebRTC-HTTP Ingress Protocol）推流：浏览器通过 WHIP 推流到服务器
+# - 编解码：H.264 + Opus（原生支持），AAC 需启用 `transcode` feature
+# - `transcode` feature 依赖系统安装 `ffmpeg`/`fdk-aac`；启用后自动将 AAC 转码为 Opus
 
 [record]
 app = "record"

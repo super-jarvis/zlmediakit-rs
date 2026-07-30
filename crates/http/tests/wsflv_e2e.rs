@@ -100,6 +100,8 @@ async fn wsflv_e2e_receives_flv_over_websocket() {
         hook,
         recorder: Arc::new(recorder),
         proxy: Arc::new(proxy),
+        pusher: Default::default(),
+        ffmpeg: Default::default(),
         record_root: std::path::PathBuf::from("./record"),
         www_root: None,
         ssl_cert: None,

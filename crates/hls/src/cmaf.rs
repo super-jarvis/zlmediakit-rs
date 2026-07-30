@@ -21,6 +21,7 @@ pub fn start_hls_cmaf_task(
     source: Arc<MediaSource>,
     segments: Arc<RwLock<VecDeque<HlsSegment>>>,
     init_cache: Arc<RwLock<Option<Vec<u8>>>>,
+    on_stop: Option<Box<dyn FnOnce() + Send>>,
 ) {
     tokio::spawn(async move {
         let mut muxer = Fmp4Muxer::new(90000);
@@ -88,6 +89,10 @@ pub fn start_hls_cmaf_task(
                     last_flush = tokio::time::Instant::now();
                 }
             }
+        }
+
+        if let Some(cb) = on_stop {
+            cb();
         }
     });
 }

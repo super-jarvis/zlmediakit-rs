@@ -27,10 +27,14 @@ pub const SRTS_LISTENING: c_int = 4;
 pub const SRTS_BROKEN: c_int = 7;
 pub const SRTS_CONNECTED: c_int = 5;
 
+// Stream ID socket option
+pub const SRT_SOCKOPT_STREAMID: c_int = 8;
+
 // Error codes
 pub const SRT_SUCCESS: c_int = 0;
 pub const SRT_EASYNCFAIL: c_int = 6002;
 pub const SRT_ECONNREJ: c_int = 2001;
+pub const SRT_EASYNCRCV: c_int = 6003;
 
 // ── FFI function declarations ────────────────────────────────────────
 
@@ -86,6 +90,17 @@ extern "C" {
 
     /// Get socket state.
     pub fn srt_getsockstate(u: c_int) -> c_int;
+
+    /// Get a socket option (string value).
+    pub fn srt_getsockflag(
+        u: c_int,
+        optname: c_int,
+        optval: *mut c_void,
+        optlen: *mut c_int,
+    ) -> c_int;
+
+    /// Get last SRT error code (thread-local).
+    pub fn srt_getlasterror(_: *mut c_int) -> c_int;
 
     /// Get last error message (thread-local).
     pub fn srt_getlasterror_str() -> *const c_char;
@@ -145,4 +160,60 @@ pub fn socket_addr_to_sockaddr(addr: &SocketAddr) -> anyhow::Result<(libc::socka
         }
         _ => anyhow::bail!("SRT only supports IPv4 in this implementation"),
     }
+}
+
+/// Retrieves the stream ID from an SRT socket (set by the caller via
+/// `?streamid=`). Maximum length is 512 bytes.
+pub fn get_streamid(sock: c_int) -> Option<String> {
+    let mut buf = [0u8; 512];
+    let mut len = buf.len() as c_int;
+    let ret = unsafe {
+        srt_getsockflag(
+            sock,
+            SRT_SOCKOPT_STREAMID,
+            buf.as_mut_ptr() as *mut c_void,
+            &mut len,
+        )
+    };
+    if ret != SRT_SUCCESS {
+        return None;
+    }
+    let len = len.max(0) as usize;
+    if len == 0 {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&buf[..len]).to_string();
+    Some(s)
+}
+
+/// Parses an SRT streamid of the form `#!::r=app/stream` and returns
+/// `(app, stream)`. Falls back to `("live", "stream")` on parse failure.
+pub fn parse_streamid(streamid: &str) -> (String, String) {
+    // Common SRT streamid formats:
+    //   #!::r=live/stream_name
+    //   #!::r=stream_name
+    //   app=live/stream=stream_name
+    for token in streamid.split(',') {
+        if let Some(rest) = token.trim().strip_prefix("r=") {
+            let parts: Vec<&str> = rest.splitn(2, '/').collect();
+            let app = parts.first().map_or("live", |v| *v);
+            let stream = parts.get(1).map_or(rest, |v| *v);
+            return (app.to_string(), stream.to_string());
+        }
+        if let Some(rest) = token.trim().strip_prefix("stream=") {
+            return ("live".to_string(), rest.to_string());
+        }
+        if let Some(rest) = token.trim().strip_prefix("app=") {
+            let parts: Vec<&str> = rest.splitn(2, '/').collect();
+            let app = parts.first().map_or("live", |v| *v);
+            let stream = parts.get(1).map_or("stream", |v| *v);
+            return (app.to_string(), stream.to_string());
+        }
+    }
+    // Try parsing as URL path
+    if streamid.contains('/') {
+        let parts: Vec<&str> = streamid.splitn(2, '/').collect();
+        return (parts[0].to_string(), parts.get(1).map_or("stream", |v| *v).to_string());
+    }
+    ("live".to_string(), streamid.to_string())
 }

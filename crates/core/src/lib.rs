@@ -9,7 +9,9 @@ pub mod media_sink;
 pub mod media_source;
 pub mod recorder;
 pub mod session;
+pub mod ffmpeg_source;
 pub mod stream_proxy;
+pub mod stream_pusher;
 pub mod transport;
 pub mod utils;
 
@@ -23,4 +25,6 @@ pub use media_sink::MediaSink;
 pub use media_source::{MediaSource, MediaSourceManager, SourceId};
 pub use recorder::{RecorderCommand, RecorderControl};
 pub use session::{SessionId, SessionManager};
+pub use ffmpeg_source::{FFmpegCmd, FFmpegEntry, FFmpegSourceControl};
 pub use stream_proxy::{ProxyCmd, ProxyEntry, StreamProxyControl};
+pub use stream_pusher::{PusherCmd, PusherEntry, StreamPusherControl};

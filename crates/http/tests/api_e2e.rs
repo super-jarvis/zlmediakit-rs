@@ -79,6 +79,8 @@ impl TestServer {
             hook,
             recorder,
             proxy,
+            pusher: Default::default(),
+            ffmpeg: Default::default(),
             record_root: std::path::PathBuf::from("./record"),
             www_root: None,
             ssl_cert: None,

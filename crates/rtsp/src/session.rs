@@ -106,7 +106,10 @@ impl RtspSession {
             if self.stream.is_none() {
                 break;
             }
-            let stream = self.stream.as_mut().unwrap();
+            let stream = match self.stream.as_mut() {
+                Some(s) => s,
+                None => break,
+            };
             match stream.read(&mut read_buf).await {
                 Ok(0) => {
                     debug!("RTSP connection closed: {}", self.peer_addr);
@@ -243,14 +246,18 @@ impl RtspSession {
                 } else {
                     None
                 };
-                let has_audio = source
-                    .info
-                    .read()
-                    .await
-                    .tracks
-                    .iter()
-                    .any(|t| matches!(t, TrackInfo::Audio(_)));
-                let sdp = self.generate_sdp(video_codec, hevc_sprop, has_audio);
+                let (has_audio, audio_sample_rate, audio_channels) = {
+                    let info = source.info.read().await;
+                    let audio_track = info.tracks.iter().find_map(|t| match t {
+                        TrackInfo::Audio(a) => Some((a.sample_rate, a.channels)),
+                        _ => None,
+                    });
+                    match audio_track {
+                        Some((sr, ch)) => (true, sr, ch),
+                        None => (false, 44100, 1),
+                    }
+                };
+                let sdp = self.generate_sdp(video_codec, hevc_sprop, has_audio, audio_sample_rate, audio_channels as u8);
                 let response = RtspResponse::new(200, "OK")
                     .with_header("CSeq", &self.cseq.to_string())
                     .with_header("Content-Type", "application/sdp")
@@ -387,7 +394,10 @@ impl RtspSession {
             let mut rx = source.subscribe();
 
             if self.tcp_interleaved {
-                let stream = self.stream.take().unwrap();
+                let stream = match self.stream.take() {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
                 let handle = tokio::spawn(async move {
                     let mut writer = stream;
                     let mut seq: u16 = 1;
@@ -411,7 +421,10 @@ impl RtspSession {
 
                 handle.await.ok();
             } else {
-                let video_sock = self.udp_video.take().unwrap();
+                let video_sock = match self.udp_video.take() {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
                 let audio_sock = self.udp_audio.take();
                 tokio::spawn(async move {
                     let mut video_seq: u16 = 1;
@@ -698,6 +711,8 @@ impl RtspSession {
         video_codec: CodecId,
         hevc_sprop: Option<(String, String, String)>,
         has_audio: bool,
+        audio_sample_rate: u32,
+        audio_channels: u8,
     ) -> String {
         let (video_rtpmap, video_fmtp) = match video_codec {
             CodecId::H265 => {
@@ -731,12 +746,13 @@ impl RtspSession {
             video_rtpmap, video_fmtp
         );
         if has_audio {
-            sdp.push_str(
+            sdp.push_str(&format!(
                 "m=audio 0 RTP/AVP 97\r\n\
-                 a=rtpmap:97 MPEG4-GENERIC/44100/1\r\n\
+                 a=rtpmap:97 MPEG4-GENERIC/{}/{}\r\n\
                  a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3\r\n\
                  a=control:track2\r\n",
-            );
+                audio_sample_rate, audio_channels
+            ));
         }
         sdp
     }

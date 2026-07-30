@@ -109,15 +109,31 @@ impl SrtServer {
                     error!("SRT listener socket broken");
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                // SRT_EASYNCRCV means no connection pending (non-blocking
+                // accept) — yield quickly without sleeping.
+                let err = unsafe {
+                    let mut e = 0;
+                    ffi::srt_getlasterror(&mut e);
+                    e
+                };
+                if err == ffi::SRT_EASYNCRCV {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
                 continue;
             }
 
-            info!("SRT client connected (fd={})", accept_fd);
+            let streamid = ffi::get_streamid(accept_fd);
+            if let Some(ref sid) = streamid {
+                info!("SRT client connected (fd={}, streamid={})", accept_fd, sid);
+            } else {
+                info!("SRT client connected (fd={}, no streamid)", accept_fd);
+            }
 
             let sm2 = sm.clone();
             tokio::spawn(async move {
-                handle_srt_connection(accept_fd, sm2).await;
+                handle_srt_connection(accept_fd, sm2, streamid).await;
             });
         }
 
@@ -128,13 +144,47 @@ impl SrtServer {
     }
 }
 
-/// Handles a single SRT connection: reads data in a loop and publishes
-/// it as video frames. `srt_recv` is blocking, so we call it via
-/// `spawn_blocking`.
-async fn handle_srt_connection(fd: c_int, sm: Arc<MediaSourceManager>) {
-    let source = sm.get_or_create("__defaultVhost__", "live", &format!("srt_{}", fd));
+/// MPEG-TS constants.
+const TS_PACKET_SIZE: usize = 188;
+const TS_SYNC: u8 = 0x47;
+const PID_PAT: u16 = 0x0000;
+const PID_DEFAULT_AUDIO: u16 = 0x1100;
+
+/// Holds TS stream state for a single SRT connection.
+struct TsContext {
+    /// PID of the video elementary stream (from PMT).
+    video_pid: Option<u16>,
+    /// PID of the audio elementary stream (from PMT).
+    audio_pid: Option<u16>,
+    /// Accumulated PES payload for the current video frame.
+    video_accum: Vec<u8>,
+    /// Accumulated PES payload for the current audio frame.
+    audio_accum: Vec<u8>,
+}
+
+impl TsContext {
+    fn new() -> Self {
+        Self {
+            video_pid: None,
+            audio_pid: None,
+            video_accum: Vec::new(),
+            audio_accum: Vec::new(),
+        }
+    }
+}
+
+/// Handles a single SRT connection: reads TS data in a loop, demuxes
+/// video and audio from MPEG-TS packets, and publishes them as
+/// `MediaFrame`s.
+async fn handle_srt_connection(fd: c_int, sm: Arc<MediaSourceManager>, streamid: Option<String>) {
+    let (app, stream_name) = match &streamid {
+        Some(sid) => ffi::parse_streamid(sid),
+        None => ("live".to_string(), format!("srt_{}", fd)),
+    };
+    let source = sm.get_or_create("__defaultVhost__", &app, &stream_name);
+    let mut ctx = TsContext::new();
     let mut timestamp: u32 = 0;
-    let buf_cap = 188 * 50;
+    let buf_cap = TS_PACKET_SIZE * 50;
 
     loop {
         let fd_copy = fd;
@@ -158,19 +208,11 @@ async fn handle_srt_connection(fd: c_int, sm: Arc<MediaSourceManager>) {
 
         match result {
             Ok(Ok(data)) => {
-                if data.len() >= 5 {
-                    let codec = detect_codec(&data);
-                    let key_frame = is_keyframe(&data, codec);
-                    let frame = MediaFrame::new_video(
-                        0,
-                        codec,
-                        timestamp,
-                        timestamp as u64,
-                        timestamp as u64,
-                        bytes::Bytes::from(data),
-                        key_frame,
-                    );
-                    source.publish_and_cache(frame).await;
+                if data.len() >= TS_PACKET_SIZE && data[0] == TS_SYNC {
+                    demux_ts_packets(&data, &mut ctx, &source, &mut timestamp).await;
+                } else if data.len() >= 4 {
+                    // Not TS — fall back to raw frame detection.
+                    publish_raw_frame(&data, &source, &mut timestamp).await;
                 }
                 timestamp += 40;
             }
@@ -191,6 +233,229 @@ async fn handle_srt_connection(fd: c_int, sm: Arc<MediaSourceManager>) {
     }
 
     unsafe { ffi::srt_close(fd) };
+}
+
+/// Iterates over 188-byte TS packets and publishes video/audio frames.
+async fn demux_ts_packets(
+    data: &[u8],
+    ctx: &mut TsContext,
+    source: &zlmediakit_core::media_source::MediaSource,
+    timestamp: &mut u32,
+) {
+    let mut offset = 0;
+    while offset + TS_PACKET_SIZE <= data.len() {
+        if data[offset] != TS_SYNC {
+            break;
+        }
+
+        let pid = ((data[offset + 1] as u16 & 0x1F) << 8) | data[offset + 2] as u16;
+        let payload_unit_start = (data[offset + 1] & 0x40) != 0;
+        let adaptation = (data[offset + 3] >> 4) & 0x03;
+        let mut payload_offset = offset + 4;
+
+        // Skip adaptation field if present.
+        if adaptation == 0x02 || adaptation == 0x03 {
+            let adapt_len = data[offset + 4] as usize + 1;
+            payload_offset += adapt_len;
+        }
+
+        if payload_offset + 4 > offset + TS_PACKET_SIZE {
+            offset += TS_PACKET_SIZE;
+            continue;
+        }
+
+        let payload = &data[payload_offset..offset + TS_PACKET_SIZE];
+
+        // Parse PAT to find PMT PID, then PMT to discover audio/video PIDs.
+        if pid == PID_PAT && payload_unit_start {
+            parse_pat(payload, ctx);
+        }
+        // Check if this is PMT.
+        if payload_unit_start && payload.len() > 3 && payload[1] == 0x02 {
+            parse_pmt(payload, ctx);
+        }
+
+        // Use default PIDs until PMT is parsed.
+        let video_pid = ctx.video_pid.unwrap_or(0x0100);
+        let audio_pid = ctx.audio_pid.unwrap_or(PID_DEFAULT_AUDIO);
+
+        let is_video = pid == video_pid;
+        let is_audio = pid == audio_pid;
+
+        if is_video && !payload.is_empty() {
+            let pes_payload = extract_pes_payload(payload, payload_unit_start);
+            if let Some(p) = pes_payload {
+                if payload_unit_start {
+                    if !ctx.video_accum.is_empty() {
+                        publish_video(&ctx.video_accum, source, timestamp).await;
+                        ctx.video_accum.clear();
+                    }
+                    ctx.video_accum.extend_from_slice(p);
+                } else {
+                    ctx.video_accum.extend_from_slice(p);
+                }
+            }
+        } else if is_audio && !payload.is_empty() {
+            let pes_payload = extract_pes_payload(payload, payload_unit_start);
+            if let Some(p) = pes_payload {
+                if payload_unit_start && !ctx.audio_accum.is_empty() {
+                    publish_audio(&ctx.audio_accum, source, timestamp).await;
+                    ctx.audio_accum.clear();
+                }
+                ctx.audio_accum.extend_from_slice(p);
+            }
+        }
+
+        offset += TS_PACKET_SIZE;
+    }
+
+    // Flush remaining accumulated data.
+    if !ctx.video_accum.is_empty() {
+        publish_video(&ctx.video_accum, source, timestamp).await;
+        ctx.video_accum.clear();
+    }
+    if !ctx.audio_accum.is_empty() {
+        publish_audio(&ctx.audio_accum, source, timestamp).await;
+        ctx.audio_accum.clear();
+    }
+}
+
+/// Parses PAT to find PMT PID.
+fn parse_pat(payload: &[u8], ctx: &mut TsContext) {
+    // PAT starts after pointer (1 byte) + table_id (1) + section_length (2).
+    if payload.len() < 8 {
+        return;
+    }
+    let pointer = payload[0] as usize;
+    let pat_start = 1 + pointer;
+    if pat_start + 4 > payload.len() {
+        return;
+    }
+    // Skip table_id (1), section_syntax_indicator + reserved + section_length (2).
+    let program_offset = pat_start + 3;
+    if program_offset + 4 > payload.len() {
+        return;
+    }
+    let program_number = u16::from_be_bytes([payload[program_offset], payload[program_offset + 1]]);
+    if program_number == 0x0000 {
+        // NIT — skip.
+        return;
+    }
+    // Store PMT PID for parsing later (encoded into program_map_PID).
+    let _pmt_pid = ((payload[program_offset + 2] as u16 & 0x1F) << 8) | payload[program_offset + 3] as u16;
+    ctx.video_pid = ctx.video_pid.or(Some(0x0100));
+    ctx.audio_pid = ctx.audio_pid.or(Some(PID_DEFAULT_AUDIO));
+}
+
+/// Parses PMT to discover video and audio PIDs.
+fn parse_pmt(payload: &[u8], ctx: &mut TsContext) {
+    // PMT: pointer (1) + table_id (1) + section_length (2)
+    if payload.len() < 12 {
+        return;
+    }
+    let pointer = payload[0] as usize;
+    let pmt_start = 1 + pointer;
+    if pmt_start + 7 > payload.len() {
+        return;
+    }
+    // Skip: table_id(1), section_length(2), program_number(2), version/current(1),
+    // section_number(1), last_section_number(1) = 8 bytes
+    let pcr_pid_offset = pmt_start + 8;
+    if pcr_pid_offset + 5 > payload.len() {
+        return;
+    }
+    // Skip PCR_PID (2) + program_info_length (2) = 4 bytes
+    let info_len = ((payload[pcr_pid_offset + 3] as u16 & 0x0F) << 8) | payload[pcr_pid_offset + 4] as u16;
+    let es_start = pcr_pid_offset + 5 + info_len as usize;
+
+    let mut pos = es_start;
+    while pos + 5 <= payload.len() {
+        let stream_type = payload[pos];
+        let pid = ((payload[pos + 1] as u16 & 0x1F) << 8) | payload[pos + 2] as u16;
+        // es_info_length (2)
+        let es_info = ((payload[pos + 3] as u16 & 0x0F) << 8) | payload[pos + 4] as u16;
+        match stream_type {
+            0x1B | 0x24 => ctx.video_pid = Some(pid),  // H.264 / H.265
+            0x0F | 0x11 => ctx.audio_pid = Some(pid),  // AAC / AAC-latm
+            _ => {}
+        }
+        pos += 5 + es_info as usize;
+    }
+}
+
+/// Extracts PES packet payload from a TS packet payload.
+fn extract_pes_payload<'a>(payload: &'a [u8], unit_start: bool) -> Option<&'a [u8]> {
+    if !unit_start {
+        return Some(payload);
+    }
+    if payload.len() < 6 {
+        return None;
+    }
+    // PES header: 0x00 0x00 0x01 stream_id
+    if payload[0] != 0x00 || payload[1] != 0x00 || payload[2] != 0x01 {
+        return Some(payload);
+    }
+    let data_start = 6 + payload[4] as usize;
+    if data_start > payload.len() {
+        return None;
+    }
+    Some(&payload[data_start..])
+}
+
+/// Publishes accumulated video data as a MediaFrame.
+async fn publish_video(data: &[u8], source: &zlmediakit_core::media_source::MediaSource, timestamp: &mut u32) {
+    if data.len() < 4 {
+        return;
+    }
+    let codec = detect_codec(data);
+    let key_frame = is_keyframe(data, codec);
+    let frame = MediaFrame::new_video(
+        0,
+        codec,
+        *timestamp,
+        *timestamp as u64,
+        *timestamp as u64,
+        bytes::Bytes::copy_from_slice(data),
+        key_frame,
+    );
+    source.publish_and_cache(frame).await;
+}
+
+/// Publishes accumulated audio data as a MediaFrame.
+async fn publish_audio(data: &[u8], source: &zlmediakit_core::media_source::MediaSource, timestamp: &mut u32) {
+    if data.len() < 7 {
+        return;
+    }
+    // Check for AAC ADTS sync word (0xFFF).
+    if data[0] == 0xFF && (data[1] & 0xF0) == 0xF0 {
+        let frame = MediaFrame::new_audio(
+            0,
+            zlmediakit_core::media_frame::CodecId::AAC,
+            *timestamp,
+            *timestamp as u64,
+            *timestamp as u64,
+            bytes::Bytes::copy_from_slice(data),
+        );
+        source.publish_and_cache(frame).await;
+    }
+}
+
+/// Fallback: publish raw data as a video frame (pre-TS behaviour).
+async fn publish_raw_frame(data: &[u8], source: &zlmediakit_core::media_source::MediaSource, timestamp: &mut u32) {
+    if data.len() >= 5 {
+        let codec = detect_codec(data);
+        let key_frame = is_keyframe(data, codec);
+        let frame = MediaFrame::new_video(
+            0,
+            codec,
+            *timestamp,
+            *timestamp as u64,
+            *timestamp as u64,
+            bytes::Bytes::copy_from_slice(data),
+            key_frame,
+        );
+        source.publish_and_cache(frame).await;
+    }
 }
 
 fn detect_codec(data: &[u8]) -> CodecId {

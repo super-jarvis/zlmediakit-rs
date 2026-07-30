@@ -1,7 +1,6 @@
 use bytes::{BufMut, BytesMut};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
 use zlmediakit_core::media_frame::{CodecId, FrameType, MediaFrame};
@@ -29,6 +28,7 @@ struct TsWriter {
     continuity_audio: u8,
     continuity_pat: u8,
     continuity_pmt: u8,
+    pcr: u64,
 }
 
 impl TsWriter {
@@ -38,6 +38,7 @@ impl TsWriter {
             continuity_audio: 0,
             continuity_pat: 0,
             continuity_pmt: 0,
+            pcr: 0,
         }
     }
 
@@ -83,8 +84,10 @@ impl TsWriter {
         write_ts_packet(out, PMT_PID, &pmt_payload, true, &mut self.continuity_pmt);
     }
 
-    fn write_pes(&mut self, out: &mut Vec<u8>, pid: u16, pes: &[u8], rand_access: bool) {
-        write_pes_to_ts(out, pid, pes, rand_access, self.continuity_for(pid));
+    fn write_pes(&mut self, out: &mut Vec<u8>, pid: u16, pes: &[u8], rand_access: bool, dts_ms: u64) {
+        self.pcr = dts_ms * 27000;
+        let pcr = self.pcr;
+        write_pes_to_ts(out, pid, pes, rand_access, self.continuity_for(pid), pcr);
     }
 
     fn continuity_for(&mut self, pid: u16) -> &mut u8 {
@@ -98,8 +101,9 @@ impl TsWriter {
 
 pub struct HlsMuxer {
     target_duration: f64,
+    max_segments: usize,
     current_frames: Vec<MediaFrame>,
-    segment_start: Option<Instant>,
+    segment_start_pts: Option<u64>,
     segment_index: u32,
     writer: TsWriter,
     video_config_sent: bool,
@@ -113,8 +117,9 @@ impl HlsMuxer {
     pub fn new(target_duration: f64) -> Self {
         Self {
             target_duration,
+            max_segments: 6,
             current_frames: Vec::new(),
-            segment_start: None,
+            segment_start_pts: None,
             segment_index: 0,
             writer: TsWriter::new(),
             video_config_sent: false,
@@ -125,14 +130,19 @@ impl HlsMuxer {
         }
     }
 
-    pub fn push_frame(&mut self, frame: MediaFrame) -> Option<(u32, Vec<u8>)> {
-        if self.segment_start.is_none() {
-            self.segment_start = Some(Instant::now());
+    pub fn with_max_segments(mut self, n: usize) -> Self {
+        self.max_segments = n;
+        self
+    }
+
+    pub fn push_frame(&mut self, frame: MediaFrame) -> Option<(u32, Vec<u8> /*data*/)> {
+        if self.segment_start_pts.is_none() {
+            self.segment_start_pts = Some(frame.dts);
         }
 
         if frame.frame_type == FrameType::Video && frame.key_frame {
-            if let Some(start) = self.segment_start {
-                let elapsed = start.elapsed().as_secs_f64();
+            if let Some(start_pts) = self.segment_start_pts {
+                let elapsed = (frame.dts.saturating_sub(start_pts)) as f64 / 1000.0;
                 debug!(
                     "HLS keyframe check: elapsed={:.2} target={:.2} frames={}",
                     elapsed,
@@ -141,13 +151,12 @@ impl HlsMuxer {
                 );
                 if elapsed >= self.target_duration && !self.current_frames.is_empty() {
                     let data = self.mux_segment();
-                    let _duration = start.elapsed().as_secs_f64();
                     let idx = self.segment_index;
                     self.segment_index += 1;
                     self.current_frames.clear();
                     self.video_config_sent = false;
                     self.audio_config_sent = false;
-                    self.segment_start = Some(Instant::now());
+                    self.segment_start_pts = Some(frame.dts);
                     self.current_frames.push(frame);
                     return Some((idx, data));
                 }
@@ -168,7 +177,7 @@ impl HlsMuxer {
         self.current_frames.clear();
         self.video_config_sent = false;
         self.audio_config_sent = false;
-        self.segment_start = None;
+        self.segment_start_pts = None;
         Some((idx, data))
     }
 
@@ -219,7 +228,7 @@ impl HlsMuxer {
             if let Some(ref config) = self.video_config_data {
                 info!("Writing video config PES: {} bytes", config.len());
                 let pes = build_config_pes(0xE0, config);
-                self.writer.write_pes(&mut out, VIDEO_PID, &pes, true);
+                self.writer.write_pes(&mut out, VIDEO_PID, &pes, true, self.writer.pcr / 90);
                 self.video_config_sent = true;
             } else {
                 info!("No video config data available");
@@ -229,7 +238,7 @@ impl HlsMuxer {
         if !self.audio_config_sent {
             if let Some(ref config) = self.audio_config_data {
                 let pes = build_config_pes(0xC0, config);
-                self.writer.write_pes(&mut out, AUDIO_PID, &pes, true);
+                self.writer.write_pes(&mut out, AUDIO_PID, &pes, true, self.writer.pcr / 90);
                 self.audio_config_sent = true;
             }
         }
@@ -246,7 +255,7 @@ impl HlsMuxer {
                                 &annex_b[..annex_b.len().min(12)]
                             );
                             let pes = build_data_pes_raw(0xE0, &annex_b, frame.timestamp);
-                            self.writer.write_pes(&mut out, VIDEO_PID, &pes, true);
+                            self.writer.write_pes(&mut out, VIDEO_PID, &pes, true, frame.timestamp as u64);
                         } else {
                             info!(
                                 "  -> annex_b EMPTY for frame data[:5]={:02x?}",
@@ -263,7 +272,7 @@ impl HlsMuxer {
                     };
                     if !audio_data.is_empty() {
                         let pes = build_data_pes_raw(0xC0, &audio_data, frame.timestamp);
-                        self.writer.write_pes(&mut out, AUDIO_PID, &pes, false);
+                        self.writer.write_pes(&mut out, AUDIO_PID, &pes, false, frame.timestamp as u64);
                     }
                 }
                 _ => {}
@@ -373,12 +382,24 @@ fn flv_audio_to_adts(data: &[u8], audio_config: &[u8]) -> Vec<u8> {
     out
 }
 
+fn write_pcr(buf: &mut Vec<u8>, pcr: u64) {
+    let base = pcr / 300;
+    let ext = (pcr % 300) as u16;
+    buf.push((base >> 25) as u8);
+    buf.push((base >> 17) as u8);
+    buf.push((base >> 9) as u8);
+    buf.push((base >> 1) as u8);
+    buf.push(((base & 1) as u8) << 7 | 0x7E);
+    buf.push(((ext >> 8) as u8 & 0x01) | (ext & 0xFF) as u8);
+}
+
 fn write_pes_to_ts(
     out: &mut Vec<u8>,
     pid: u16,
     pes: &[u8],
     rand_access: bool,
     continuity: &mut u8,
+    pcr: u64,
 ) {
     let mut offset = 0;
     let max_payload = TS_PACKET_SIZE - 4; // 184
@@ -390,13 +411,13 @@ fn write_pes_to_ts(
     // Build adaptation field for first packet
     let mut adapt: Vec<u8> = Vec::new();
     if first_pad > 0 || rand_access {
-        if rand_access && first_pad >= 7 {
-            // Random access: write adaptation with random_access flag + PCR placeholder (6 bytes of 0xFF)
-            let adapt_data_len = first_pad - 1; // -1 for length byte itself
-            adapt.push(adapt_data_len as u8); // adaptation_field_length
-            adapt.push(0x40); // random_access=1, no PCR flag
-            adapt.extend(std::iter::repeat_n(0xFF, adapt_data_len.saturating_sub(1)));
-        // stuffing
+        if rand_access && first_pad >= 8 {
+            // Random access: write adaptation with random_access flag + PCR
+            let adapt_data_len = first_pad - 1;
+            adapt.push(adapt_data_len as u8);
+            adapt.push(0x50); // random_access=1, PCR flag=1
+            write_pcr(&mut adapt, pcr);
+            adapt.extend(std::iter::repeat_n(0xFF, adapt_data_len.saturating_sub(7)));
         } else if first_pad > 0 {
             // Just padding, no PCR, no random access
             let adapt_data_len = first_pad - 1; // -1 for length byte itself
@@ -650,9 +671,15 @@ impl Default for HlsMuxer {
     }
 }
 
-pub fn start_hls_task(source: Arc<MediaSource>, segments: Arc<RwLock<VecDeque<HlsSegment>>>) {
+pub fn start_hls_task(
+    source: Arc<MediaSource>,
+    segments: Arc<RwLock<VecDeque<HlsSegment>>>,
+    target_duration: f64,
+    max_segments: usize,
+    on_stop: Option<Box<dyn FnOnce() + Send>>,
+) {
     tokio::spawn(async move {
-        let mut muxer = HlsMuxer::new(2.0);
+        let mut muxer = HlsMuxer::new(target_duration).with_max_segments(max_segments);
 
         let config_frames = source.get_cached_config_frames().await;
         for frame in &config_frames {
@@ -682,12 +709,12 @@ pub fn start_hls_task(source: Arc<MediaSource>, segments: Arc<RwLock<VecDeque<Hl
                     if let Some((idx, data)) = muxer.push_frame(frame) {
                         let seg = HlsSegment {
                             index: idx,
-                            duration: 2.0,
+                            duration: target_duration,
                             data,
                         };
                         let mut segs = segments.write().await;
                         segs.push_back(seg);
-                        if segs.len() > 6 {
+                        while segs.len() > max_segments {
                             segs.pop_front();
                         }
                         info!("HLS segment {} generated ({} total)", idx, segs.len());
@@ -706,11 +733,15 @@ pub fn start_hls_task(source: Arc<MediaSource>, segments: Arc<RwLock<VecDeque<Hl
         if let Some((idx, data)) = muxer.flush() {
             let seg = HlsSegment {
                 index: idx,
-                duration: 2.0,
+                duration: target_duration,
                 data,
             };
             let mut segs = segments.write().await;
             segs.push_back(seg);
+        }
+
+        if let Some(cb) = on_stop {
+            cb();
         }
 
         info!("HLS task ended for {}", source.url());

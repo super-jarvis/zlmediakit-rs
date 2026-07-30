@@ -121,6 +121,8 @@ async fn recording_api_start_stop_via_http() {
         hook,
         recorder: recorder.clone(),
         proxy,
+        pusher: Default::default(),
+        ffmpeg: Default::default(),
         record_root: std::path::PathBuf::from(RECORD_BASE),
         www_root: None,
         ssl_cert: None,

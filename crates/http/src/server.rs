@@ -4,10 +4,12 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use zlmediakit_core::auth::StreamAuth;
+use zlmediakit_core::ffmpeg_source::FFmpegSourceControl;
 use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::recorder::RecorderControl;
 use zlmediakit_core::stream_proxy::StreamProxyControl;
+use zlmediakit_core::stream_pusher::StreamPusherControl;
 use zlmediakit_core::transport::{load_tls_config, TlsAcceptor, TransportStream};
 
 /// Bundled configuration for the HTTP server.
@@ -18,6 +20,8 @@ pub struct HttpServerConfig {
     pub hook: Arc<HookClient>,
     pub recorder: Arc<RecorderControl>,
     pub proxy: Arc<StreamProxyControl>,
+    pub pusher: Arc<StreamPusherControl>,
+    pub ffmpeg: Arc<FFmpegSourceControl>,
     pub record_root: PathBuf,
     pub www_root: Option<PathBuf>,
     pub ssl_cert: Option<String>,
@@ -32,6 +36,8 @@ pub struct HttpServer {
     hook: Arc<HookClient>,
     recorder: Arc<RecorderControl>,
     proxy: Arc<StreamProxyControl>,
+    pusher: Arc<StreamPusherControl>,
+    ffmpeg: Arc<FFmpegSourceControl>,
     record_root: PathBuf,
     www_root: Option<PathBuf>,
 }
@@ -53,6 +59,8 @@ impl HttpServer {
             hook: config.hook,
             recorder: config.recorder,
             proxy: config.proxy,
+            pusher: config.pusher,
+            ffmpeg: config.ffmpeg,
             record_root: config.record_root,
             www_root: config.www_root,
         })
@@ -70,6 +78,8 @@ impl HttpServer {
                     let hook = self.hook.clone();
                     let recorder = self.recorder.clone();
                     let proxy = self.proxy.clone();
+                    let pusher = self.pusher.clone();
+                    let ffmpeg = self.ffmpeg.clone();
                     let peer = peer_addr.to_string();
 
                     if let Some(ref tls) = tls {
@@ -86,6 +96,8 @@ impl HttpServer {
                                         hook,
                                         recorder,
                                         proxy,
+                                        pusher,
+                                        ffmpeg,
                                         record_root.clone(),
                                         www_root.clone(),
                                     );
@@ -108,6 +120,8 @@ impl HttpServer {
                                 hook,
                                 recorder,
                                 proxy,
+                                pusher,
+                                ffmpeg,
                                 record_root.clone(),
                                 www_root.clone(),
                             );

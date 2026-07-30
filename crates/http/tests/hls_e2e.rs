@@ -84,6 +84,8 @@ async fn hls_e2e_generates_playlist_and_segments() {
             hook,
             recorder,
             proxy,
+            pusher: Default::default(),
+            ffmpeg: Default::default(),
             record_root: std::path::PathBuf::from("./record"),
             www_root: None,
             ssl_cert: None,
@@ -111,35 +113,33 @@ async fn hls_e2e_generates_playlist_and_segments() {
     let (code, _) = http_get("/live/test/hls.m3u8").await;
     assert_eq!(code, 200, "playlist request should succeed");
 
-    // Push frames with real-time spacing > 2 s to trigger segment flush.
+    // Push frames with PTS span > 4 s to trigger segment flush (target duration = 4.0).
     // First frame (P-frame, starts timer if not already started):
     let nalu = [0x41u8, 0x9a, 0x00, 0x15, 0x20];
     let f = MediaFrame::new_video(0, CodecId::H264, 0, 0, 0, avcc_sample(false, &nalu), false);
     source.publish_and_cache(f).await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // Second frame (P-frame):
+    // Second frame (P-frame, 3 seconds later):
     let nalu = [0x41u8, 0x9a, 0x01, 0x15, 0x20];
     let f = MediaFrame::new_video(
         0,
         CodecId::H264,
-        500,
-        500,
-        500,
+        3000,
+        3000,
+        3000,
         avcc_sample(false, &nalu),
         false,
     );
     source.publish_and_cache(f).await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // Third frame (IDR key frame, should trigger flush since >2 s elapsed):
+    // Third frame (IDR key frame at 6s → PTS delta 6s > 4s target → flush):
     let nalu = [0x65u8, 0x9a, 0x02, 0x15, 0x20];
     let f = MediaFrame::new_video(
         0,
         CodecId::H264,
-        1000,
-        1000,
-        1000,
+        6000,
+        6000,
+        6000,
         avcc_sample(true, &nalu),
         true,
     );

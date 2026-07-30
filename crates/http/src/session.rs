@@ -9,8 +9,10 @@ use tracing::{debug, error, warn};
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::hook::HookResult;
 use zlmediakit_core::media_source::MediaSourceManager;
+use zlmediakit_core::ffmpeg_source::FFmpegSourceControl;
 use zlmediakit_core::recorder::RecorderControl;
 use zlmediakit_core::stream_proxy::StreamProxyControl;
+use zlmediakit_core::stream_pusher::StreamPusherControl;
 use zlmediakit_core::transport::TransportStream;
 use zlmediakit_hls::muxer::{self, HlsSegment};
 
@@ -43,6 +45,8 @@ pub struct HttpSession {
     hook: Arc<zlmediakit_core::hook::HookClient>,
     recorder: Arc<RecorderControl>,
     proxy: Arc<StreamProxyControl>,
+    pusher: Arc<StreamPusherControl>,
+    ffmpeg: Arc<FFmpegSourceControl>,
     record_root: PathBuf,
     www_root: Option<PathBuf>,
     buffer: BytesMut,
@@ -57,6 +61,8 @@ impl HttpSession {
         hook: Arc<zlmediakit_core::hook::HookClient>,
         recorder: Arc<RecorderControl>,
         proxy: Arc<StreamProxyControl>,
+        pusher: Arc<StreamPusherControl>,
+        ffmpeg: Arc<FFmpegSourceControl>,
         record_root: PathBuf,
         www_root: Option<PathBuf>,
     ) -> Self {
@@ -68,6 +74,8 @@ impl HttpSession {
             hook,
             recorder,
             proxy,
+            pusher,
+            ffmpeg,
             record_root,
             www_root,
             buffer: BytesMut::with_capacity(4096),
@@ -287,7 +295,16 @@ impl HttpSession {
                     Arc::new(RwLock::new(VecDeque::new()));
                 let segs_clone = segs.clone();
                 let source_clone = source.clone();
-                muxer::start_hls_task(source_clone, segs_clone);
+                let cleanup_key = key.clone();
+                muxer::start_hls_task(
+                    source_clone,
+                    segs_clone,
+                    4.0,
+                    10,
+                    Some(Box::new(move || {
+                        HLS_SEGMENTS.remove(&cleanup_key);
+                    })),
+                );
                 segs
             });
 
@@ -440,7 +457,16 @@ impl HttpSession {
             let segs_clone = segs.clone();
             let src = source.clone();
             let init_clone = init.clone();
-            zlmediakit_hls::cmaf::start_hls_cmaf_task(src, segs_clone, init_clone);
+            let cleanup_key = key.clone();
+            zlmediakit_hls::cmaf::start_hls_cmaf_task(
+                src,
+                segs_clone,
+                init_clone,
+                Some(Box::new(move || {
+                    CMAF_SEGMENTS.remove(&cleanup_key);
+                    CMAF_INIT_CACHE.remove(&cleanup_key);
+                })),
+            );
             segs
         });
 
@@ -617,8 +643,10 @@ impl HttpSession {
             let segs: Arc<RwLock<VecDeque<Fmp4Segment>>> = Arc::new(RwLock::new(VecDeque::new()));
             let segs_clone = segs.clone();
             let src = source.clone();
+            let cleanup_key = key.clone();
             tokio::spawn(async move {
                 start_dash_task(src, segs_clone).await;
+                DASH_SEGMENTS.remove(&cleanup_key);
             });
             segs
         });
@@ -1141,6 +1169,169 @@ impl HttpSession {
                     }
                 }))
                 .await?;
+            }
+            "addStreamPusher" => {
+                let q = Self::parse_query(path);
+                let dst_url = q.get("dst_url").map(|s| s.as_str()).unwrap_or("").to_string();
+                let vhost = q
+                    .get("vhost")
+                    .map(|s| s.as_str())
+                    .unwrap_or("__defaultVhost__")
+                    .to_string();
+                let app = q
+                    .get("app")
+                    .map(|s| s.as_str())
+                    .unwrap_or("live")
+                    .to_string();
+                let stream = q
+                    .get("stream")
+                    .map(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if dst_url.is_empty() || stream.is_empty() {
+                    self.send_json(&serde_json::json!({
+                        "code": -400,
+                        "msg": "missing dst_url or stream param"
+                    }))
+                    .await?;
+                    return Ok(());
+                }
+                let ok = self.pusher.add(&dst_url, &vhost, &app, &stream);
+                if ok {
+                    self.send_json(
+                        &serde_json::json!({"code": 0, "result": "stream pusher started"}),
+                    )
+                    .await?;
+                } else {
+                    self.send_json(&serde_json::json!({
+                        "code": -1,
+                        "msg": "pusher already exists"
+                    }))
+                    .await?;
+                }
+            }
+            "delStreamPusher" => {
+                let (vhost, app, stream) = Self::api_stream_params(path);
+                if stream.is_empty() {
+                    self.send_json(
+                        &serde_json::json!({"code": -400, "msg": "missing stream param"}),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let ok = self.pusher.remove(&vhost, &app, &stream);
+                if ok {
+                    self.send_json(
+                        &serde_json::json!({"code": 0, "result": "stream pusher stopped"}),
+                    )
+                    .await?;
+                } else {
+                    self.send_json(&serde_json::json!({"code": -404, "msg": "pusher not found"}))
+                        .await?;
+                }
+            }
+            "getStreamPusherList" => {
+                let list = self.pusher.list();
+                let data: Vec<serde_json::Value> = list
+                    .iter()
+                    .map(|(dst_url, vhost, app, stream)| {
+                        serde_json::json!({
+                            "dst_url": dst_url,
+                            "vhost": vhost,
+                            "app": app,
+                            "stream": stream,
+                        })
+                    })
+                    .collect();
+                self.send_json(&serde_json::json!({"code": 0, "result": data}))
+                    .await?;
+            }
+            "addFFmpegSource" => {
+                let q = Self::parse_query(path);
+                let src_url = q.get("src_url").map(|s| s.as_str()).unwrap_or("").to_string();
+                let dst_url = q.get("dst_url").map(|s| s.as_str()).unwrap_or("").to_string();
+                let vhost = q
+                    .get("vhost")
+                    .map(|s| s.as_str())
+                    .unwrap_or("__defaultVhost__")
+                    .to_string();
+                let app = q
+                    .get("app")
+                    .map(|s| s.as_str())
+                    .unwrap_or("live")
+                    .to_string();
+                let stream = q
+                    .get("stream")
+                    .map(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let timeout_ms: u32 = q
+                    .get("timeout_ms")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(10000);
+                if src_url.is_empty() || dst_url.is_empty() {
+                    self.send_json(&serde_json::json!({
+                        "code": -400,
+                        "msg": "missing src_url or dst_url param"
+                    }))
+                    .await?;
+                    return Ok(());
+                }
+                let stream = if stream.is_empty() {
+                    dst_url.rsplit('/').next().unwrap_or("stream").to_string()
+                } else {
+                    stream
+                };
+                let ok = self.ffmpeg.add(&src_url, &dst_url, &vhost, &app, &stream, timeout_ms);
+                if ok {
+                    self.send_json(
+                        &serde_json::json!({"code": 0, "result": "ffmpeg source started"}),
+                    )
+                    .await?;
+                } else {
+                    self.send_json(&serde_json::json!({
+                        "code": -1,
+                        "msg": "ffmpeg source already exists"
+                    }))
+                    .await?;
+                }
+            }
+            "delFFmpegSource" => {
+                let (vhost, app, stream) = Self::api_stream_params(path);
+                if stream.is_empty() {
+                    self.send_json(
+                        &serde_json::json!({"code": -400, "msg": "missing stream param"}),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let ok = self.ffmpeg.remove(&vhost, &app, &stream);
+                if ok {
+                    self.send_json(
+                        &serde_json::json!({"code": 0, "result": "ffmpeg source stopped"}),
+                    )
+                    .await?;
+                } else {
+                    self.send_json(&serde_json::json!({"code": -404, "msg": "ffmpeg source not found"}))
+                        .await?;
+                }
+            }
+            "getFFmpegSourceList" => {
+                let list = self.ffmpeg.list();
+                let data: Vec<serde_json::Value> = list
+                    .iter()
+                    .map(|(src_url, dst_url, vhost, app, stream)| {
+                        serde_json::json!({
+                            "src_url": src_url,
+                            "dst_url": dst_url,
+                            "vhost": vhost,
+                            "app": app,
+                            "stream": stream,
+                        })
+                    })
+                    .collect();
+                self.send_json(&serde_json::json!({"code": 0, "result": data}))
+                    .await?;
             }
             "addStreamProxy" => {
                 let q = Self::parse_query(path);
