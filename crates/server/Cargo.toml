@@ -17,6 +17,7 @@ zlmediakit-http = { path = "../http" }
 zlmediakit-flv = { path = "../flv" }
 zlmediakit-hls = { path = "../hls" }
 zlmediakit-mp4 = { path = "../mp4" }
+zlmediakit-srt = { path = "../srt" }
 zlmediakit-webrtc = { path = "../webrtc" }
 tokio.workspace = true
 bytes.workspace = true

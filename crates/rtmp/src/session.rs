@@ -971,6 +971,15 @@ pub fn parse_video_rtmp_packet(data: &[u8]) -> (CodecId, bool, bool) {
     let codec_id = first_byte & 0x0F;
     let is_keyframe = frame_type == 1;
 
+    // Enhanced RTMP (ExHeader bit set)
+    if data[0] & 0x80 != 0 && data.len() >= 5 {
+        let fourcc = &data[1..5];
+        let packet_type = data[0] & 0x0F;
+        let is_config = packet_type == 0;
+        let codec = parse_enhanced_video_codec(fourcc);
+        return (codec, is_keyframe && !is_config, is_config);
+    }
+
     let is_config = (codec_id == 7 || codec_id == 12) && (data[1] & 0x0F) == 0;
 
     if codec_id == 7 {
@@ -993,7 +1002,21 @@ pub fn parse_audio_rtmp_packet(data: &[u8]) -> CodecId {
         7 => CodecId::G711A,
         8 => CodecId::G711U,
         13 => CodecId::Opus,
+        14 => CodecId::L16,   // PCM Little-endian 16-bit
         _ => CodecId::AAC,
+    }
+}
+
+/// Maps enhanced RTMP/FLV codec IDs to our CodecId enum.
+/// Enhanced FLV uses FourCC codes: av01=AV1, vp09=VP9, vp08=VP8.
+pub fn parse_enhanced_video_codec(fourcc: &[u8]) -> CodecId {
+    match fourcc {
+        b"av01" => CodecId::AV1,
+        b"vp09" => CodecId::VP9,
+        b"vp08" => CodecId::VP8,
+        b"hvc1" | b"hev1" => CodecId::H265,
+        b"avc1" => CodecId::H264,
+        _ => CodecId::Unknown(0),
     }
 }
 

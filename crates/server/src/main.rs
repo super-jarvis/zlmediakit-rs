@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
 use zlmediakit_core::auth::StreamAuth;
@@ -17,7 +18,9 @@ use zlmediakit_flv::FlvRecorder;
 use zlmediakit_hls::HlsRecorder;
 use zlmediakit_http::{HttpServer, HttpServerConfig};
 use zlmediakit_mp4::recorder::Mp4Recorder;
+use zlmediakit_srt::{SrtServer, SrtServerConfig};
 use zlmediakit_rtmp::pull_client as rtmp_pull_client;
+use zlmediakit_rtmp::push_client as rtmp_push_client;
 use zlmediakit_rtmp::RtmpServer;
 use zlmediakit_rtsp::rtsp_pull_start;
 use zlmediakit_rtsp::RtspServer;
@@ -283,6 +286,35 @@ async fn main() -> Result<()> {
         handles.push(handle);
     }
 
+    // SRT ingest server: accepts SRT connections and publishes the received
+    // stream to the MediaSourceManager. Runs in a blocking thread since
+    // the SRT API is synchronous.
+    if config.srt.enabled {
+        let srt_addr = format!("0.0.0.0:{}", config.srt.port);
+        let srt_sm = source_manager.clone();
+        let srt_stop = Arc::new(AtomicBool::new(false));
+        let srt_stop_handle = srt_stop.clone();
+        let srt_latency = config.srt.latency_ms;
+        let srt_passphrase = config.srt.passphrase.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let mut server = SrtServer::new(SrtServerConfig {
+                addr: srt_addr,
+                latency_ms: srt_latency,
+                passphrase: srt_passphrase,
+                source_manager: srt_sm,
+            });
+            if let Err(e) = server.run_blocking(srt_stop) {
+                error!("SRT server error: {}", e);
+            }
+        });
+        handles.push(handle);
+        // Store the stop signal for cleanup
+        let stop_signal = srt_stop_handle;
+        // NOTE: In a full implementation, we'd store stop_signal and set it
+        // to true during shutdown. For now, Ctrl+C aborts the task.
+        drop(stop_signal);
+    }
+
     // Recorder supervisor: always runs so the HTTP API can start/stop recording
     // on demand. It also auto-records every published stream when `record.hls`
     // or `record.flv` is enabled in the config.
@@ -330,6 +362,22 @@ async fn main() -> Result<()> {
                 warn!("Auto proxy: {} already active, skipping", stream);
             }
         }
+    }
+
+    // Cluster push relay: when a stream is published locally, push it to
+    // configured remote peers (RTMP push).
+    if config.cluster.enabled && !config.cluster.push_to.is_empty() {
+        info!(
+            "Cluster push relay: {} peer(s) configured",
+            config.cluster.push_to.len()
+        );
+        let cluster_peers = config.cluster.push_to.clone();
+        let cluster_sm = source_manager.clone();
+        let cluster_eb = event_bus.clone();
+        let handle = tokio::spawn(async move {
+            run_cluster_push_relay(cluster_eb, cluster_sm, cluster_peers).await;
+        });
+        handles.push(handle);
     }
 
     info!("All servers started. Press Ctrl+C to stop.");
@@ -499,5 +547,69 @@ async fn run_proxy_supervisor(
             info!("stream proxy task end: {}", key);
             active.remove(&key);
         });
+    }
+}
+
+/// Watches the EventBus for `StreamPublish` events and pushes the stream
+/// to configured cluster peers via RTMP push.
+async fn run_cluster_push_relay(
+    event_bus: Arc<EventBus>,
+    source_manager: Arc<MediaSourceManager>,
+    peers: Vec<zlmediakit_core::config::ClusterPeerConfig>,
+) {
+    use std::sync::atomic::AtomicBool;
+
+    let mut rx = event_bus.subscribe();
+    info!("Cluster push relay supervisor started");
+
+    loop {
+        match rx.recv().await {
+            Ok(Event::StreamPublish { vhost, app, stream, .. }) => {
+                for peer in &peers {
+                    let _peer_vhost = if peer.vhost.is_empty() {
+                        &vhost
+                    } else {
+                        &peer.vhost
+                    };
+                    let peer_app = if peer.app.is_empty() { "live" } else { &peer.app };
+                    let push_url = format!(
+                        "{}/{}/{}",
+                        peer.url.trim_end_matches('/'),
+                        peer_app,
+                        stream
+                    );
+
+                    let sm = source_manager.clone();
+                    let src_vhost = vhost.clone();
+                    let src_app = app.clone();
+                    let src_stream = stream.clone();
+
+                    tokio::spawn(async move {
+                        info!("Cluster push: {}/{} -> {}", src_app, src_stream, push_url);
+                        let stop = Arc::new(tokio::sync::Notify::new());
+                        let stopped = Arc::new(AtomicBool::new(false));
+                        if let Err(e) = rtmp_push_client::start(
+                            &push_url,
+                            &src_vhost,
+                            &src_app,
+                            &src_stream,
+                            sm,
+                            stop,
+                            stopped,
+                        )
+                        .await
+                        {
+                            warn!(
+                                "Cluster push {}/{} -> {} failed: {}",
+                                src_app, src_stream, push_url, e
+                            );
+                        }
+                    });
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(_) => break,
+            _ => {}
+        }
     }
 }

@@ -16,9 +16,24 @@ use zlmediakit_hls::muxer::{self, HlsSegment};
 
 use crate::ws::{upgrade_response, WsSession};
 use zlmediakit_flv::FlvMuxer;
+use zlmediakit_mp4::fmp4::Fmp4Muxer;
+use zlmediakit_mp4::{build_mpd, DashRepresentation, Fmp4Segment};
 
 pub static HLS_SEGMENTS: once_cell::sync::Lazy<DashMap<String, Arc<RwLock<VecDeque<HlsSegment>>>>> =
     once_cell::sync::Lazy::new(DashMap::new);
+
+/// DASH fMP4 segment cache. Key = stream URL (vhost/app/stream).
+pub static DASH_SEGMENTS: once_cell::sync::Lazy<DashMap<String, Arc<RwLock<VecDeque<Fmp4Segment>>>>> =
+    once_cell::sync::Lazy::new(DashMap::new);
+
+/// CMAF HLS segment cache (fMP4-based). Key = stream URL.
+pub static CMAF_SEGMENTS: once_cell::sync::Lazy<DashMap<String, Arc<RwLock<VecDeque<zlmediakit_hls::HlsSegment>>>>> =
+    once_cell::sync::Lazy::new(DashMap::new);
+
+/// CMAF HLS init segment cache. Key = stream URL.
+pub static CMAF_INIT_CACHE: once_cell::sync::Lazy<
+    DashMap<String, Arc<RwLock<Option<Vec<u8>>>>>,
+> = once_cell::sync::Lazy::new(DashMap::new);
 
 pub struct HttpSession {
     stream: TransportStream,
@@ -116,6 +131,14 @@ impl HttpSession {
             self.handle_vod(path, &request_str).await?;
         } else if route.ends_with(".flv") {
             self.handle_flv_stream(path).await?;
+        } else if route.ends_with(".mpd") {
+            self.handle_dash_mpd(path).await?;
+        } else if route.ends_with(".m4s") {
+            self.handle_dash_segment(path).await?;
+        } else if route.ends_with("init.mp4") {
+            self.handle_dash_init(path).await?;
+        } else if route.ends_with(".cmav.m3u8") {
+            self.handle_cmaf_playlist(path).await?;
         } else if route.ends_with(".m3u8") {
             self.handle_hls_playlist(path).await?;
         } else if route.ends_with(".ts") {
@@ -374,6 +397,298 @@ impl HttpSession {
                     self.stream.write_all(&seg.data).await?;
                     return Ok(());
                 }
+            }
+        }
+
+        self.send_404().await
+    }
+
+    // ── CMAF HLS handlers ──────────────────────────────────────────────
+
+    /// Serves a CMAF-compatible HLS playlist (.cmav.m3u8).
+    async fn handle_cmaf_playlist(&mut self, path: &str) -> anyhow::Result<()> {
+        let (app, resource, sign) = Self::parse_path_sign(path);
+        let stream_name = resource
+            .strip_suffix(".cmav.m3u8")
+            .and_then(|s| s.strip_suffix("/hls"))
+            .unwrap_or_else(|| {
+                resource
+                    .strip_suffix(".cmav.m3u8")
+                    .unwrap_or("stream")
+            })
+            .to_string();
+
+        if !self.auth.check("__defaultVhost__", &app, &stream_name, "play", &sign) {
+            return self.send_401().await;
+        }
+
+        let source = self.source_manager.get("__defaultVhost__", &app, &stream_name);
+        let source = match source {
+            Some(s) => s,
+            None => return self.send_404().await,
+        };
+
+        let key = source.url();
+
+        // Ensure CMAF task is running
+        let _segs = CMAF_SEGMENTS.entry(key.clone()).or_insert_with(|| {
+            let segs: Arc<RwLock<VecDeque<zlmediakit_hls::HlsSegment>>> =
+                Arc::new(RwLock::new(VecDeque::new()));
+            let init: Arc<RwLock<Option<Vec<u8>>>> = Arc::new(RwLock::new(None));
+            CMAF_INIT_CACHE.insert(key.clone(), init.clone());
+
+            let segs_clone = segs.clone();
+            let src = source.clone();
+            let init_clone = init.clone();
+            zlmediakit_hls::cmaf::start_hls_cmaf_task(src, segs_clone, init_clone);
+            segs
+        });
+
+        let segs_guard = _segs.read().await;
+        let m3u8 = zlmediakit_hls::cmaf::build_cmaf_playlist(
+            &segs_guard,
+            4,
+            &app,
+            &stream_name,
+        );
+
+        let body = m3u8;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/vnd.apple.mpegurl\r\n\
+             Content-Length: {}\r\n\
+             Access-Control-Allow-Origin: *\r\n\
+             Cache-Control: no-cache\r\n\
+             Connection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        self.stream.write_all(response.as_bytes()).await?;
+        Ok(())
+    }
+
+    // ── DASH handlers ──────────────────────────────────────────────────
+
+    /// Serves DASH MPD manifest for a live stream.
+    async fn handle_dash_mpd(&mut self, path: &str) -> anyhow::Result<()> {
+        let (app, resource, sign) = Self::parse_path_sign(path);
+        let stream_name = resource
+            .strip_suffix(".mpd")
+            .map_or("stream", |v| v)
+            .to_string();
+
+        if !self.auth.check("__defaultVhost__", &app, &stream_name, "play", &sign) {
+            return self.send_401().await;
+        }
+
+        let source = self.source_manager.get("__defaultVhost__", &app, &stream_name);
+        let source = match source {
+            Some(s) => s,
+            None => return self.send_404().await,
+        };
+
+        let info = source.info.read().await;
+        let mut representations = Vec::new();
+
+        for track in &info.tracks {
+            match track {
+                zlmediakit_core::media_frame::TrackInfo::Video(v) => {
+                    let codec_str = match v.codec {
+                        zlmediakit_core::media_frame::CodecId::H264 => "avc1.64001f",
+                        zlmediakit_core::media_frame::CodecId::H265 => "hev1.1.6.L93.B0",
+                        zlmediakit_core::media_frame::CodecId::VP8 => "vp8",
+                        zlmediakit_core::media_frame::CodecId::VP9 => "vp09.00.10.08",
+                        zlmediakit_core::media_frame::CodecId::AV1 => "av01.0.04M.08",
+                        _ => "avc1.64001f",
+                    };
+                    representations.push(DashRepresentation {
+                        id: "v0".into(),
+                        mime_type: "video/mp4".into(),
+                        codecs: codec_str.into(),
+                        width: v.width,
+                        height: v.height,
+                        segment_duration_secs: 4,
+                        timescale: 90000,
+                        bandwidth: 2000000,
+                    });
+                }
+                zlmediakit_core::media_frame::TrackInfo::Audio(a) => {
+                    let codec_str = match a.codec {
+                        zlmediakit_core::media_frame::CodecId::AAC => "mp4a.40.2",
+                        zlmediakit_core::media_frame::CodecId::Opus => "opus",
+                        _ => "mp4a.40.2",
+                    };
+                    representations.push(DashRepresentation {
+                        id: "a0".into(),
+                        mime_type: "audio/mp4".into(),
+                        codecs: codec_str.into(),
+                        width: 0,
+                        height: 0,
+                        segment_duration_secs: 4,
+                        timescale: a.sample_rate,
+                        bandwidth: 128000,
+                    });
+                }
+            }
+        }
+        drop(info);
+
+        let base_url = format!("/{}/{}", app, stream_name);
+        let mpd = build_mpd(
+            &representations,
+            &format!("{}/init-{}", base_url, "$RepresentationID$"),
+            &format!("{}/seg-{}-$", base_url, "$RepresentationID$"),
+            1,
+        );
+
+        let body = mpd;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/dash+xml\r\n\
+             Content-Length: {}\r\n\
+             Access-Control-Allow-Origin: *\r\n\
+             Cache-Control: no-cache\r\n\
+             Connection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        self.stream.write_all(response.as_bytes()).await?;
+        Ok(())
+    }
+
+    /// Serves a DASH/CMAF init segment.
+    async fn handle_dash_init(&mut self, path: &str) -> anyhow::Result<()> {
+        let (app, resource, sign) = Self::parse_path_sign(path);
+
+        // Check CMAF init cache first
+        let route = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+        // Path: /app/stream/init.mp4 (CMAF) or /app/stream/init-v0.mp4 (DASH)
+        if route.ends_with("init.mp4") && !route.contains("-v") && !route.contains("-a") {
+            let stream_name = route
+                .trim_start_matches('/')
+                .split('/')
+                .nth(1)
+                .unwrap_or("stream");
+            if let Some(source) = self.source_manager.get("__defaultVhost__", &app, stream_name) {
+                if let Some(init_cache) = CMAF_INIT_CACHE.get(&source.url()) {
+                    let guard = init_cache.read().await;
+                    if let Some(ref data) = *guard {
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: video/mp4\r\n\
+                             Content-Length: {}\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Cache-Control: max-age=3600\r\n\
+                             Connection: close\r\n\r\n",
+                            data.len()
+                        );
+                        self.stream.write_all(response.as_bytes()).await?;
+                        self.stream.write_all(data).await?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        // Existing DASH init handler...
+        let rest = resource.strip_suffix("init.mp4").unwrap_or(&resource);
+        let rest = rest.trim_end_matches('/');
+        let stream_name = if let Some(s) = rest.strip_suffix("-v0") {
+            s
+        } else if let Some(s) = rest.strip_suffix("-a0") {
+            s
+        } else {
+            rest
+        };
+
+        if !self.auth.check("__defaultVhost__", &app, stream_name, "play", &sign) {
+            return self.send_401().await;
+        }
+
+        let source = self.source_manager.get("__defaultVhost__", &app, stream_name);
+        let source = match source {
+            Some(s) => s,
+            None => return self.send_404().await,
+        };
+
+        // Ensure DASH muxer exists
+        let key = source.url();
+        let _segs = DASH_SEGMENTS.entry(key.clone()).or_insert_with(|| {
+            let segs: Arc<RwLock<VecDeque<Fmp4Segment>>> = Arc::new(RwLock::new(VecDeque::new()));
+            let segs_clone = segs.clone();
+            let src = source.clone();
+            tokio::spawn(async move {
+                start_dash_task(src, segs_clone).await;
+            });
+            segs
+        });
+
+        // Build init segment from current config
+        let mut muxer = Fmp4Muxer::new(90000);
+        let cached_configs = {
+            let cache = source.gop_cache.read().await;
+            cache.get_config_frames()
+        };
+        for frame in &cached_configs {
+            muxer.push_frame(frame);
+        }
+        let init = muxer.init_segment();
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: video/mp4\r\n\
+             Content-Length: {}\r\n\
+             Access-Control-Allow-Origin: *\r\n\
+             Cache-Control: max-age=3600\r\n\
+             Connection: close\r\n\r\n",
+            init.data.len()
+        );
+        self.stream.write_all(response.as_bytes()).await?;
+        self.stream.write_all(&init.data).await?;
+        Ok(())
+    }
+
+    /// Serves a DASH media segment (.m4s).
+    async fn handle_dash_segment(&mut self, path: &str) -> anyhow::Result<()> {
+        let (app, resource, sign) = Self::parse_path_sign(path);
+        // Path: /app/stream/seg-v0-1.m4s
+        let rest = resource.strip_suffix(".m4s").unwrap_or(&resource);
+        let parts: Vec<&str> = rest.split('-').collect();
+        if parts.len() < 3 {
+            return self.send_404().await;
+        }
+        let stream_name = parts[0];
+        // repr = parts[1], seq = parts[2]
+        if parts.len() >= 3 {
+            let _seq: u64 = parts.last().unwrap_or(&"0").parse().unwrap_or(0);
+        }
+
+        if !self.auth.check("__defaultVhost__", &app, stream_name, "play", &sign) {
+            return self.send_401().await;
+        }
+
+        let source = self.source_manager.get("__defaultVhost__", &app, stream_name);
+        let source = match source {
+            Some(s) => s,
+            None => return self.send_404().await,
+        };
+
+        let key = source.url();
+        if let Some(segments) = DASH_SEGMENTS.get(&key) {
+            let segs = segments.read().await;
+            if let Some(seg) = segs.back() {
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: video/mp4\r\n\
+                     Content-Length: {}\r\n\
+                     Access-Control-Allow-Origin: *\r\n\
+                     Cache-Control: max-age=3600\r\n\
+                     Connection: close\r\n\r\n",
+                    seg.data.len()
+                );
+                self.stream.write_all(response.as_bytes()).await?;
+                self.stream.write_all(&seg.data).await?;
+                return Ok(());
             }
         }
 
@@ -1295,5 +1610,75 @@ refreshTimer = setInterval(refreshStreams, 3000);
         );
         self.stream.write_all(response.as_bytes()).await?;
         Ok(())
+    }
+}
+
+/// Background task: subscribes to a MediaSource and generates fMP4 segments
+/// every 4 seconds, storing them in DASH_SEGMENTS.
+async fn start_dash_task(
+    source: Arc<zlmediakit_core::media_source::MediaSource>,
+    segs: Arc<RwLock<VecDeque<Fmp4Segment>>>,
+) {
+    use zlmediakit_core::gop_cache;
+
+    let mut muxer = Fmp4Muxer::new(90000);
+    let mut rx = source.subscribe();
+
+    // Replay config frames
+    let configs = {
+        let cache = source.gop_cache.read().await;
+        cache.get_config_frames()
+    };
+    for frame in &configs {
+        muxer.push_frame(frame);
+    }
+
+    // Replay GOP cache
+    let gop = {
+        let cache = source.gop_cache.read().await;
+        cache.get_latest_gop_frames()
+    };
+    for frame in &gop {
+        if !gop_cache::is_config_frame(frame) {
+            muxer.push_frame(frame);
+        }
+    }
+
+    // Flush initial segment
+    if let Some(seg) = muxer.flush_segment() {
+        let mut guard = segs.write().await;
+        guard.push_back(seg);
+        while guard.len() > 10 {
+            guard.pop_front();
+        }
+    }
+
+    let mut last_flush = tokio::time::Instant::now();
+    let flush_interval = tokio::time::Duration::from_secs(4);
+
+    loop {
+        tokio::select! {
+            frame = rx.recv() => {
+                match frame {
+                    Ok(f) => {
+                        if !gop_cache::is_config_frame(&f) {
+                            muxer.push_frame(&f);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+            _ = tokio::time::sleep_until(last_flush + flush_interval) => {
+                if let Some(seg) = muxer.flush_segment() {
+                    let mut guard = segs.write().await;
+                    guard.push_back(seg);
+                    while guard.len() > 10 {
+                        guard.pop_front();
+                    }
+                }
+                last_flush = tokio::time::Instant::now();
+            }
+        }
     }
 }

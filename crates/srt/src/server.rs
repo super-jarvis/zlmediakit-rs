@@ -4,8 +4,8 @@
 use crate::ffi;
 use std::ffi::c_int;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::Notify;
 use tracing::{error, info, warn};
 use zlmediakit_core::media_frame::{CodecId, MediaFrame};
 use zlmediakit_core::media_source::MediaSourceManager;
@@ -35,7 +35,7 @@ impl SrtServer {
 
     /// Starts the SRT server. This will block the calling thread (use in
     /// a dedicated `tokio::task::spawn_blocking`).
-    pub fn run_blocking(&mut self, stop: Arc<Notify>) -> anyhow::Result<()> {
+    pub fn run_blocking(&mut self, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
         if self.started {
             anyhow::bail!("SRT server already started");
         }
@@ -97,7 +97,7 @@ impl SrtServer {
         // Accept loop
         loop {
             // Check stop signal
-            if stop.notified().now_or_never().is_some() {
+            if stop.load(Ordering::Relaxed) {
                 break;
             }
 

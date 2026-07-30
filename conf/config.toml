@@ -21,14 +21,14 @@ ssl = false
 # RTSP server
 [rtsp]
 enabled = true
-port = 554
+port = 8554
 ssl = false
 tcp_mode = true
 
 # HTTP server
 [http]
 enabled = true
-port = 80
+port = 8080
 ssl = false
 dir_root = true
 www_root = "./www"
@@ -64,6 +64,25 @@ ice_servers = []
 #on_stream_not_found = "http://127.0.0.1:8080/index/hook/on_stream_not_found"
 #timeout_sec = 5
 #retry = 1
+
+# SRT (Secure Reliable Transport) ingest server.
+# Accepts SRT push streams and publishes them to the MediaSourceManager.
+# Uses libsrt (must be installed: apt install libsrt-gnutls-dev).
+#[srt]
+#enabled = false
+#port = 9000
+#latency_ms = 120
+#passphrase = ""  # optional encryption
+
+# Cluster push relay: when a local stream is published, automatically push
+# it to remote RTMP servers. Each peer entry specifies the remote URL and
+# optional vhost/app overrides.
+#[cluster]
+#enabled = false
+#push_to = [
+#  { url = "rtmp://192.168.1.10/live" },
+#  { url = "rtmp://192.168.1.11/live", vhost = "__defaultVhost__", app = "live" },
+#]
 
 # Record settings
 [record]

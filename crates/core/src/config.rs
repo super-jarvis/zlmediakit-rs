@@ -48,6 +48,12 @@ pub struct ServerConfig {
     pub proxy: ProxyConfig,
 
     #[serde(default)]
+    pub srt: SrtConfig,
+
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+
+    #[serde(default)]
     pub webrtc: WebRtcConfig,
 
     #[serde(default = "default_webrtc_port")]
@@ -211,6 +217,73 @@ impl Default for HookConfig {
             on_stream_not_found: None,
             timeout_sec: default_hook_timeout(),
             retry: default_hook_retry(),
+        }
+    }
+}
+
+/// SRT (Secure Reliable Transport) ingest configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SrtConfig {
+    /// Whether to enable the SRT ingest server.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Port to listen on (default: 9000).
+    #[serde(default = "default_srt_port")]
+    pub port: u16,
+    /// Latency in milliseconds (default: 120).
+    #[serde(default = "default_srt_latency")]
+    pub latency_ms: u32,
+    /// Optional encryption passphrase.
+    #[serde(default)]
+    pub passphrase: Option<String>,
+}
+
+/// Cluster peer configuration — push streams to a remote node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterPeerConfig {
+    /// Remote RTMP URL to push to (e.g. rtmp://192.168.1.10/live).
+    pub url: String,
+    /// Local vhost to relay.
+    #[serde(default = "default_vhost")]
+    pub vhost: String,
+    /// Local app to relay (default: live).
+    #[serde(default = "default_proxy_app")]
+    pub app: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterConfig {
+    /// Whether cluster push relay is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// List of remote peers to push streams to.
+    #[serde(default)]
+    pub push_to: Vec<ClusterPeerConfig>,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            push_to: Vec::new(),
+        }
+    }
+}
+
+fn default_srt_port() -> u16 {
+    9000
+}
+fn default_srt_latency() -> u32 {
+    120
+}
+
+impl Default for SrtConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: default_srt_port(),
+            latency_ms: default_srt_latency(),
+            passphrase: None,
         }
     }
 }
@@ -390,6 +463,8 @@ impl Default for ServerConfig {
             http: HttpConfig::default(),
             record: RecordConfig::default(),
             proxy: ProxyConfig::default(),
+            srt: SrtConfig::default(),
+            cluster: ClusterConfig::default(),
             webrtc: WebRtcConfig::default(),
             webrtc_port: default_webrtc_port(),
         }
