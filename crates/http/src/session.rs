@@ -14,6 +14,7 @@ use zlmediakit_core::recorder::RecorderControl;
 use zlmediakit_core::stream_proxy::StreamProxyControl;
 use zlmediakit_core::stream_pusher::StreamPusherControl;
 use zlmediakit_core::transport::TransportStream;
+use zlmediakit_srt::{RtpPayloadType, RtpServerManager, SipServer};
 use zlmediakit_hls::muxer::{self, HlsSegment};
 
 use crate::ws::{upgrade_response, WsSession};
@@ -47,6 +48,8 @@ pub struct HttpSession {
     proxy: Arc<StreamProxyControl>,
     pusher: Arc<StreamPusherControl>,
     ffmpeg: Arc<FFmpegSourceControl>,
+    rtp: Option<Arc<RtpServerManager>>,
+    sip: Option<Arc<SipServer>>,
     record_root: PathBuf,
     www_root: Option<PathBuf>,
     buffer: BytesMut,
@@ -63,6 +66,8 @@ impl HttpSession {
         proxy: Arc<StreamProxyControl>,
         pusher: Arc<StreamPusherControl>,
         ffmpeg: Arc<FFmpegSourceControl>,
+        rtp: Option<Arc<RtpServerManager>>,
+        sip: Option<Arc<SipServer>>,
         record_root: PathBuf,
         www_root: Option<PathBuf>,
     ) -> Self {
@@ -76,6 +81,8 @@ impl HttpSession {
             proxy,
             pusher,
             ffmpeg,
+            rtp,
+            sip,
             record_root,
             www_root,
             buffer: BytesMut::with_capacity(4096),
@@ -855,7 +862,14 @@ impl HttpSession {
             Err(_) => return self.send_404().await,
         };
         if meta.is_dir() {
-            return self.serve_dir_listing(&target, route).await;
+            let index = target.join("index.html");
+            match tokio::fs::metadata(&index).await {
+                Ok(idx_meta) => {
+                    let range = Self::extract_range(request);
+                    return self.serve_file(&index, idx_meta.len(), range).await;
+                }
+                Err(_) => return self.serve_dir_listing(&target, route).await,
+            }
         }
         let range = Self::extract_range(request);
         self.serve_file(&target, meta.len(), range).await
@@ -1468,6 +1482,129 @@ impl HttpSession {
                     .collect();
                 self.send_json(&serde_json::json!({"code": 0, "result": data}))
                     .await?;
+            }
+            "openRtpServer" => {
+                if let Some(rtp) = &self.rtp {
+                    let q = Self::parse_query(path);
+                    let port: u16 = q.get("port").and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let ssrc: Option<u32> = q.get("ssrc").and_then(|v| v.parse().ok());
+                    let app = q
+                        .get("app")
+                        .cloned()
+                        .unwrap_or_else(|| "rtp".to_string());
+                    let stream = q
+                        .get("stream_id")
+                        .cloned()
+                        .or_else(|| q.get("stream").cloned())
+                        .unwrap_or_else(|| format!("rtp_{port}"));
+                    let payload = q
+                        .get("type")
+                        .map(|s| RtpPayloadType::from_str(s))
+                        .unwrap_or(RtpPayloadType::Ps);
+                    let vhost = q
+                        .get("vhost")
+                        .map(|s| s.as_str())
+                        .unwrap_or("__defaultVhost__")
+                        .to_string();
+                    match rtp.open(port, &vhost, &app, &stream, payload, ssrc).await {
+                        Ok(p) => {
+                            let _ = self.send_json(&serde_json::json!({"code": 0, "result": p})).await;
+                        }
+                        Err(e) => {
+                            let _ =
+                                self.send_json(&serde_json::json!({"code": -1, "msg": e.to_string()}))
+                                    .await;
+                        }
+                    }
+                } else {
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": -1, "msg": "rtp server disabled"}))
+                        .await;
+                }
+            }
+            "closeRtpServer" => {
+                if let Some(rtp) = &self.rtp {
+                    let q = Self::parse_query(path);
+                    let port: u16 = q
+                        .get("port")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    rtp.close(port);
+                    let _ = self.send_json(&serde_json::json!({"code": 0, "result": "ok"})).await;
+                } else {
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": -1, "msg": "rtp server disabled"}))
+                        .await;
+                }
+            }
+            "listRtpServer" => {
+                if let Some(rtp) = &self.rtp {
+                    let list = rtp.list();
+                    let _ = self.send_json(&serde_json::json!({"code": 0, "result": list})).await;
+                } else {
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": -1, "msg": "rtp server disabled"}))
+                        .await;
+                }
+            }
+            "getRtpInfo" => {
+                if let Some(rtp) = &self.rtp {
+                    let q = Self::parse_query(path);
+                    let port: u16 = q
+                        .get("port")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    let info = rtp.get_info(port);
+                    let _ = self.send_json(&serde_json::json!({"code": 0, "result": info})).await;
+                } else {
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": -1, "msg": "rtp server disabled"}))
+                        .await;
+                }
+            }
+            "startRtp" => {
+                if let Some(sip) = &self.sip {
+                    let q = Self::parse_query(path);
+                    let device = q.get("device_id").cloned().unwrap_or_default();
+                    let channel = q
+                        .get("channel_id")
+                        .or_else(|| q.get("stream"))
+                        .cloned()
+                        .unwrap_or_default();
+                    match sip.invite(&device, &channel).await {
+                        Ok(port) => {
+                            let _ = self.send_json(&serde_json::json!({"code": 0, "result": port})).await;
+                        }
+                        Err(e) => {
+                            let _ =
+                                self.send_json(&serde_json::json!({"code": -1, "msg": e.to_string()}))
+                                    .await;
+                        }
+                    }
+                } else {
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": -1, "msg": "gb28181 disabled"}))
+                        .await;
+                }
+            }
+            "stopRtp" => {
+                if let Some(rtp) = &self.rtp {
+                    let q = Self::parse_query(path);
+                    if let Some(stream) = q.get("stream").or_else(|| q.get("channel_id")) {
+                        let app = q
+                            .get("app")
+                            .cloned()
+                            .unwrap_or_else(|| "gb28181".to_string());
+                        if let Some(info) = rtp.find_by_stream(&app, stream) {
+                            rtp.close(info.port);
+                        }
+                    }
+                    let _ = self.send_json(&serde_json::json!({"code": 0, "result": "ok"})).await;
+                } else {
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": -1, "msg": "rtp server disabled"}))
+                        .await;
+                }
             }
             _ => {
                 self.send_404().await?;

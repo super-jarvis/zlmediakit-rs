@@ -51,6 +51,9 @@ pub struct ServerConfig {
     pub srt: SrtConfig,
 
     #[serde(default)]
+    pub gb28181: Gb28181Config,
+
+    #[serde(default)]
     pub cluster: ClusterConfig,
 
     #[serde(default)]
@@ -238,6 +241,35 @@ pub struct SrtConfig {
     pub passphrase: Option<String>,
 }
 
+/// GB28181 (SIP + RTP/PS) ingest configuration.
+///
+/// Enables a minimal SIP registrar/server (UDP) that accepts device
+/// `REGISTER`/`MESSAGE` and can `INVITE` a device to push its PS stream
+/// over RTP to a local media port. The RTP/PS stream is demuxed and
+/// published as a `MediaSource` so it can be played over any protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Gb28181Config {
+    /// Whether to enable the GB28181 SIP + RTP server.
+    #[serde(default)]
+    pub enabled: bool,
+    /// UDP port for the SIP signaling server (default: 5060).
+    #[serde(default = "default_gb28181_sip_port")]
+    pub sip_port: u16,
+    /// Base UDP port for RTP media reception (auto-incremented per stream).
+    #[serde(default = "default_gb28181_media_port")]
+    pub media_port: u16,
+    /// SIP realm used for digest authentication.
+    #[serde(default = "default_gb28181_realm")]
+    pub realm: String,
+    /// SIP password for digest authentication. Empty disables auth.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Externally reachable IP put into SDP `c=` lines so devices know where
+    /// to send RTP. Auto-detected (first non-loopback interface) when empty.
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
 /// Cluster peer configuration — push streams to a remote node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterPeerConfig {
@@ -270,8 +302,30 @@ impl Default for ClusterConfig {
     }
 }
 
+impl Default for Gb28181Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sip_port: default_gb28181_sip_port(),
+            media_port: default_gb28181_media_port(),
+            realm: default_gb28181_realm(),
+            password: None,
+            host: None,
+        }
+    }
+}
+
 fn default_srt_port() -> u16 {
     9000
+}
+fn default_gb28181_sip_port() -> u16 {
+    5060
+}
+fn default_gb28181_media_port() -> u16 {
+    10000
+}
+fn default_gb28181_realm() -> String {
+    "zlmediakit".to_string()
 }
 fn default_srt_latency() -> u32 {
     120
@@ -464,6 +518,7 @@ impl Default for ServerConfig {
             record: RecordConfig::default(),
             proxy: ProxyConfig::default(),
             srt: SrtConfig::default(),
+            gb28181: Gb28181Config::default(),
             cluster: ClusterConfig::default(),
             webrtc: WebRtcConfig::default(),
             webrtc_port: default_webrtc_port(),

@@ -11,6 +11,7 @@ use zlmediakit_core::recorder::RecorderControl;
 use zlmediakit_core::stream_proxy::StreamProxyControl;
 use zlmediakit_core::stream_pusher::StreamPusherControl;
 use zlmediakit_core::transport::{load_tls_config, TlsAcceptor, TransportStream};
+use zlmediakit_srt::{RtpServerManager, SipServer};
 
 /// Bundled configuration for the HTTP server.
 pub struct HttpServerConfig {
@@ -22,6 +23,9 @@ pub struct HttpServerConfig {
     pub proxy: Arc<StreamProxyControl>,
     pub pusher: Arc<StreamPusherControl>,
     pub ffmpeg: Arc<FFmpegSourceControl>,
+    /// Optional GB28181 / openRtpServer RTP reception manager.
+    pub rtp: Option<Arc<RtpServerManager>>,
+    pub sip: Option<Arc<SipServer>>,
     pub record_root: PathBuf,
     pub www_root: Option<PathBuf>,
     pub ssl_cert: Option<String>,
@@ -38,6 +42,8 @@ pub struct HttpServer {
     proxy: Arc<StreamProxyControl>,
     pusher: Arc<StreamPusherControl>,
     ffmpeg: Arc<FFmpegSourceControl>,
+    rtp: Option<Arc<RtpServerManager>>,
+    sip: Option<Arc<SipServer>>,
     record_root: PathBuf,
     www_root: Option<PathBuf>,
 }
@@ -61,6 +67,8 @@ impl HttpServer {
             proxy: config.proxy,
             pusher: config.pusher,
             ffmpeg: config.ffmpeg,
+            rtp: config.rtp,
+            sip: config.sip,
             record_root: config.record_root,
             www_root: config.www_root,
         })
@@ -80,6 +88,8 @@ impl HttpServer {
                     let proxy = self.proxy.clone();
                     let pusher = self.pusher.clone();
                     let ffmpeg = self.ffmpeg.clone();
+                    let rtp = self.rtp.clone();
+                    let sip = self.sip.clone();
                     let peer = peer_addr.to_string();
 
                     if let Some(ref tls) = tls {
@@ -98,6 +108,8 @@ impl HttpServer {
                                         proxy,
                                         pusher,
                                         ffmpeg,
+                                        rtp.clone(),
+                                        sip.clone(),
                                         record_root.clone(),
                                         www_root.clone(),
                                     );
@@ -122,6 +134,8 @@ impl HttpServer {
                                 proxy,
                                 pusher,
                                 ffmpeg,
+                                rtp.clone(),
+                                sip.clone(),
                                 record_root.clone(),
                                 www_root.clone(),
                             );

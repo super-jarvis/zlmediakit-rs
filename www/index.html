@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZLMediaKit-RS 管理后台</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<nav class="sidebar">
+  <div class="sidebar-header">
+    <h1>ZLMediaKit</h1>
+    <div class="version">v0.1.0 · RS</div>
+  </div>
+  <div class="sidebar-nav">
+    <a href="#" data-tab="dashboard" class="active"><span class="icon">📊</span> <span>控制台</span></a>
+    <a href="#" data-tab="proxies"><span class="icon">🔄</span> <span>拉流代理</span></a>
+    <a href="#" data-tab="recording"><span class="icon">⏺️</span> <span>录制管理</span></a>
+    <a href="#" data-tab="forwarding"><span class="icon">📤</span> <span>推流转发</span></a>
+    <a href="#" data-tab="ffmpeg"><span class="icon">🎬</span> <span>FFmpeg 源</span></a>
+    <a href="#" data-tab="server"><span class="icon">ℹ️</span> <span>服务器</span></a>
+  </div>
+</nav>
+
+<div class="main">
+
+  <!-- ════════════════════════════════════════════════ -->
+  <!-- 控制台                                           -->
+  <!-- ════════════════════════════════════════════════ -->
+  <div id="page-dashboard" class="page active">
+    <div class="page-header">
+      <h2>控制台</h2>
+      <span class="subtitle">实时流监控与播放</span>
+    </div>
+
+    <div id="dash-alerts"></div>
+
+    <div class="status-bar">
+      <div class="stat-item">
+        <span class="stat-value" id="stat-streams">-</span>
+        <span class="stat-label">流数量</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-value" id="stat-viewers">-</span>
+        <span class="stat-label">观看人数</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-value" id="stat-alive">-</span>
+        <span class="stat-label">在线流</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h3>活跃流列表</h3>
+        <div class="card-actions">
+          <button class="btn btn-sm" onclick="loadDashboard()">↻ 刷新</button>
+        </div>
+      </div>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead><tr>
+            <th>应用</th><th>流名称</th><th>状态</th><th>观看数</th><th>存活时间</th><th>视频</th><th>音频</th><th>操作</th>
+          </tr></thead>
+          <tbody id="stream-table-body">
+            <tr class="empty-row"><td colspan="8">加载中...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h3>媒体播放器</h3></div>
+      <div class="form-row">
+        <div class="form-group" style="flex:3;">
+          <input id="dash-url" type="text" placeholder="/live/stream.flv" value="/live/test.flv" />
+        </div>
+        <div class="form-group" style="flex:0 0 120px;">
+          <select id="dash-player-type">
+            <option value="auto">自动</option>
+            <option value="hls">HLS</option>
+            <option value="flv">HTTP-FLV</option>
+            <option value="wsflv">WebSocket-FLV</option>
+          </select>
+        </div>
+        <div class="form-group" style="flex:0 0 auto;">
+          <button class="btn btn-primary" onclick="playDashStream()">▶ 播放</button>
+          <button class="btn btn-danger" onclick="stopPlayer()">■ 停止</button>
+        </div>
+      </div>
+      <div id="dash-player-container" class="player-container" style="display:none;">
+        <video id="dash-video" controls autoplay muted></video>
+        <div id="dash-player-info" class="player-info"></div>
+        <div id="dash-player-error" class="player-error" style="display:none;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════ -->
+  <!-- 拉流代理                                         -->
+  <!-- ════════════════════════════════════════════════ -->
+  <div id="page-proxies" class="page">
+    <div class="page-header">
+      <h2>拉流代理</h2>
+      <span class="subtitle">通过 RTMP/RTSP/HTTP 拉取远程流</span>
+    </div>
+    <div id="proxy-alerts"></div>
+
+    <div class="card">
+      <div class="card-header"><h3>添加代理</h3></div>
+      <form id="proxy-form" onsubmit="event.preventDefault();addProxy();">
+        <div class="form-row">
+          <div class="form-group" style="flex:2;">
+            <label>流地址 URL</label>
+            <input type="text" name="url" placeholder="rtmp://example.com/live/stream" required />
+          </div>
+          <div class="form-group">
+            <label>应用名</label>
+            <input type="text" name="app" placeholder="live" />
+          </div>
+          <div class="form-group">
+            <label>流名称</label>
+            <input type="text" name="stream" placeholder="mystream" required />
+          </div>
+          <div class="form-group" style="flex:0 0 auto;">
+            <label>&nbsp;</label>
+            <button type="submit" class="btn btn-primary">+ 添加代理</button>
+          </div>
+        </div>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h3>代理列表</h3>
+        <div class="card-actions">
+          <button class="btn btn-sm" onclick="loadProxies()">↻ 刷新</button>
+        </div>
+      </div>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>应用</th><th>流名称</th><th>源地址</th><th>状态</th><th>观看数</th><th>操作</th></tr></thead>
+          <tbody id="proxy-table-body"><tr class="empty-row"><td colspan="6">加载中...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════ -->
+  <!-- 录制管理                                         -->
+  <!-- ════════════════════════════════════════════════ -->
+  <div id="page-recording" class="page">
+    <div class="page-header">
+      <h2>录制管理</h2>
+      <span class="subtitle">启动/停止 HLS / FLV / MP4 录制</span>
+    </div>
+    <div id="rec-alerts"></div>
+
+    <div class="card">
+      <div class="card-header">
+        <h3>录制状态</h3>
+        <div class="card-actions">
+          <button class="btn btn-sm" onclick="loadRecordingStatus()">↻ 刷新</button>
+        </div>
+      </div>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>应用</th><th>流名称</th><th>录制中</th><th>启动录制</th><th>停止全部</th><th>路径</th></tr></thead>
+          <tbody id="rec-table-body"><tr class="empty-row"><td colspan="6">加载中...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════ -->
+  <!-- 推流转发                                         -->
+  <!-- ════════════════════════════════════════════════ -->
+  <div id="page-forwarding" class="page">
+    <div class="page-header">
+      <h2>推流转发</h2>
+      <span class="subtitle">将流转发到远程服务器</span>
+    </div>
+    <div id="forward-alerts"></div>
+
+    <div class="card">
+      <div class="card-header"><h3>添加转发器</h3></div>
+      <form id="forward-form" onsubmit="event.preventDefault();addForwarder();">
+        <div class="form-row">
+          <div class="form-group" style="flex:2;">
+            <label>目标地址 URL</label>
+            <input type="text" name="dst_url" placeholder="rtmp://remote-server.com/live/stream" required />
+          </div>
+          <div class="form-group">
+            <label>应用名</label>
+            <input type="text" name="app" placeholder="live" />
+          </div>
+          <div class="form-group">
+            <label>流名称</label>
+            <input type="text" name="stream" placeholder="mystream" required />
+          </div>
+          <div class="form-group" style="flex:0 0 auto;">
+            <label>&nbsp;</label>
+            <button type="submit" class="btn btn-primary">+ 添加转发</button>
+          </div>
+        </div>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h3>转发列表</h3>
+        <div class="card-actions">
+          <button class="btn btn-sm" onclick="loadForwarders()">↻ 刷新</button>
+        </div>
+      </div>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>应用</th><th>流名称</th><th>目标地址</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="forward-table-body"><tr class="empty-row"><td colspan="5">加载中...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════ -->
+  <!-- FFmpeg 源                                        -->
+  <!-- ════════════════════════════════════════════════ -->
+  <div id="page-ffmpeg" class="page">
+    <div class="page-header">
+      <h2>FFmpeg 源</h2>
+      <span class="subtitle">通过 FFmpeg 从外部拉取流</span>
+    </div>
+    <div id="ffmpeg-alerts"></div>
+
+    <div class="card">
+      <div class="card-header"><h3>添加 FFmpeg 源</h3></div>
+      <form id="ffmpeg-form" onsubmit="event.preventDefault();addFFmpegSource();">
+        <div class="form-row">
+          <div class="form-group" style="flex:2;">
+            <label>输入地址 (源)</label>
+            <input type="text" name="src_url" placeholder="rtsp://摄像头IP:554/stream1" required />
+          </div>
+          <div class="form-group" style="flex:2;">
+            <label>输出地址</label>
+            <input type="text" name="dst_url" placeholder="rtmp://127.0.0.1:1935/live/stream" required />
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>应用名</label>
+            <input type="text" name="app" placeholder="live" />
+          </div>
+          <div class="form-group">
+            <label>流名称</label>
+            <input type="text" name="stream" placeholder="cam1" required />
+          </div>
+          <div class="form-group">
+            <label>超时时间 (毫秒)</label>
+            <input type="number" name="timeout_ms" placeholder="10000" value="10000" />
+          </div>
+          <div class="form-group" style="flex:0 0 auto;">
+            <label>&nbsp;</label>
+            <button type="submit" class="btn btn-primary">+ 添加 FFmpeg</button>
+          </div>
+        </div>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h3>FFmpeg 源列表</h3>
+        <div class="card-actions">
+          <button class="btn btn-sm" onclick="loadFFmpegSources()">↻ 刷新</button>
+        </div>
+      </div>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>源地址</th><th>输出地址</th><th>应用</th><th>流名称</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="ffmpeg-table-body"><tr class="empty-row"><td colspan="6">加载中...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════ -->
+  <!-- 服务器信息                                       -->
+  <!-- ════════════════════════════════════════════════ -->
+  <div id="page-server" class="page">
+    <div class="page-header">
+      <h2>服务器信息</h2>
+      <span class="subtitle">配置、统计与地址参考</span>
+    </div>
+    <div id="server-info">
+      <p class="text-secondary">加载中...</p>
+    </div>
+  </div>
+
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<script src="https://cdn.jsdelivr.net/npm/flv.js@latest"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

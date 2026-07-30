@@ -20,7 +20,7 @@ use zlmediakit_flv::FlvRecorder;
 use zlmediakit_hls::HlsRecorder;
 use zlmediakit_http::{HttpServer, HttpServerConfig};
 use zlmediakit_mp4::recorder::Mp4Recorder;
-use zlmediakit_srt::{SrtServer, SrtServerConfig};
+use zlmediakit_srt::{Gb28181Server, RtpServerManager, SipServer, SrtServer, SrtServerConfig};
 use zlmediakit_rtmp::pull_client as rtmp_pull_client;
 use zlmediakit_rtmp::push_client as rtmp_push_client;
 use zlmediakit_rtmp::RtmpServer;
@@ -199,6 +199,20 @@ async fn main() -> Result<()> {
         handles.push(handle);
     }
 
+    // GB28181 SIP + RTP/PS receive server.
+    let mut gb28181_rtp: Option<Arc<RtpServerManager>> = None;
+    let mut gb28181_sip: Option<Arc<SipServer>> = None;
+    if config.gb28181.enabled {
+        match Gb28181Server::start(&config.gb28181, source_manager.clone()).await {
+            Ok(srv) => {
+                gb28181_rtp = Some(srv.rtp.clone());
+                gb28181_sip = Some(srv.sip.clone());
+                info!("GB28181 SIP server started on port {}", config.gb28181.sip_port);
+            }
+            Err(e) => error!("Failed to start GB28181 server: {}", e),
+        }
+    }
+
     if config.http.enabled {
         let addr = format!("0.0.0.0:{}", config.http_port);
         let sm = source_manager.clone();
@@ -211,6 +225,8 @@ async fn main() -> Result<()> {
         let http_key = ssl_key.clone();
         let http_www = www_root.clone();
         let http_hook = hook.clone();
+        let http_rtp = gb28181_rtp.clone();
+        let http_sip = gb28181_sip.clone();
         let handle = tokio::spawn(async move {
             match HttpServer::new(HttpServerConfig {
                 addr: addr.clone(),
@@ -221,6 +237,8 @@ async fn main() -> Result<()> {
                 proxy,
                 pusher,
                 ffmpeg,
+                rtp: http_rtp.clone(),
+                sip: http_sip.clone(),
                 record_root: std::path::PathBuf::from(&http_record_root),
                 www_root: http_www,
                 ssl_cert: http_cert,
@@ -254,6 +272,8 @@ async fn main() -> Result<()> {
         let api_key = ssl_key.clone();
         let api_www = www_root.clone();
         let api_hook = hook.clone();
+        let api_rtp = gb28181_rtp.clone();
+        let api_sip = gb28181_sip.clone();
         let handle = tokio::spawn(async move {
             match HttpServer::new(HttpServerConfig {
                 addr: addr.clone(),
@@ -264,6 +284,8 @@ async fn main() -> Result<()> {
                 proxy,
                 pusher,
                 ffmpeg,
+                rtp: api_rtp.clone(),
+                sip: api_sip.clone(),
                 record_root: std::path::PathBuf::from(&api_record_root),
                 www_root: api_www,
                 ssl_cert: api_cert,

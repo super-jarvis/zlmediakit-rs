@@ -6,6 +6,7 @@ edition.workspace = true
 
 [dependencies]
 zlmediakit-core = { path = "../core" }
+zlmediakit-srt = { path = "../srt" }
 zlmediakit-flv = { path = "../flv" }
 zlmediakit-hls = { path = "../hls" }
 zlmediakit-mp4 = { path = "../mp4" }

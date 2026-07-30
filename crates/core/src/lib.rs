@@ -17,6 +17,7 @@ pub mod utils;
 
 pub use auth::{generate_sign, validate_sign, StreamAuth};
 pub use config::ServerConfig;
+pub use config::Gb28181Config;
 pub use error::{Error, Result};
 pub use event_bus::{Event, EventBus};
 pub use hook::{HookClient, HookConfig, HookResult};
