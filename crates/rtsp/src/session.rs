@@ -257,7 +257,7 @@ impl RtspSession {
                         None => (false, 44100, 1),
                     }
                 };
-                let sdp = self.generate_sdp(video_codec, hevc_sprop, has_audio, audio_sample_rate, audio_channels as u8);
+                let sdp = self.generate_sdp(video_codec, hevc_sprop, has_audio, audio_sample_rate, audio_channels);
                 let response = RtspResponse::new(200, "OK")
                     .with_header("CSeq", &self.cseq.to_string())
                     .with_header("Content-Type", "application/sdp")
@@ -712,7 +712,7 @@ impl RtspSession {
         hevc_sprop: Option<(String, String, String)>,
         has_audio: bool,
         audio_sample_rate: u32,
-        audio_channels: u8,
+        audio_channels: u32,
     ) -> String {
         let (video_rtpmap, video_fmtp) = match video_codec {
             CodecId::H265 => {
