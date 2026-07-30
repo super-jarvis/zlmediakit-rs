@@ -9,14 +9,15 @@ use tokio::sync::Notify;
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::config::{RecordConfig, ServerConfig};
 use zlmediakit_core::event_bus::{Event, EventBus};
+use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::media_source::{MediaSource, MediaSourceManager};
 use zlmediakit_core::recorder::{RecorderCommand, RecorderControl};
 use zlmediakit_core::stream_proxy::{ProxyCmd, ProxyTable, StreamProxyControl};
 use zlmediakit_flv::FlvRecorder;
 use zlmediakit_hls::HlsRecorder;
-use zlmediakit_http::HttpServer;
+use zlmediakit_http::{HttpServer, HttpServerConfig};
 use zlmediakit_mp4::recorder::Mp4Recorder;
-use zlmediakit_rtmp::push_client as rtmp_push_client;
+use zlmediakit_rtmp::pull_client as rtmp_pull_client;
 use zlmediakit_rtmp::RtmpServer;
 use zlmediakit_rtsp::rtsp_pull_start;
 use zlmediakit_rtsp::RtspServer;
@@ -104,6 +105,7 @@ async fn main() -> Result<()> {
     let source_manager = Arc::new(MediaSourceManager::new());
     let event_bus = Arc::new(EventBus::new(1024));
     let auth = StreamAuth::new(config.auth_enabled, config.secret.clone());
+    let hook = HookClient::new(config.hook.clone());
     let (recorder_control, recorder_cmd_rx) = RecorderControl::new();
     let recorder_control = Arc::new(recorder_control);
 
@@ -121,6 +123,24 @@ async fn main() -> Result<()> {
 
     let mut handles = Vec::new();
 
+    // Recording root, shared by the HTTP VOD server and the recorder supervisor.
+    let record_base = if config.record.path.is_empty() {
+        "./record".to_string()
+    } else {
+        config.record.path.clone()
+    };
+    // Owned clones handed to the per-server tasks so each task owns its copy
+    // (keeps the spawned futures `'static` and leaves `record_base` free to be
+    // moved into the recorder supervisor).
+    let http_record_root = record_base.clone();
+    let api_record_root = record_base.clone();
+    // Static file web root: only enabled when dir_root is true in config
+    let www_root = if config.http.dir_root {
+        Some(std::path::PathBuf::from(&config.http.www_root))
+    } else {
+        None
+    };
+
     // Common TLS config (shared across protocols). When a protocol has
     // `ssl: true` its server will attempt TLS negotiation after accepting a
     // plain TCP connection.
@@ -132,10 +152,11 @@ async fn main() -> Result<()> {
         let sm = source_manager.clone();
         let eb = event_bus.clone();
         let rtmp_auth = auth.clone();
+        let rtmp_hook = hook.clone();
         let rtmp_cert = config.rtmp.ssl_cert.clone();
         let rtmp_key = config.rtmp.ssl_key.clone();
         let handle = tokio::spawn(async move {
-            match RtmpServer::new(&addr, sm, eb, rtmp_auth, rtmp_cert, rtmp_key).await {
+            match RtmpServer::new(&addr, sm, eb, rtmp_auth, rtmp_hook, rtmp_cert, rtmp_key).await {
                 Ok(server) => {
                     if let Err(e) = server.run().await {
                         error!("RTMP server error: {}", e);
@@ -175,8 +196,23 @@ async fn main() -> Result<()> {
         let proxy = proxy_control.clone();
         let http_cert = ssl_cert.clone();
         let http_key = ssl_key.clone();
+        let http_www = www_root.clone();
+        let http_hook = hook.clone();
         let handle = tokio::spawn(async move {
-            match HttpServer::new(&addr, sm, http_auth, rec, proxy, http_cert, http_key).await {
+            match HttpServer::new(HttpServerConfig {
+                addr: addr.clone(),
+                source_manager: sm,
+                auth: http_auth,
+                hook: http_hook,
+                recorder: rec,
+                proxy,
+                record_root: std::path::PathBuf::from(&http_record_root),
+                www_root: http_www,
+                ssl_cert: http_cert,
+                ssl_key: http_key,
+            })
+            .await
+            {
                 Ok(server) => {
                     if let Err(e) = server.run().await {
                         error!("HTTP server error: {}", e);
@@ -199,8 +235,23 @@ async fn main() -> Result<()> {
         let proxy = proxy_control.clone();
         let api_cert = ssl_cert.clone();
         let api_key = ssl_key.clone();
+        let api_www = www_root.clone();
+        let api_hook = hook.clone();
         let handle = tokio::spawn(async move {
-            match HttpServer::new(&addr, sm, api_auth, rec, proxy, api_cert, api_key).await {
+            match HttpServer::new(HttpServerConfig {
+                addr: addr.clone(),
+                source_manager: sm,
+                auth: api_auth,
+                hook: api_hook,
+                recorder: rec,
+                proxy,
+                record_root: std::path::PathBuf::from(&api_record_root),
+                www_root: api_www,
+                ssl_cert: api_cert,
+                ssl_key: api_key,
+            })
+            .await
+            {
                 Ok(server) => {
                     if let Err(e) = server.run().await {
                         error!("API server error: {}", e);
@@ -237,20 +288,15 @@ async fn main() -> Result<()> {
     // or `record.flv` is enabled in the config.
     {
         let rec_cfg = config.record.clone();
-        let rec_base = if config.record.path.is_empty() {
-            "./record".to_string()
-        } else {
-            config.record.path.clone()
-        };
         let sup_event = event_bus.clone();
         let sup_sm = source_manager.clone();
         info!(
             "Recorder supervisor started (auto hls={}, flv={}, mp4={}) -> {}",
-            config.record.hls, config.record.flv, config.record.mp4, rec_base
+            config.record.hls, config.record.flv, config.record.mp4, record_base
         );
         let rec = recorder_control.clone();
         let handle = tokio::spawn(async move {
-            run_recorder_supervisor(sup_event, sup_sm, rec_cfg, rec_base, recorder_cmd_rx, rec)
+            run_recorder_supervisor(sup_event, sup_sm, rec_cfg, record_base, recorder_cmd_rx, rec)
                 .await;
         });
         handles.push(handle);
@@ -267,6 +313,23 @@ async fn main() -> Result<()> {
             run_proxy_supervisor(proxy_cmd_rx, sup_sm, sup_active).await;
         });
         handles.push(handle);
+    }
+
+    // Config-driven auto-pull: start proxy entries from config.
+    if config.proxy.enabled {
+        for entry in &config.proxy.pulls {
+            let stream = if entry.stream.is_empty() {
+                entry.url.rsplit('/').next().unwrap_or("proxy").to_string()
+            } else {
+                entry.stream.clone()
+            };
+            let ok = proxy_control.add(&entry.url, &entry.vhost, &entry.app, &stream);
+            if ok {
+                info!("Auto proxy: {} -> {}/{}/{}", entry.url, entry.vhost, entry.app, stream);
+            } else {
+                warn!("Auto proxy: {} already active, skipping", stream);
+            }
+        }
     }
 
     info!("All servers started. Press Ctrl+C to stop.");
@@ -422,9 +485,9 @@ async fn run_proxy_supervisor(
             info!("stream proxy task start: {} -> {}", url, key);
             if url.starts_with("rtmp://") || url.starts_with("rtmps://") {
                 if let Err(e) =
-                    rtmp_push_client::start(&url, &vhost, &app, &stream, sm, stop, stopped).await
+                    rtmp_pull_client::start(&url, &vhost, &app, &stream, sm, stop, stopped).await
                 {
-                    warn!("RTMP push task error {}: {}", key, e);
+                    warn!("RTMP proxy task error {}: {}", key, e);
                 }
             } else {
                 if let Err(e) =

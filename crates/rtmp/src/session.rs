@@ -7,6 +7,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::event_bus::{Event, EventBus};
+use zlmediakit_core::hook::{HookClient, HookResult};
 use zlmediakit_core::media_frame::{CodecId, FrameType, MediaFrame};
 use zlmediakit_core::media_source::{MediaSource, MediaSourceManager};
 use zlmediakit_core::transport::TransportStream;
@@ -19,6 +20,7 @@ pub struct RtmpSession {
     source_manager: Arc<MediaSourceManager>,
     event_bus: Arc<EventBus>,
     auth: Arc<StreamAuth>,
+    hook: Arc<HookClient>,
     source: Option<Arc<MediaSource>>,
     app: String,
     stream_name: String,
@@ -36,6 +38,7 @@ impl RtmpSession {
         source_manager: Arc<MediaSourceManager>,
         event_bus: Arc<EventBus>,
         auth: Arc<StreamAuth>,
+        hook: Arc<HookClient>,
     ) -> Self {
         Self {
             stream: Some(stream),
@@ -45,6 +48,7 @@ impl RtmpSession {
             source_manager,
             event_bus,
             auth,
+            hook,
             source: None,
             app: String::new(),
             stream_name: String::new(),
@@ -504,6 +508,19 @@ impl RtmpSession {
         let (stream_base, sign) = Self::split_stream_sign(&self.stream_name);
         self.stream_name = stream_base;
 
+        // External hook callback (before built-in auth)
+        if let HookResult::Deny(msg) = self
+            .hook
+            .on_publish("__defaultVhost__", &self.app, &self.stream_name, &sign)
+            .await
+        {
+            warn!(
+                "RTMP publish rejected (hook): {}/{} - {}",
+                self.app, self.stream_name, msg
+            );
+            return self.send_publish_not_allowed(&msg).await;
+        }
+
         if !self.auth.check(
             "__defaultVhost__",
             &self.app,
@@ -515,30 +532,7 @@ impl RtmpSession {
                 "RTMP publish rejected (auth): {}/{}",
                 self.app, self.stream_name
             );
-            let status_obj = AmfValue::Object(vec![
-                ("level".to_string(), AmfValue::String("error".to_string())),
-                (
-                    "code".to_string(),
-                    AmfValue::String("NetStream.Publish.NotAllowed".to_string()),
-                ),
-                (
-                    "description".to_string(),
-                    AmfValue::String("auth failed".to_string()),
-                ),
-            ]);
-            self.send_msg(&RtmpMessage::Amf0Command {
-                stream_id: self.stream_id,
-                timestamp: 0,
-                data: AmfEncoder::encode(&[
-                    AmfValue::String("onStatus".to_string()),
-                    AmfValue::Number(0.0),
-                    AmfValue::Null,
-                    status_obj,
-                ])
-                .freeze(),
-            })
-            .await?;
-            return Ok(());
+            return self.send_publish_not_allowed("auth failed").await;
         }
 
         let source =
@@ -608,6 +602,19 @@ impl RtmpSession {
         let (stream_base, sign) = Self::split_stream_sign(&self.stream_name);
         self.stream_name = stream_base;
 
+        // External hook callback (before built-in auth)
+        if let HookResult::Deny(msg) = self
+            .hook
+            .on_play("__defaultVhost__", &self.app, &self.stream_name, &sign)
+            .await
+        {
+            warn!(
+                "RTMP play rejected (hook): {}/{} - {}",
+                self.app, self.stream_name, msg
+            );
+            return self.send_play_not_allowed(&msg).await;
+        }
+
         if !self.auth.check(
             "__defaultVhost__",
             &self.app,
@@ -619,30 +626,7 @@ impl RtmpSession {
                 "RTMP play rejected (auth): {}/{}",
                 self.app, self.stream_name
             );
-            let status_obj = AmfValue::Object(vec![
-                ("level".to_string(), AmfValue::String("error".to_string())),
-                (
-                    "code".to_string(),
-                    AmfValue::String("NetStream.Play.NotAllowed".to_string()),
-                ),
-                (
-                    "description".to_string(),
-                    AmfValue::String("auth failed".to_string()),
-                ),
-            ]);
-            self.send_msg(&RtmpMessage::Amf0Command {
-                stream_id: self.stream_id,
-                timestamp: 0,
-                data: AmfEncoder::encode(&[
-                    AmfValue::String("onStatus".to_string()),
-                    AmfValue::Number(0.0),
-                    AmfValue::Null,
-                    status_obj,
-                ])
-                .freeze(),
-            })
-            .await?;
-            return Ok(());
+            return self.send_play_not_allowed("auth failed").await;
         }
 
         self.send_msg(&RtmpMessage::UserControl(
@@ -785,6 +769,16 @@ impl RtmpSession {
             }
             None => {
                 warn!("Stream not found: {}/{}", self.app, self.stream_name);
+
+                // Fire stream-not-found hook (best-effort, fire-and-forget)
+                let hook = self.hook.clone();
+                let app = self.app.clone();
+                let stream = self.stream_name.clone();
+                tokio::spawn(async move {
+                    hook.on_stream_not_found("__defaultVhost__", &app, &stream)
+                        .await;
+                });
+
                 let on_status = AmfValue::Object(vec![
                     ("level".to_string(), AmfValue::String("error".to_string())),
                     (
@@ -837,6 +831,60 @@ impl RtmpSession {
             });
         }
         self.source = None;
+    }
+
+    /// Sends `NetStream.Publish.NotAllowed` with a custom description.
+    async fn send_publish_not_allowed(&mut self, reason: &str) -> anyhow::Result<()> {
+        let status_obj = AmfValue::Object(vec![
+            ("level".to_string(), AmfValue::String("error".to_string())),
+            (
+                "code".to_string(),
+                AmfValue::String("NetStream.Publish.NotAllowed".to_string()),
+            ),
+            (
+                "description".to_string(),
+                AmfValue::String(format!("{}", reason)),
+            ),
+        ]);
+        self.send_msg(&RtmpMessage::Amf0Command {
+            stream_id: self.stream_id,
+            timestamp: 0,
+            data: AmfEncoder::encode(&[
+                AmfValue::String("onStatus".to_string()),
+                AmfValue::Number(0.0),
+                AmfValue::Null,
+                status_obj,
+            ])
+            .freeze(),
+        })
+        .await
+    }
+
+    /// Sends `NetStream.Play.NotAllowed` with a custom description.
+    async fn send_play_not_allowed(&mut self, reason: &str) -> anyhow::Result<()> {
+        let status_obj = AmfValue::Object(vec![
+            ("level".to_string(), AmfValue::String("error".to_string())),
+            (
+                "code".to_string(),
+                AmfValue::String("NetStream.Play.NotAllowed".to_string()),
+            ),
+            (
+                "description".to_string(),
+                AmfValue::String(format!("{}", reason)),
+            ),
+        ]);
+        self.send_msg(&RtmpMessage::Amf0Command {
+            stream_id: self.stream_id,
+            timestamp: 0,
+            data: AmfEncoder::encode(&[
+                AmfValue::String("onStatus".to_string()),
+                AmfValue::Number(0.0),
+                AmfValue::Null,
+                status_obj,
+            ])
+            .freeze(),
+        })
+        .await
     }
 
     /// Splits a stream name that may carry a `?sign=...` query into the bare
@@ -913,7 +961,7 @@ fn normalize_enhanced_video(data: &bytes::Bytes) -> Option<bytes::Bytes> {
     Some(bytes::Bytes::from(out))
 }
 
-fn parse_video_rtmp_packet(data: &[u8]) -> (CodecId, bool, bool) {
+pub fn parse_video_rtmp_packet(data: &[u8]) -> (CodecId, bool, bool) {
     if data.len() < 2 {
         return (CodecId::H264, false, false);
     }
@@ -934,7 +982,7 @@ fn parse_video_rtmp_packet(data: &[u8]) -> (CodecId, bool, bool) {
     }
 }
 
-fn parse_audio_rtmp_packet(data: &[u8]) -> CodecId {
+pub fn parse_audio_rtmp_packet(data: &[u8]) -> CodecId {
     if data.is_empty() {
         return CodecId::AAC;
     }

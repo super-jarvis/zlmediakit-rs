@@ -27,6 +27,9 @@ pub struct ServerConfig {
     pub auth_enabled: bool,
 
     #[serde(default)]
+    pub hook: HookConfig,
+
+    #[serde(default)]
     pub general: GeneralConfig,
 
     #[serde(default)]
@@ -40,6 +43,9 @@ pub struct ServerConfig {
 
     #[serde(default)]
     pub record: RecordConfig,
+
+    #[serde(default)]
+    pub proxy: ProxyConfig,
 
     #[serde(default)]
     pub webrtc: WebRtcConfig,
@@ -106,6 +112,8 @@ pub struct HttpConfig {
     pub ssl_port: Option<u16>,
     #[serde(default = "default_true")]
     pub dir_root: bool,
+    #[serde(default = "default_www_root")]
+    pub www_root: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +138,81 @@ pub struct WebRtcConfig {
     /// candidates only (same-LAN / open-Internet peers).
     #[serde(default)]
     pub ice_servers: Vec<IceServer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyEntryConfig {
+    /// The remote URL to pull (e.g. `rtmp://192.168.1.100/live/camera1`).
+    pub url: String,
+    /// Virtual host to publish under locally.
+    #[serde(default = "default_vhost")]
+    pub vhost: String,
+    /// Application name to publish under locally.
+    #[serde(default = "default_proxy_app")]
+    pub app: String,
+    /// Stream name to publish under locally (defaults to the last path
+    /// component of `url` when empty).
+    pub stream: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    /// Whether to auto-start proxy entries from this config section.
+    #[serde(default)]
+    pub enabled: bool,
+    /// List of remote streams to pull on startup.
+    #[serde(default)]
+    pub pulls: Vec<ProxyEntryConfig>,
+}
+
+/// External authentication hook configuration (HTTP callbacks).
+/// When a hook URL is configured, the server will POST to it before
+/// allowing a publish or play operation. The external service responds
+/// with JSON `{"code": 0}` to allow, or `{"code": -1, "msg": "..."}` to deny.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookConfig {
+    /// Called before a stream starts publishing.
+    /// POST params: vhost, app, stream, params
+    #[serde(default)]
+    pub on_publish: Option<String>,
+
+    /// Called before a stream starts playing.
+    /// POST params: vhost, app, stream, params
+    #[serde(default)]
+    pub on_play: Option<String>,
+
+    /// Called when a player requests a stream that does not exist.
+    /// POST params: vhost, app, stream
+    #[serde(default)]
+    pub on_stream_not_found: Option<String>,
+
+    /// Timeout in seconds for each HTTP hook call (default 5).
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_sec: u64,
+
+    /// Number of retries on network failure before falling back to allow
+    /// (fail-open). Default is 1 (one retry after initial attempt).
+    #[serde(default = "default_hook_retry")]
+    pub retry: u32,
+}
+
+fn default_hook_timeout() -> u64 {
+    5
+}
+fn default_hook_retry() -> u32 {
+    1
+}
+
+impl Default for HookConfig {
+    fn default() -> Self {
+        Self {
+            on_publish: None,
+            on_play: None,
+            on_stream_not_found: None,
+            timeout_sec: default_hook_timeout(),
+            retry: default_hook_retry(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +267,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_proxy_app() -> String {
+    "live".to_string()
+}
+
 fn default_record_path() -> String {
     "./record".to_string()
 }
@@ -234,6 +321,31 @@ impl Default for HttpConfig {
             ssl_key: None,
             ssl_port: None,
             dir_root: true,
+            www_root: default_www_root(),
+        }
+    }
+}
+
+fn default_www_root() -> String {
+    "./www".to_string()
+}
+
+impl Default for ProxyEntryConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            vhost: default_vhost(),
+            app: default_proxy_app(),
+            stream: String::new(),
+        }
+    }
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            pulls: vec![],
         }
     }
 }
@@ -271,11 +383,13 @@ impl Default for ServerConfig {
             default_vhost: default_vhost(),
             secret: default_secret(),
             auth_enabled: default_auth_enabled(),
+            hook: HookConfig::default(),
             general: GeneralConfig::default(),
             rtmp: RtmpConfig::default(),
             rtsp: RtspConfig::default(),
             http: HttpConfig::default(),
             record: RecordConfig::default(),
+            proxy: ProxyConfig::default(),
             webrtc: WebRtcConfig::default(),
             webrtc_port: default_webrtc_port(),
         }
@@ -324,6 +438,7 @@ mod tests {
         let cfg = HttpConfig::default();
         assert!(cfg.enabled);
         assert!(cfg.dir_root);
+        assert_eq!(cfg.www_root, "./www");
         assert!(!cfg.ssl);
     }
 
@@ -387,6 +502,16 @@ dir_root = false
         let cfg = GeneralConfig::default();
         assert!(cfg.flow_threshold > 0);
         assert!(cfg.stream_none_reader_delay > 0);
+    }
+
+    #[test]
+    fn hook_config_default() {
+        let cfg = HookConfig::default();
+        assert!(cfg.on_publish.is_none());
+        assert!(cfg.on_play.is_none());
+        assert!(cfg.on_stream_not_found.is_none());
+        assert_eq!(cfg.timeout_sec, 5);
+        assert_eq!(cfg.retry, 1);
     }
 }
 

@@ -1,6 +1,7 @@
 use crate::amf::{AmfDecoder, AmfEncoder, AmfValue};
 use crate::handshake::RtmpHandshake;
 use crate::message::{RtmpMessage, RtmpMessageEncoder, RtmpMessageParser};
+use crate::session::{parse_audio_rtmp_packet, parse_video_rtmp_packet};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::DigitallySignedStruct;
@@ -8,10 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::broadcast;
 use tokio::sync::Notify;
-use tracing::{debug, info, warn};
-use zlmediakit_core::media_frame::FrameType;
+use tracing::{info, warn};
+use zlmediakit_core::media_frame::{AudioInfo, MediaFrame, TrackInfo, VideoInfo};
 use zlmediakit_core::media_source::MediaSourceManager;
 
 #[derive(Debug)]
@@ -63,7 +63,6 @@ trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 type ConnectStream = Box<dyn IoStream>;
 
-/// Parses an RTMP(S) URL into (host, port, app, stream_name, use_tls).
 fn parse_url(url: &str) -> anyhow::Result<(String, u16, String, String, bool)> {
     let (s, use_tls) = if let Some(s) = url.strip_prefix("rtmps://") {
         (s, true)
@@ -116,7 +115,7 @@ async fn connect(url: &str) -> anyhow::Result<(ConnectStream, String, String)> {
     Ok((stream, remote_app, remote_stream))
 }
 
-/// Push a local stream to a remote RTMP(S) server.
+/// Pulls a remote RTMP(S) stream and republishes it locally.
 pub async fn start(
     url: &str,
     vhost: &str,
@@ -126,7 +125,7 @@ pub async fn start(
     stop: Arc<Notify>,
     stopped: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    info!("RTMP push: {} -> {}/{}/{}", url, vhost, app, stream_name);
+    info!("RTMP pull: {} -> {}/{}/{}", url, vhost, app, stream_name);
 
     let (mut stream, remote_app, remote_stream) = connect(url).await?;
     let stream_name = if stream_name.is_empty() {
@@ -137,7 +136,7 @@ pub async fn start(
     let app = if app.is_empty() { "live" } else { app };
 
     RtmpHandshake::client_handshake(&mut *stream).await?;
-    info!("RTMP push handshake done for {}", url);
+    info!("RTMP pull handshake done for {}", url);
 
     let mut parser = RtmpMessageParser::new();
     let mut encoder = RtmpMessageEncoder::new();
@@ -162,7 +161,7 @@ pub async fn start(
 
     let msgs = read_until_result(&mut *stream, &mut parser, &mut read_buf, 1.0).await?;
     apply_control_messages(&mut encoder, &msgs);
-    info!("RTMP push connect ok for {}", url);
+    info!("RTMP pull connect ok for {}", url);
 
     // --- createStream ---
     let cs_payload = AmfEncoder::encode(&[
@@ -180,8 +179,7 @@ pub async fn start(
 
     let msgs = read_until_result(&mut *stream, &mut parser, &mut read_buf, 2.0).await?;
     apply_control_messages(&mut encoder, &msgs);
-
-    let push_stream_id = msgs
+    let pull_stream_id = msgs
         .iter()
         .find_map(|m| {
             if let RtmpMessage::Amf0Command { data, .. } = m {
@@ -198,76 +196,102 @@ pub async fn start(
                 None
             }
         })
-        .ok_or_else(|| anyhow::anyhow!("RTMP push: no stream id from createStream"))?;
-    info!("RTMP push got stream_id={} for {}", push_stream_id, url);
+        .ok_or_else(|| anyhow::anyhow!("RTMP pull: no stream id from createStream"))?;
+    info!("RTMP pull got stream_id={} for {}", pull_stream_id, url);
 
-    // --- publish ---
-    let pub_payload = AmfEncoder::encode(&[
-        AmfValue::String("publish".to_string()),
+    // --- play ---
+    let play_payload = AmfEncoder::encode(&[
+        AmfValue::String("play".to_string()),
         AmfValue::Number(3.0),
         AmfValue::Null,
         AmfValue::String(remote_stream.clone()),
-        AmfValue::String("live".to_string()),
     ])
     .freeze();
-    let pub_msg = RtmpMessage::Amf0Command {
-        stream_id: push_stream_id,
+    let play_msg = RtmpMessage::Amf0Command {
+        stream_id: pull_stream_id,
         timestamp: 0,
-        data: pub_payload,
+        data: play_payload,
     };
-    stream.write_all(&encoder.encode(&pub_msg)).await?;
+    stream.write_all(&encoder.encode(&play_msg)).await?;
+    info!("RTMP pull play sent for {}", url);
 
-    let msgs = read_until_status(&mut *stream, &mut parser, &mut read_buf).await?;
-    apply_control_messages(&mut encoder, &msgs);
-    info!("RTMP push publish ok for {}", url);
-
-    // --- Subscribe to local source and forward frames ---
-    let source = source_manager
-        .get(vhost, app, stream_name)
-        .ok_or_else(|| anyhow::anyhow!("RTMP push: local stream {}/{}/{} not found", vhost, app, stream_name))?;
-    let mut rx = source.subscribe();
+    let source = source_manager.get_or_create(vhost, app, stream_name);
+    let mut has_video = false;
+    let mut has_audio = false;
 
     loop {
         if stopped.load(Ordering::SeqCst) {
             break;
         }
-        tokio::select! {
+        let n = tokio::select! {
             _ = stop.notified() => {
                 if stopped.load(Ordering::SeqCst) { break; }
+                continue;
             }
-            frame = rx.recv() => {
-                match frame {
-                    Ok(frame) => {
-                        let msg = match frame.frame_type {
-                            FrameType::Video => RtmpMessage::Video {
-                                stream_id: push_stream_id,
-                                timestamp: frame.timestamp,
-                                data: frame.data,
-                            },
-                            FrameType::Audio => RtmpMessage::Audio {
-                                stream_id: push_stream_id,
-                                timestamp: frame.timestamp,
-                                data: frame.data,
-                            },
-                            FrameType::Metadata => RtmpMessage::Amf0Data {
-                                stream_id: push_stream_id,
-                                timestamp: frame.timestamp,
-                                data: frame.data,
-                            },
-                        };
-                        if let Err(e) = stream.write_all(&encoder.encode(&msg)).await {
-                            warn!("RTMP push write error {}: {}", url, e);
-                            break;
+            n = stream.read(&mut read_buf) => n?,
+        };
+        if n == 0 {
+            info!("RTMP pull: upstream closed {}", url);
+            break;
+        }
+        let msgs = parser.feed(&read_buf[..n]);
+        for msg in msgs {
+            match msg {
+                RtmpMessage::SetChunkSize(sz) => parser.set_chunk_size(sz),
+                RtmpMessage::Video { timestamp, data, .. } => {
+                    let (codec, key_frame, is_config) = parse_video_rtmp_packet(&data);
+                    if is_config && !has_video {
+                        has_video = true;
+                        source.info.write().await.tracks.push(TrackInfo::Video(VideoInfo {
+                            codec, width: 640, height: 480, fps: 25.0, key_frame: false,
+                        }));
+                    }
+                    let mut frame = MediaFrame::new_video(
+                        0, codec, timestamp, timestamp as u64, timestamp as u64, data, key_frame,
+                    );
+                    frame.config_frame = is_config;
+                    source.publish_and_cache(frame).await;
+                }
+                RtmpMessage::Audio { timestamp, data, .. } => {
+                    let codec = parse_audio_rtmp_packet(&data);
+                    let is_config = data.len() >= 2 && (data[0] >> 4) & 0x0F == 10 && data[1] == 0x00;
+                    if is_config && !has_audio {
+                        has_audio = true;
+                        source.info.write().await.tracks.push(TrackInfo::Audio(AudioInfo {
+                            codec, sample_rate: 44100, channels: 2, bits_per_sample: 16,
+                        }));
+                    }
+                    let mut frame = MediaFrame::new_audio(
+                        1, codec, timestamp, timestamp as u64, timestamp as u64, data,
+                    );
+                    frame.config_frame = is_config;
+                    source.publish_and_cache(frame).await;
+                }
+                RtmpMessage::Amf0Command { data, .. } => {
+                    if let Ok(vals) = AmfDecoder::decode(&data) {
+                        if let Some(AmfValue::String(cmd)) = vals.first() {
+                            if cmd == "onStatus" {
+                                if let Some(AmfValue::Object(props)) = vals.get(3) {
+                                    for (k, v) in props {
+                                        if k == "code" {
+                                            if let AmfValue::String(s) = v {
+                                                if s == "NetStream.Play.StreamNotFound" {
+                                                    warn!("RTMP pull: stream not found on remote");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(_) => break,
                 }
+                _ => {}
             }
         }
     }
 
-    info!("RTMP push finished for {}", url);
+    info!("RTMP pull finished for {}", url);
     Ok(())
 }
 
@@ -281,7 +305,7 @@ async fn read_until_result(
     loop {
         let n = stream.read(buf).await?;
         if n == 0 {
-            anyhow::bail!("RTMP push: connection closed before _result");
+            anyhow::bail!("RTMP pull: connection closed before _result");
         }
         let msgs = parser.feed(&buf[..n]);
         for m in &msgs {
@@ -304,37 +328,10 @@ async fn read_until_result(
     }
 }
 
-async fn read_until_status(
-    stream: &mut (dyn AsyncRead + Unpin + Send),
-    parser: &mut RtmpMessageParser,
-    buf: &mut [u8],
-) -> anyhow::Result<Vec<RtmpMessage>> {
-    let mut all = Vec::new();
-    loop {
-        let n = stream.read(buf).await?;
-        if n == 0 {
-            anyhow::bail!("RTMP push: connection closed before onStatus");
-        }
-        let msgs = parser.feed(&buf[..n]);
-        for m in &msgs {
-            if let RtmpMessage::Amf0Command { data, .. } = m {
-                if let Ok(vals) = AmfDecoder::decode(data) {
-                    if vals.first().map_or(false, |v| matches!(v, AmfValue::String(s) if s == "onStatus")) {
-                        all.push(m.clone());
-                        return Ok(all);
-                    }
-                }
-            }
-            all.push(m.clone());
-        }
-    }
-}
-
 fn apply_control_messages(encoder: &mut RtmpMessageEncoder, msgs: &[RtmpMessage]) {
     for m in msgs {
         if let RtmpMessage::SetChunkSize(size) = m {
             encoder.set_chunk_size(*size as usize);
-            debug!("RTMP push: server set chunk size to {}", size);
         }
     }
 }

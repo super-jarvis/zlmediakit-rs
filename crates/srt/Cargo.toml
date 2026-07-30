@@ -1,0 +1,13 @@
+[package]
+name = "zlmediakit-srt"
+description = "SRT ingest server for zlmediakit-rs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zlmediakit-core = { path = "../core" }
+tokio.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+libc = "0.2"

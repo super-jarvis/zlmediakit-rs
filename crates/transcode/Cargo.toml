@@ -1,0 +1,13 @@
+[package]
+name = "zlmediakit-transcode"
+description = "Video transcoding via ffmpeg subprocess (H.264/H.265 re-encode, scale, bitrate)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zlmediakit-core = { path = "../core" }
+zlmediakit-codec = { path = "../codec" }
+tokio.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

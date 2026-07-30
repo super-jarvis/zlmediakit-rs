@@ -5,6 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 use zlmediakit_core::auth::StreamAuth;
+use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::event_bus::EventBus;
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_rtmp::amf::{AmfDecoder, AmfEncoder, AmfValue};
@@ -134,7 +135,7 @@ async fn rtmp_hevc_e2e_publish_receives_media() {
     let auth = StreamAuth::new(false, String::new());
 
     let addr = format!("127.0.0.1:{}", TEST_PORT);
-    let srv = RtmpServer::new(&addr, mgr.clone(), event_bus, auth, None, None)
+    let srv = RtmpServer::new(&addr, mgr.clone(), event_bus, auth, HookClient::empty(), None, None)
         .await
         .expect("RtmpServer start");
 

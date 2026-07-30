@@ -4,11 +4,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 use zlmediakit_core::auth::StreamAuth;
+use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::media_frame::{CodecId, MediaFrame, TrackInfo, VideoInfo};
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::recorder::RecorderControl;
 use zlmediakit_core::stream_proxy::StreamProxyControl;
-use zlmediakit_http::server::HttpServer;
+use zlmediakit_http::server::{HttpServer, HttpServerConfig};
 use zlmediakit_http::ws::{compute_accept_key, WsFrame};
 
 const TEST_PORT: u16 = 19125;
@@ -87,18 +88,23 @@ async fn wsflv_e2e_receives_flv_over_websocket() {
     let (recorder, _recv) = RecorderControl::new();
     let (proxy, _table, _proxy_rx) = StreamProxyControl::new();
     let auth = StreamAuth::new(false, String::new());
+        let hook = HookClient::empty();
     let mgr = Arc::new(MediaSourceManager::new());
 
+    let hook = HookClient::empty();
     let addr = format!("127.0.0.1:{}", TEST_PORT);
-    let srv = HttpServer::new(
-        &addr,
-        mgr.clone(),
+    let srv = HttpServer::new(HttpServerConfig {
+        addr,
+        source_manager: mgr.clone(),
         auth,
-        Arc::new(recorder),
-        Arc::new(proxy),
-        None,
-        None,
-    )
+        hook,
+        recorder: Arc::new(recorder),
+        proxy: Arc::new(proxy),
+        record_root: std::path::PathBuf::from("./record"),
+        www_root: None,
+        ssl_cert: None,
+        ssl_key: None,
+    })
     .await
     .expect("HttpServer should start");
 

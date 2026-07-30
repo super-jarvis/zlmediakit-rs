@@ -1,0 +1,364 @@
+use bytes::Bytes;
+use rand::RngExt;
+use rcgen::{CertificateParams, KeyPair};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::DigitallySignedStruct;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::Notify;
+use tokio::time::Duration;
+use zlmediakit_core::hook::HookClient;
+use zlmediakit_core::media_source::MediaSourceManager;
+use zlmediakit_rtmp::amf::{AmfDecoder, AmfEncoder, AmfValue};
+use zlmediakit_rtmp::handshake::RtmpHandshake;
+use zlmediakit_rtmp::message::{RtmpMessage, RtmpMessageEncoder, RtmpMessageParser};
+use zlmediakit_rtmp::push_client;
+use zlmediakit_rtmp::RtmpServer;
+
+const PUB_PORT: u16 = 19160;
+const PUSH_TLS_PORT: u16 = 19161;
+
+#[derive(Debug)]
+struct NoVerifier;
+
+impl ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
+fn gen_self_signed_cert() -> (String, String) {
+    let key_pair = KeyPair::generate().unwrap();
+    let cert_params = CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+    let cert = cert_params.self_signed(&key_pair).unwrap();
+    let cert_pem = cert.pem();
+    let key_pem = key_pair.serialize_pem();
+    (cert_pem, key_pem)
+}
+
+fn build_c1() -> Vec<u8> {
+    let mut c1 = vec![0u8; 1536];
+    c1[..4].copy_from_slice(&0u32.to_be_bytes());
+    c1[4..8].copy_from_slice(&0x00090000u32.to_be_bytes());
+    rand::rng().fill(&mut c1[8..]);
+    c1
+}
+
+fn encode_video(stream_id: u32, timestamp: u32, data: Bytes) -> Vec<u8> {
+    RtmpMessageEncoder::new()
+        .encode(&RtmpMessage::Video { stream_id, timestamp, data })
+        .to_vec()
+}
+
+fn avcc_config() -> Bytes {
+    let sps = [0x67u8, 0x42, 0x00, 0x1f, 0x9a, 0x66, 0x02, 0x80, 0x2c, 0x8e];
+    let pps = [0x68u8, 0xee, 0x3c, 0x80];
+    let mut v = vec![
+        0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x42, 0x00, 0x1f, 0xff, 0xe0 | 1, 0x00, 0x0a,
+    ];
+    v.extend_from_slice(&sps);
+    v.push(0x01);
+    v.extend_from_slice(&[0x00, 0x04]);
+    v.extend_from_slice(&pps);
+    Bytes::from(v)
+}
+
+fn avcc_sample(key: bool) -> Bytes {
+    let nalu = if key { [0x65u8, 0x9a, 0x00, 0x15, 0x20] } else { [0x41u8, 0x9a, 0x00, 0x10, 0x20] };
+    let frame_type: u8 = if key { 0x10 } else { 0x20 };
+    let mut v = vec![frame_type | 0x07, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05];
+    v.extend_from_slice(&nalu);
+    Bytes::from(v)
+}
+
+async fn send_and_recv<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    parser: &mut RtmpMessageParser,
+    data: &[u8],
+) -> Vec<RtmpMessage> {
+    if !data.is_empty() {
+        stream.write_all(data).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut buf = [0u8; 65536];
+    let mut all = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_millis(20), stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => all.extend(parser.feed(&buf[..n])),
+            _ => break,
+        }
+    }
+    all
+}
+
+#[tokio::test]
+async fn rtmps_push_to_tls_server() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("ring provider install");
+
+    let (cert_pem, key_pem) = gen_self_signed_cert();
+
+    let tmp_dir = std::env::temp_dir().join(format!("rtmps_test_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let cert_path = tmp_dir.join("cert.pem");
+    let key_path = tmp_dir.join("key.pem");
+    std::fs::write(&cert_path, cert_pem.as_bytes()).unwrap();
+    std::fs::write(&key_path, key_pem.as_bytes()).unwrap();
+
+    let mgr1 = Arc::new(MediaSourceManager::new());
+    let mgr2 = Arc::new(MediaSourceManager::new());
+    let event_bus1 = Arc::new(zlmediakit_core::event_bus::EventBus::new(1024));
+    let event_bus2 = Arc::new(zlmediakit_core::event_bus::EventBus::new(1024));
+    let auth1 = zlmediakit_core::auth::StreamAuth::new(false, String::new());
+    let auth2 = zlmediakit_core::auth::StreamAuth::new(false, String::new());
+
+    // Server A: plain RTMP for publisher
+    let srv1 = RtmpServer::new(
+        &format!("127.0.0.1:{}", PUB_PORT),
+        mgr1.clone(),
+        event_bus1,
+        auth1,
+        HookClient::empty(),
+        None,
+        None,
+    )
+    .await
+    .expect("server1 start");
+    tokio::spawn(async move { let _ = srv1.run().await; });
+
+    // Server B: RTMPS
+    let srv2 = RtmpServer::new(
+        &format!("127.0.0.1:{}", PUSH_TLS_PORT),
+        mgr2.clone(),
+        event_bus2,
+        auth2,
+        HookClient::empty(),
+        Some(cert_path.to_string_lossy().to_string()),
+        Some(key_path.to_string_lossy().to_string()),
+    )
+    .await
+    .expect("server2 start");
+    tokio::spawn(async move { let _ = srv2.run().await; });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // =========== Publish to server1 ===========
+    let mut pub_stream = TcpStream::connect(("127.0.0.1", PUB_PORT)).await.unwrap();
+    pub_stream.set_nodelay(true).unwrap();
+    let mut handshake_buf = [0u8; 1537];
+
+    let mut c0c1 = vec![0x03u8];
+    c0c1.extend_from_slice(&build_c1());
+    pub_stream.write_all(&c0c1).await.unwrap();
+    pub_stream.read_exact(&mut handshake_buf).await.unwrap();
+    assert_eq!(handshake_buf[0], 0x03);
+    let mut s2 = vec![0u8; 1536];
+    pub_stream.read_exact(&mut s2).await.unwrap();
+    pub_stream.write_all(&handshake_buf[1..]).await.unwrap();
+
+    let mut pub_parser = RtmpMessageParser::new();
+    let mut pub_encoder = RtmpMessageEncoder::new();
+
+    let connect_payload = AmfEncoder::encode(&[
+        AmfValue::String("connect".to_string()),
+        AmfValue::Number(1.0),
+        AmfValue::Object(vec![
+            ("app".to_string(), AmfValue::String("live".to_string())),
+            ("tcUrl".to_string(), AmfValue::String(format!("rtmp://127.0.0.1:{}/live", PUB_PORT))),
+        ]),
+    ])
+    .freeze();
+    let connect_msg = RtmpMessage::Amf0Command { stream_id: 0, timestamp: 0, data: connect_payload };
+    let msgs = send_and_recv(&mut pub_stream, &mut pub_parser, &pub_encoder.encode(&connect_msg)).await;
+    assert!(msgs.iter().any(|m| matches!(m, RtmpMessage::SetChunkSize(_))));
+    pub_encoder.set_chunk_size(4096);
+    pub_parser.set_chunk_size(4096);
+
+    let cs_payload = AmfEncoder::encode(&[
+        AmfValue::String("createStream".to_string()),
+        AmfValue::Number(2.0),
+        AmfValue::Null,
+    ])
+    .freeze();
+    let cs_msg = RtmpMessage::Amf0Command { stream_id: 0, timestamp: 0, data: cs_payload };
+    let msgs = send_and_recv(&mut pub_stream, &mut pub_parser, &pub_encoder.encode(&cs_msg)).await;
+    let pub_stream_id = msgs.iter().find_map(|m| {
+        if let RtmpMessage::Amf0Command { data, .. } = m {
+            let vals = AmfDecoder::decode(data).ok()?;
+            if matches!(vals.first(), Some(AmfValue::String(s)) if s == "_result") {
+                vals.get(3).and_then(|v| match v { AmfValue::Number(n) => Some(*n as u32), _ => None })
+            } else { None }
+        } else { None }
+    }).expect("_result for createStream");
+    drop(msgs);
+
+    let pub_payload = AmfEncoder::encode(&[
+        AmfValue::String("publish".to_string()),
+        AmfValue::Number(3.0),
+        AmfValue::Null,
+        AmfValue::String("pushtest".to_string()),
+        AmfValue::String("live".to_string()),
+    ])
+    .freeze();
+    let pub_msg = RtmpMessage::Amf0Command { stream_id: pub_stream_id, timestamp: 0, data: pub_payload };
+    let msgs = send_and_recv(&mut pub_stream, &mut pub_parser, &pub_encoder.encode(&pub_msg)).await;
+    assert!(msgs.iter().any(|m| {
+        matches!(m, RtmpMessage::Amf0Command { data, .. } if AmfDecoder::decode(data).ok().map_or(false, |v|
+            matches!(v.first(), Some(AmfValue::String(s)) if s == "onStatus")
+        ))
+    }));
+    drop(msgs);
+
+    // Send config + key frame
+    pub_stream.write_all(&encode_video(pub_stream_id, 0, avcc_config())).await.unwrap();
+    pub_stream.write_all(&encode_video(pub_stream_id, 0, avcc_sample(true))).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // =========== Start push relay to RTMPS ===========
+    let stop = Arc::new(Notify::new());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let push_url = format!("rtmps://127.0.0.1:{}/live/pushtest", PUSH_TLS_PORT);
+    let push_handle = tokio::spawn({
+        let mgr1 = mgr1.clone();
+        let stop = stop.clone();
+        let stopped = stopped.clone();
+        let url = push_url.clone();
+        async move {
+            push_client::start(&url, "__defaultVhost__", "live", "pushtest", mgr1, stop, stopped).await
+        }
+    });
+
+    // Give push time to connect and forward frames
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // =========== Connect TLS player to server2 ===========
+    let config = Arc::new(
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth(),
+    );
+    let connector = tokio_rustls::TlsConnector::from(config);
+    let domain = ServerName::IpAddress(
+        rustls_pki_types::IpAddr::V4(rustls_pki_types::Ipv4Addr::from([127, 0, 0, 1])),
+    );
+    let tcp = TcpStream::connect(("127.0.0.1", PUSH_TLS_PORT)).await.unwrap();
+    let mut tls_stream = connector.connect(domain, tcp).await.unwrap();
+    RtmpHandshake::client_handshake(&mut tls_stream).await.unwrap();
+
+    let mut play_parser = RtmpMessageParser::new();
+    let play_encoder = RtmpMessageEncoder::new();
+
+    let connect = RtmpMessage::Amf0Command {
+        stream_id: 0, timestamp: 0,
+        data: AmfEncoder::encode(&[
+            AmfValue::String("connect".to_string()),
+            AmfValue::Number(1.0),
+            AmfValue::Object(vec![
+                ("app".to_string(), AmfValue::String("live".to_string())),
+                ("tcUrl".to_string(), AmfValue::String(format!("rtmps://127.0.0.1:{}/live", PUSH_TLS_PORT))),
+            ]),
+        ]).freeze(),
+    };
+    let msgs = send_and_recv(&mut tls_stream, &mut play_parser, &play_encoder.encode(&connect)).await;
+    assert!(msgs.iter().any(|m| matches!(m, RtmpMessage::WindowAckSize(_))));
+    let chunk_size = msgs.iter().find_map(|m| {
+        if let RtmpMessage::SetChunkSize(sz) = m { Some(*sz) } else { None }
+    }).unwrap_or(128);
+    play_parser.set_chunk_size(chunk_size);
+    drop(msgs);
+
+    let cs = RtmpMessage::Amf0Command {
+        stream_id: 0, timestamp: 0,
+        data: AmfEncoder::encode(&[
+            AmfValue::String("createStream".to_string()),
+            AmfValue::Number(2.0),
+            AmfValue::Null,
+        ]).freeze(),
+    };
+    let msgs = send_and_recv(&mut tls_stream, &mut play_parser, &play_encoder.encode(&cs)).await;
+    let play_stream_id = msgs.iter().find_map(|m| {
+        if let RtmpMessage::Amf0Command { data, .. } = m {
+            let vals = AmfDecoder::decode(data).ok()?;
+            if matches!(vals.first(), Some(AmfValue::String(s)) if s == "_result") {
+                vals.get(3).and_then(|v| match v { AmfValue::Number(n) => Some(*n as u32), _ => None })
+            } else { None }
+        } else { None }
+    }).expect("_result for createStream");
+    drop(msgs);
+
+    let play_cmd = RtmpMessage::Amf0Command {
+        stream_id: play_stream_id, timestamp: 0,
+        data: AmfEncoder::encode(&[
+            AmfValue::String("play".to_string()),
+            AmfValue::Number(3.0),
+            AmfValue::Null,
+            AmfValue::String("pushtest".to_string()),
+        ]).freeze(),
+    };
+    tls_stream.write_all(&play_encoder.encode(&play_cmd)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let initial = send_and_recv(&mut tls_stream, &mut play_parser, &[]).await;
+    let initial_video = initial.iter().filter(|m| matches!(m, RtmpMessage::Video { .. })).count();
+
+    // Send more live frames from publisher
+    pub_stream.write_all(&encode_video(pub_stream_id, 100, avcc_sample(true))).await.unwrap();
+    pub_stream.write_all(&encode_video(pub_stream_id, 200, avcc_sample(false))).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let live = send_and_recv(&mut tls_stream, &mut play_parser, &[]).await;
+    let live_video = live.iter().filter(|m| matches!(m, RtmpMessage::Video { .. })).count();
+
+    let total = initial_video + live_video;
+    assert!(total >= 2, "player on TLS server should receive at least 2 frames, got {}", total);
+
+    // Cleanup
+    stop.notify_waiters();
+    stopped.store(true, Ordering::SeqCst);
+    let _ = tokio::time::timeout(Duration::from_secs(1), push_handle).await;
+
+    if let Some(source) = mgr1.get("__defaultVhost__", "live", "pushtest") {
+        source.close();
+    }
+}

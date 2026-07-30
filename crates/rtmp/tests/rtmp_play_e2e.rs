@@ -5,6 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 use zlmediakit_core::auth::StreamAuth;
+use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::event_bus::EventBus;
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_rtmp::amf::{AmfDecoder, AmfEncoder, AmfValue};
@@ -133,6 +134,7 @@ async fn rtmp_play_receives_video() {
         mgr.clone(),
         event_bus,
         auth,
+        HookClient::empty(),
         None,
         None,
     )

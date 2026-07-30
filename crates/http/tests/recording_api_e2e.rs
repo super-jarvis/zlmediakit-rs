@@ -4,12 +4,13 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::Duration;
 use zlmediakit_core::auth::StreamAuth;
+use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::media_frame::{CodecId, MediaFrame};
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::recorder::{RecorderCommand, RecorderControl};
 use zlmediakit_core::stream_proxy::StreamProxyControl;
 use zlmediakit_flv::FlvRecorder;
-use zlmediakit_http::server::HttpServer;
+use zlmediakit_http::server::{HttpServer, HttpServerConfig};
 
 const TEST_PORT: u16 = 19157;
 
@@ -107,20 +108,24 @@ async fn recording_api_start_stop_via_http() {
 
     let mgr = Arc::new(MediaSourceManager::new());
     let auth = StreamAuth::new(false, String::new());
+        let hook = HookClient::empty();
     let (recorder, cmd_rx) = RecorderControl::new();
     let recorder = Arc::new(recorder);
     let proxy = Arc::new(StreamProxyControl::new().0);
 
     let port = TEST_PORT;
-    let srv = HttpServer::new(
-        &format!("127.0.0.1:{}", port),
-        mgr.clone(),
+    let srv = HttpServer::new(HttpServerConfig {
+        addr: format!("127.0.0.1:{}", port),
+        source_manager: mgr.clone(),
         auth,
-        recorder.clone(),
+        hook,
+        recorder: recorder.clone(),
         proxy,
-        None,
-        None,
-    )
+        record_root: std::path::PathBuf::from(RECORD_BASE),
+        www_root: None,
+        ssl_cert: None,
+        ssl_key: None,
+    })
     .await
     .expect("HttpServer start");
 

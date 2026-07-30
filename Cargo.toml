@@ -9,6 +9,8 @@ members = [
     "crates/hls",
     "crates/mp4",
     "crates/server",
+    "crates/srt",
+    "crates/transcode",
     "crates/webrtc",
 ]
 resolver = "2"
@@ -44,7 +46,8 @@ base64 = "0.23"
 rand = "0.10"
 hex = "0.4"
 log = "0.4"
-rustls = "0.23"
+rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
 rustls-pki-types = "1"
+rcgen = "0.13"

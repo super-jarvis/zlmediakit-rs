@@ -31,6 +31,7 @@ enabled = true
 port = 80
 ssl = false
 dir_root = true
+www_root = "./www"
 
 # WebRTC (WHEP playback) server. A browser plays a published stream over
 # WebRTC by POSTing an SDP offer to /webrtc/play/<vhost>/<app>/<stream> (or
@@ -51,7 +52,19 @@ ice_servers = []
 # `transcode` Cargo feature (needs libopus / libfdk-aac at build time):
 #   cargo build --features zlmediakit-webrtc/transcode,zlmediakit-webrtc/aac-transcode
 
-# Record settings
+# Optional HTTP callbacks to an external auth/notification service.
+# When configured, the server POSTs to the given URL before allowing
+# publish/play. The service should respond with JSON `{"code": 0}` to
+# allow or `{"code": -1, "msg": "reason"}` to deny.
+# POST parameters: vhost, app, stream, params
+# Unconfigured hooks are skipped (allow by default).
+#[hook]
+#on_publish = "http://127.0.0.1:8080/index/hook/on_publish"
+#on_play = "http://127.0.0.1:8080/index/hook/on_play"
+#on_stream_not_found = "http://127.0.0.1:8080/index/hook/on_stream_not_found"
+#timeout_sec = 5
+#retry = 1
+
 # Record settings
 [record]
 app = "record"

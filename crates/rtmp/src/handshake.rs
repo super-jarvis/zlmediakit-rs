@@ -56,7 +56,7 @@ impl RtmpHandshake {
     /// 1. Sends C0 (version 3) + C1 (4-byte timestamp, 4-byte zero, 1528 random bytes).
     /// 2. Reads S0 + S1 + S2.
     /// 3. Sends C2 (echo of S1).
-    pub async fn client_handshake<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    pub async fn client_handshake<S: AsyncReadExt + AsyncWriteExt + Unpin + ?Sized>(
         stream: &mut S,
     ) -> anyhow::Result<()> {
         let mut c0c1 = Vec::with_capacity(1 + C0C1_SIZE);

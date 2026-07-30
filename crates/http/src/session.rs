@@ -1,11 +1,13 @@
 use bytes::BytesMut;
 use dashmap::DashMap;
 use std::collections::{HashMap, VecDeque};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 use zlmediakit_core::auth::StreamAuth;
+use zlmediakit_core::hook::HookResult;
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::recorder::RecorderControl;
 use zlmediakit_core::stream_proxy::StreamProxyControl;
@@ -23,8 +25,11 @@ pub struct HttpSession {
     peer_addr: String,
     source_manager: Arc<MediaSourceManager>,
     auth: Arc<StreamAuth>,
+    hook: Arc<zlmediakit_core::hook::HookClient>,
     recorder: Arc<RecorderControl>,
     proxy: Arc<StreamProxyControl>,
+    record_root: PathBuf,
+    www_root: Option<PathBuf>,
     buffer: BytesMut,
 }
 
@@ -34,16 +39,22 @@ impl HttpSession {
         peer_addr: String,
         source_manager: Arc<MediaSourceManager>,
         auth: Arc<StreamAuth>,
+        hook: Arc<zlmediakit_core::hook::HookClient>,
         recorder: Arc<RecorderControl>,
         proxy: Arc<StreamProxyControl>,
+        record_root: PathBuf,
+        www_root: Option<PathBuf>,
     ) -> Self {
         Self {
             stream,
             peer_addr,
             source_manager,
             auth,
+            hook,
             recorder,
             proxy,
+            record_root,
+            www_root,
             buffer: BytesMut::with_capacity(4096),
         }
     }
@@ -89,7 +100,7 @@ impl HttpSession {
             if !ws_key.is_empty() {
                 let response = upgrade_response(ws_key);
                 self.stream.write_all(response.as_bytes()).await?;
-                let mut ws = WsSession::new(self.stream, self.source_manager, self.auth);
+                let mut ws = WsSession::new(self.stream, self.source_manager, self.auth, self.hook.clone());
                 return ws.run_flv(path).await;
             }
         }
@@ -98,8 +109,11 @@ impl HttpSession {
         // receive the full `path` so they can extract `?sign=` and other params.
         let route = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
 
+        let www_root = self.www_root.clone();
         if route.starts_with("/index/api/") {
             self.handle_api(path).await?;
+        } else if route.starts_with("/record/") {
+            self.handle_vod(path, &request_str).await?;
         } else if route.ends_with(".flv") {
             self.handle_flv_stream(path).await?;
         } else if route.ends_with(".m3u8") {
@@ -107,7 +121,15 @@ impl HttpSession {
         } else if route.ends_with(".ts") {
             self.handle_hls_segment(path).await?;
         } else if route == "/" || route == "/index.html" {
-            self.handle_index().await?;
+            if let Some(ref www) = www_root {
+                // When a web root is configured, serve from it instead of the default index
+                self.handle_static_file(path, www, &request_str).await?;
+            } else {
+                self.handle_index().await?;
+            }
+        } else if let Some(ref www) = www_root {
+            // Static file fallback: serve from www_root
+            self.handle_static_file(path, www, &request_str).await?;
         } else {
             self.send_404().await?;
         }
@@ -121,6 +143,19 @@ impl HttpSession {
             .strip_suffix(".flv")
             .map_or("stream", |v| v)
             .to_string();
+
+        // External hook callback (before built-in auth)
+        if let HookResult::Deny(msg) = self
+            .hook
+            .on_play("__defaultVhost__", &app, &stream_name, &sign)
+            .await
+        {
+            warn!(
+                "HTTP-FLV play rejected (hook): {}/{} - {}",
+                app, stream_name, msg
+            );
+            return self.send_401().await;
+        }
 
         if !self
             .auth
@@ -196,6 +231,19 @@ impl HttpSession {
             &resource
         }
         .to_string();
+
+        // External hook callback (before built-in auth)
+        if let HookResult::Deny(msg) = self
+            .hook
+            .on_play("__defaultVhost__", &app, &stream_name, &sign)
+            .await
+        {
+            warn!(
+                "HLS playlist play rejected (hook): {}/{} - {}",
+                app, stream_name, msg
+            );
+            return self.send_401().await;
+        }
 
         if !self
             .auth
@@ -273,6 +321,19 @@ impl HttpSession {
         let stream_name = parts[0];
         let file_name = parts[1];
 
+        // External hook callback (before built-in auth)
+        if let HookResult::Deny(msg) = self
+            .hook
+            .on_play("__defaultVhost__", app, stream_name, &sign)
+            .await
+        {
+            warn!(
+                "HLS segment play rejected (hook): {}/{} - {}",
+                app, stream_name, msg
+            );
+            return self.send_401().await;
+        }
+
         if !self
             .auth
             .check("__defaultVhost__", app, stream_name, "play", &sign)
@@ -317,6 +378,258 @@ impl HttpSession {
         }
 
         self.send_404().await
+    }
+
+    /// Serves recorded files (FLV/MP4/HLS) and a directory listing under the
+    /// `/record/` prefix, mapping the remainder of the path onto `record_root`.
+    /// Supports HTTP `Range` requests so players can seek within archives.
+    /// When auth is enabled, the request must carry a valid `?sign=` parameter.
+    async fn handle_vod(&mut self, path: &str, request: &str) -> anyhow::Result<()> {
+        let (_, _rest, sign) = Self::parse_path_sign(path);
+        // Route is the path without query string
+        let route = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+        let rel = match route.strip_prefix("/record/") {
+            Some(r) => r,
+            None => return self.send_404().await,
+        };
+
+        // Auth check for VOD playback (strip trailing slash for consistent signing)
+        let stream_path = rel.trim_end_matches('/').to_string();
+
+        // External hook callback (before built-in auth)
+        if let HookResult::Deny(msg) = self
+            .hook
+            .on_play("__defaultVhost__", "record", &stream_path, &sign)
+            .await
+        {
+            warn!("VOD play rejected (hook): {} - {}", rel, msg);
+            return self.send_401().await;
+        }
+
+        if !self
+            .auth
+            .check("__defaultVhost__", "record", &stream_path, "play", &sign)
+        {
+            warn!("VOD play rejected (auth): {}", rel);
+            return self.send_401().await;
+        }
+
+        let target = match Self::safe_join(&self.record_root, rel) {
+            Some(t) => t,
+            None => return self.send_404().await,
+        };
+        let meta = match tokio::fs::metadata(&target).await {
+            Ok(m) => m,
+            Err(_) => return self.send_404().await,
+        };
+        if meta.is_dir() {
+            return self.serve_dir_listing(&target, route).await;
+        }
+        let range = Self::extract_range(request);
+        self.serve_file(&target, meta.len(), range).await
+    }
+
+    /// Serves a file or directory from `www_root` for paths that didn't match
+    /// any other route. Used as the static file fallback.
+    async fn handle_static_file(
+        &mut self,
+        path: &str,
+        www_root: &Path,
+        request: &str,
+    ) -> anyhow::Result<()> {
+        let route = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+        let rel = route.trim_start_matches('/');
+        let target = match Self::safe_join(www_root, rel) {
+            Some(t) => t,
+            None => return self.send_404().await,
+        };
+        // Additional safety: ensure resolved path is still under www_root
+        if !target.starts_with(www_root) {
+            return self.send_404().await;
+        }
+        let meta = match tokio::fs::metadata(&target).await {
+            Ok(m) => m,
+            Err(_) => return self.send_404().await,
+        };
+        if meta.is_dir() {
+            return self.serve_dir_listing(&target, route).await;
+        }
+        let range = Self::extract_range(request);
+        self.serve_file(&target, meta.len(), range).await
+    }
+
+    async fn serve_file(
+        &mut self,
+        path: &Path,
+        total: u64,
+        range: Option<(u64, Option<u64>)>,
+    ) -> anyhow::Result<()> {
+        let (start, end, status_line) = match range {
+            Some((s, e)) if total > 0 => {
+                let last = total - 1;
+                let end = e.unwrap_or(last).min(last);
+                let start = s.min(end);
+                (start, end, "206 Partial Content")
+            }
+            _ => (0, total.saturating_sub(1), "200 OK"),
+        };
+        let len = end - start + 1;
+        let mime = Self::mime_for(path);
+
+        let mut header = format!(
+            "HTTP/1.1 {}\r\n\
+             Content-Type: {}\r\n\
+             Accept-Ranges: bytes\r\n\
+             Content-Length: {}\r\n",
+            status_line, mime, len
+        );
+        if status_line.starts_with("206") {
+            header.push_str(&format!("Content-Range: bytes {}-{}/{}\r\n", start, end, total));
+        }
+        header.push_str("Connection: close\r\n\r\n");
+        self.stream.write_all(header.as_bytes()).await?;
+
+        let mut file = tokio::fs::File::open(path).await?;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+
+        let mut remaining = len;
+        let mut buf = [0u8; 65536];
+        while remaining > 0 {
+            let to_read = remaining.min(buf.len() as u64) as usize;
+            file.read_exact(&mut buf[..to_read]).await?;
+            self.stream.write_all(&buf[..to_read]).await?;
+            remaining -= to_read as u64;
+        }
+        Ok(())
+    }
+
+    async fn serve_dir_listing(&mut self, dir: &Path, route: &str) -> anyhow::Result<()> {
+        let mut entries = match tokio::fs::read_dir(dir).await {
+            Ok(e) => e,
+            Err(_) => return self.send_404().await,
+        };
+        let mut items: Vec<(String, bool)> = Vec::new();
+        while let Some(ent) = entries.next_entry().await? {
+            let name = ent.file_name().to_string_lossy().to_string();
+            let is_dir = ent.metadata().await.map(|m| m.is_dir()).unwrap_or(false);
+            items.push((name, is_dir));
+        }
+        items.sort();
+
+        let base = route.trim_end_matches('/');
+        let mut html = String::from(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+             <title>Recordings</title></head><body><h1>Recordings</h1><ul>",
+        );
+        for (name, is_dir) in &items {
+            let suffix = if *is_dir { "/" } else { "" };
+            html.push_str(&format!(
+                "<li><a href=\"{}{}{}\">{}{}</a></li>",
+                base,
+                if base.is_empty() { "" } else { "/" },
+                name,
+                name,
+                suffix
+            ));
+        }
+        html.push_str("</ul></body></html>");
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n{}",
+            html.len(),
+            html
+        );
+        self.stream.write_all(response.as_bytes()).await?;
+        Ok(())
+    }
+
+    /// Joins `rel` onto `root`, rejecting any path that would escape `root`
+    /// (via `..` or absolute components). Returns `None` for unsafe paths.
+    fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
+        let rel = rel.trim_start_matches('/');
+        let mut out = root.to_path_buf();
+        for comp in Path::new(rel).components() {
+            match comp {
+                Component::Normal(c) => out.push(c),
+                Component::CurDir => {}
+                Component::ParentDir => return None,
+                Component::RootDir => return None,
+                Component::Prefix(_) => return None,
+            }
+        }
+        Some(out)
+    }
+
+    fn mime_for(path: &Path) -> &'static str {
+        match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            // video
+            Some("flv") => "video/x-flv",
+            Some("mp4") | Some("m4v") | Some("mov") => "video/mp4",
+            Some("ts") => "video/mp2t",
+            Some("m4s") => "video/iso.segment",
+            Some("webm") => "video/webm",
+            // audio
+            Some("m3u8") => "application/vnd.apple.mpegurl",
+            Some("m3u") => "audio/mpegurl",
+            Some("mp3") => "audio/mpeg",
+            Some("aac") => "audio/aac",
+            Some("ogg") | Some("oga") => "audio/ogg",
+            Some("wav") => "audio/wav",
+            Some("opus") => "audio/opus",
+            // text / markup
+            Some("html") | Some("htm") => "text/html; charset=utf-8",
+            Some("js") | Some("mjs") => "application/javascript",
+            Some("css") => "text/css",
+            Some("json") => "application/json",
+            Some("xml") => "application/xml",
+            Some("txt") | Some("log") => "text/plain; charset=utf-8",
+            // images
+            Some("png") => "image/png",
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("svg") => "image/svg+xml",
+            Some("webp") => "image/webp",
+            Some("ico") => "image/x-icon",
+            // fonts
+            Some("woff") => "font/woff",
+            Some("woff2") => "font/woff2",
+            Some("ttf") => "font/ttf",
+            Some("otf") => "font/otf",
+            // other
+            Some("wasm") => "application/wasm",
+            Some("pdf") => "application/pdf",
+            _ => "application/octet-stream",
+        }
+    }
+
+    fn extract_range(request: &str) -> Option<(u64, Option<u64>)> {
+        for line in request.lines() {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("range:") {
+                let val = line.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
+                let spec = val.strip_prefix("bytes=")?;
+                if spec.starts_with('-') {
+                    return None; // suffix range not supported; serve whole file
+                }
+                let parts: Vec<&str> = spec.splitn(2, '-').collect();
+                let start = parts[0].parse::<u64>().unwrap_or(0);
+                let end = if parts.len() > 1 && !parts[1].is_empty() {
+                    parts[1].parse::<u64>().ok()
+                } else {
+                    None
+                };
+                return Some((start, end));
+            }
+        }
+        None
     }
 
     async fn handle_api(&mut self, path: &str) -> anyhow::Result<()> {

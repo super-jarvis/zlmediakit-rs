@@ -7,6 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 use zlmediakit_core::auth::StreamAuth;
+use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::media_frame::TrackInfo;
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::transport::TransportStream;
@@ -155,6 +156,7 @@ pub struct WsSession {
     read_buf: BytesMut,
     source_manager: Arc<MediaSourceManager>,
     auth: Arc<StreamAuth>,
+    hook: Arc<HookClient>,
 }
 
 impl WsSession {
@@ -162,12 +164,14 @@ impl WsSession {
         stream: TransportStream,
         source_manager: Arc<MediaSourceManager>,
         auth: Arc<StreamAuth>,
+        hook: Arc<HookClient>,
     ) -> Self {
         Self {
             stream,
             read_buf: BytesMut::with_capacity(8192),
             source_manager,
             auth,
+            hook,
         }
     }
 
@@ -177,6 +181,21 @@ impl WsSession {
             .strip_suffix(".flv")
             .map_or("stream", |v| v)
             .to_string();
+
+        // External hook callback (before built-in auth)
+        if let zlmediakit_core::hook::HookResult::Deny(msg) = self
+            .hook
+            .on_play("__defaultVhost__", &app, &stream_name, &sign)
+            .await
+        {
+            warn!(
+                "WS-FLV play rejected (hook): {}/{} - {}",
+                app, stream_name, msg
+            );
+            let close = WsFrame::close(3000, "unauthorized");
+            self.stream.write_all(&close.encode_server()).await?;
+            return Ok(());
+        }
 
         if !self
             .auth

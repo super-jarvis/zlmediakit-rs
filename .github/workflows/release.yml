@@ -1,0 +1,131 @@
+name: Release
+
+# release-plz 自动化版本管理
+#
+# 工作流程：
+#   每次推送至 main 时，release-plz 自动判断是否需要发版：
+#   1. 扫描 conventional commits，确定版本号提升（major/minor/patch）
+#   2. 创建/更新 Release PR（内含 Cargo.toml 版本号 + CHANGELOG）
+#   3. 合入 Release PR 后，自动打 git tag + 创建 GitHub Release
+#   4. 编译多平台二进制 → 上传至 Release 附件
+
+on:
+  push:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-plz:
+    name: Release PLZ
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      releases: ${{ steps.release-plz.outputs.releases }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: actions-rust/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Run release-plz
+        id: release-plz
+        uses: MarcoIeni/release-plz-action@v0.5
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 仅当 release-plz 创建了新 tag（即合入 Release PR 后触发）时才构建二进制
+  build:
+    name: Build ${{ matrix.target }}
+    needs: release-plz
+    if: ${{ fromJSON(needs.release-plz.outputs.releases)[0].tag_name != '' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            ext: ""
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            ext: ""
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            ext: ""
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            ext: ""
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            ext: ".exe"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install cross-compilation dependencies (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/zlmediakit${{ matrix.ext }}"
+          PKG="zlmediakit-${{ matrix.target }}${{ matrix.ext }}"
+          cp "$BIN" "$PKG"
+          echo "PKG=$PKG" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zlmediakit-${{ matrix.target }}
+          path: ${{ env.PKG }}
+
+  publish:
+    name: Publish GitHub Release
+    needs: [release-plz, build]
+    if: ${{ fromJSON(needs.release-plz.outputs.releases)[0].tag_name != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate checksums
+        run: |
+          find artifacts -type f -exec sha256sum {} \; > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ fromJSON(needs.release-plz.outputs.releases)[0].tag_name }}
+          name: ZLMediaKit-RS ${{ fromJSON(needs.release-plz.outputs.releases)[0].tag_name }}
+          body: ${{ fromJSON(needs.release-plz.outputs.releases)[0].release_notes }}
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/**/*
+            checksums.txt
