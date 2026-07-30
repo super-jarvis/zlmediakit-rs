@@ -1,0 +1,49 @@
+# ============================================================
+#  ZLMediaKit-RS Docker Compose 部署
+#  启动: docker compose up -d
+#  查看日志: docker compose logs -f
+#  停止: docker compose down
+# ============================================================
+
+services:
+  zlmediakit:
+    image: ghcr.io/${GITHUB_USER:-yourname}/zlmediakit-rs:latest
+    container_name: zlmediakit
+    restart: unless-stopped
+    network_mode: host   # 使用宿主机网络以简化端口映射（也可用 bridge + ports）
+    # 如果不用 host 模式，取消注释以下 ports:
+    # ports:
+    #   - "1935:1935"    # RTMP
+    #   - "8554:8554"    # RTSP (UDP also needed for RTP)
+    #   - "8080:8080"    # HTTP
+    #   - "8081:8081"    # API
+    #   - "9000:9000"    # WebRTC (UDP)
+
+    environment:
+      # 对外端口（与 config.toml 中的端口保持一致）
+      - ZLM_RTMP_PORT=1935
+      - ZLM_RTSP_PORT=8554
+      - ZLM_HTTP_PORT=8080
+      - ZLM_API_PORT=8081
+      - ZLM_WEBRTC_PORT=9000
+
+      # 日志级别: trace / debug / info / warn / error
+      - RUST_LOG=info
+
+    volumes:
+      # 配置文件（可选：挂载自定义配置覆盖镜像内置的）
+      - ./conf/config.toml:/etc/zlmediakit/config.toml:ro
+
+      # 录制文件持久化
+      - ./record:/var/lib/zlmediakit/record
+
+      # 静态文件（可选：挂载自定义 Web 页面）
+      - ./www:/var/lib/zlmediakit/www
+
+    # 健康检查：通过 API 端点判断服务是否正常
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8081/index/api/getServerConfig"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

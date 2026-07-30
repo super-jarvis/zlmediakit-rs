@@ -1,82 +1,148 @@
-# ZLMediaKit-RS Configuration File
+# ============================================================
+#  ZLMediaKit-RS 配置文件
+#  启动命令: zlmediakit --config conf/config.toml
+# ============================================================
 
-# API/stream token auth. When enabled, publish/play requests must carry a
-# `?sign=` query parameter. sign = sha256(secret | vhost | app | stream | action)
-# where action is "pub" (publish) or "play". The secret below is also used by
-# the management API. Default secret is generated if omitted.
+# ---- 全局参数 ----
+
+# API 鉴权开关。开启后，推流/播放请求必须携带 `?sign=` 参数。
+# sign = sha256(secret | vhost | app | stream | action)
+# action: "pub"（推流）或 "play"（播放）
 auth_enabled = false
+
+# 鉴权密钥，同时也是管理 API 的密钥。未配置时自动生成。
 secret = "035c73f7-bb6b-4889-a715-d9eb2d1925cc"
 
-# General settings
+# 媒体流默认虚拟主机名
+#default_vhost = "__defaultVhost__"
+
+# ---- 端口配置（可在对应协议段内覆盖） ----
+
+# RTMP 默认端口
+#rtmp_port = 1935
+
+# RTSP 默认端口
+#rtsp_port = 8554
+
+# HTTP 默认端口
+#http_port = 8080
+
+# 管理 API 默认端口（独立于 HTTP 端口）
+#api_port = 8081
+
+# RTP 默认端口（GB28181 PS 推流接收）
+#rtp_port = 8000
+
+# WebRTC WHEP 默认端口
+#webrtc_port = 9000
+
+# ============================================================
+#  通用设置
+# ============================================================
 [general]
+# 流量统计阈值（字节）
 flow_threshold = 1024
+
+# 无播放者时自动关闭流的延迟（秒）
 stream_none_reader_delay = 10
 
-# RTMP server
+# ============================================================
+#  RTMP 服务器
+# ============================================================
 [rtmp]
+# 是否启用
 enabled = true
-port = 1935
-ssl = false
 
-# RTSP server
+# 监听端口（覆盖顶层 rtmp_port）
+port = 1935
+
+# 是否启用 RTMPS（加密 RTMP）
+ssl = false
+#ssl_cert = "/path/to/cert.pem"
+#ssl_key = "/path/to/key.pem"
+#ssl_port = 443
+
+# ============================================================
+#  RTSP 服务器
+# ============================================================
 [rtsp]
 enabled = true
-port = 8554
+port = 554
 ssl = false
+#ssl_cert = "/path/to/cert.pem"
+#ssl_key = "/path/to/key.pem"
+
+# TCP 模式：RTP 包通过 TCP 连接传输（对 NAT 穿透更友好）
 tcp_mode = true
 
-# HTTP server
+# ============================================================
+#  HTTP 服务器
+# ============================================================
 [http]
 enabled = true
 port = 8080
 ssl = false
+#ssl_cert = "/path/to/cert.pem"
+#ssl_key = "/path/to/key.pem"
+
+# 是否启用静态文件服务（从 www_root 提供 HTML/JS/CSS 等）
 dir_root = true
 www_root = "./www"
 
-# WebRTC (WHEP playback) server. A browser plays a published stream over
-# WebRTC by POSTing an SDP offer to /webrtc/play/<vhost>/<app>/<stream> (or
-# with ?vhost=&app=&stream= query params) and DELETEing the returned Location
-# to stop. Currently playback (WHEP) only; H.264 video and Opus audio.
+# ============================================================
+#  WebRTC (WHEP 播放) 服务器
+#  浏览器通过 POST /webrtc/play/<vhost>/<app>/<stream> 播放
+#  支持 H.264 视频 + Opus 音频
+#  可选 AAC->Opus 转码需编译时特性:
+#    cargo build --features zlmediakit-webrtc/transcode,zlmediakit-webrtc/aac-transcode
+# ============================================================
 [webrtc]
 enabled = true
 port = 9000
-# ICE servers for NAT traversal. Empty = host candidates only (same LAN /
-# open Internet). Uncomment to enable STUN and/or TURN:
-# ice_servers = [
-#   { urls = ["stun:stun.l.google.com:19302"] },
-#   { urls = ["turn:turn.example.com:3478?transport=udp"], username = "user", credential = "pass" },
-# ]
+
+# ICE/STUN/TURN 服务器，用于 NAT 穿透。留空 = 仅本地候选地址。
+# 公网部署时建议配置 STUN 服务器：
+#ice_servers = [
+#  { urls = ["stun:stun.l.google.com:19302"] },
+#  { urls = ["turn:turn.example.com:3478?transport=udp"], username = "user", credential = "pass" },
+#]
 ice_servers = []
 
-# Optional AAC->Opus audio transcoding for WebRTC playback is behind the
-# `transcode` Cargo feature (needs libopus / libfdk-aac at build time):
-#   cargo build --features zlmediakit-webrtc/transcode,zlmediakit-webrtc/aac-transcode
-
-# Optional HTTP callbacks to an external auth/notification service.
-# When configured, the server POSTs to the given URL before allowing
-# publish/play. The service should respond with JSON `{"code": 0}` to
-# allow or `{"code": -1, "msg": "reason"}` to deny.
-# POST parameters: vhost, app, stream, params
-# Unconfigured hooks are skipped (allow by default).
+# ============================================================
+#  外部鉴权 Hook（HTTP 回调）
+#  开启后，服务器在允许推流/播放前先 POST 到配置的 URL。
+#  外部服务返回 {"code": 0} 表示放行，{"code": -1, "msg": "原因"} 表示拒绝。
+#  未配置的 hook 直接放行。
+# ============================================================
 #[hook]
+## 推流鉴权（POST 参数: vhost, app, stream, params）
 #on_publish = "http://127.0.0.1:8080/index/hook/on_publish"
+## 播放鉴权
 #on_play = "http://127.0.0.1:8080/index/hook/on_play"
+## 流未找到通知
 #on_stream_not_found = "http://127.0.0.1:8080/index/hook/on_stream_not_found"
+## HTTP 调用超时（秒）
 #timeout_sec = 5
+## 网络失败重试次数
 #retry = 1
 
-# SRT (Secure Reliable Transport) ingest server.
-# Accepts SRT push streams and publishes them to the MediaSourceManager.
-# Uses libsrt (must be installed: apt install libsrt-gnutls-dev).
+# ============================================================
+#  SRT 推流接收
+#  接收 SRT 推流并发布到 MediaSource。
+#  需要 libsrt（已安装时自动检测）
+# ============================================================
 #[srt]
 #enabled = false
 #port = 9000
+## 延迟（毫秒）
 #latency_ms = 120
-#passphrase = ""  # optional encryption
+## 可选加密密码
+#passphrase = ""
 
-# Cluster push relay: when a local stream is published, automatically push
-# it to remote RTMP servers. Each peer entry specifies the remote URL and
-# optional vhost/app overrides.
+# ============================================================
+#  集群推流中继
+#  本地流发布后自动推送到远程 RTMP 服务器，实现多节点级联。
+# ============================================================
 #[cluster]
 #enabled = false
 #push_to = [
@@ -84,16 +150,31 @@ ice_servers = []
 #  { url = "rtmp://192.168.1.11/live", vhost = "__defaultVhost__", app = "live" },
 #]
 
-# Stream proxy: automatically pull remote streams on startup.
+# ============================================================
+#  拉流代理
+#  启动时自动从远程拉取媒体流并在本地发布。
+# ============================================================
 #[proxy]
 #enabled = false
 #pulls = [
-#  { url = "rtmp://192.168.1.100/live/camera1" },
+#  { url = "rtmp://192.168.1.100/live/camera1", stream = "camera1" },
 #]
 
-# Record settings
+# ============================================================
+#  录制设置
+# ============================================================
 [record]
+# 录制流所属的 app 名称
 app = "record"
+
+# 录制文件存储根目录
+path = "./record"
+
+# 录制到 HLS（TS 分段）
 hls = false
+
+# 录制到 MP4（完整文件，流结束后写入）
 mp4 = false
+
+# 录制到 FLV
 flv = false
