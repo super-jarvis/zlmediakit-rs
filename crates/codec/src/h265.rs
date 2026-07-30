@@ -50,7 +50,7 @@ impl H265Parser {
     }
 
     pub fn is_keyframe(nal_type: u8) -> bool {
-        let nalu_type = (nal_type >> 1) & 0x3F;
+        let nalu_type = nal_type & 0x3F;
         matches!(nalu_type, 16..=21)
     }
 
@@ -112,21 +112,15 @@ mod tests {
 
     #[test]
     fn is_keyframe_bla_wrap() {
-        // NAL unit type 16 (BLA_W_LP) >> 1 & 0x3F = 8, not a keyframe
-        // IDR_W_RADL (19) >> 1 & 0x3F = 9 -> not a keyframe by the logic
-        // Let me re-check the logic...
-        // is_keyframe checks: nalu_type = (nal_type >> 1) & 0x3F
-        // For keyframe: 16 <= nalu_type <= 21
-        // So if nal_type = 32, then (32 >> 1) & 0x3F = 16 -> keyframe
-        assert!(H265Parser::is_keyframe(32)); // VPS type VPS_NUT -> but let me think...
+        // NAL unit type 16 (BLA_W_LP) is a keyframe
+        assert!(H265Parser::is_keyframe(16));
     }
 
     #[test]
     fn is_keyframe_idr() {
-        // nal_type where (nal_type >> 1) & 0x3F = 19 => nal_type = 38 or 39
-        // IDR_W_RADL = 19, so nal_type should be 38 or 39
-        assert!(H265Parser::is_keyframe(38));
-        assert!(H265Parser::is_keyframe(39));
+        // IDR_W_RADL = 19, IDR_R_DPL = 20
+        assert!(H265Parser::is_keyframe(19));
+        assert!(H265Parser::is_keyframe(20));
     }
 
     #[test]

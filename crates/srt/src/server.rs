@@ -156,6 +156,8 @@ struct TsContext {
     video_pid: Option<u16>,
     /// PID of the audio elementary stream (from PMT).
     audio_pid: Option<u16>,
+    /// PMT PID discovered from PAT, used to route PSI packets to the PMT parser.
+    pmt_pid: Option<u16>,
     /// Accumulated PES payload for the current video frame.
     video_accum: Vec<u8>,
     /// Accumulated PES payload for the current audio frame.
@@ -167,6 +169,7 @@ impl TsContext {
         Self {
             video_pid: None,
             audio_pid: None,
+            pmt_pid: None,
             video_accum: Vec::new(),
             audio_accum: Vec::new(),
         }
@@ -270,8 +273,12 @@ async fn demux_ts_packets(
         if pid == PID_PAT && payload_unit_start {
             parse_pat(payload, ctx);
         }
-        // Check if this is PMT.
-        if payload_unit_start && payload.len() > 3 && payload[1] == 0x02 {
+        // Check if this is a PMT packet (using PAT-discovered PID, or fallback heuristic).
+        let is_pmt = ctx.pmt_pid.map_or(
+            payload_unit_start && payload.len() > 3 && payload[1] == 0x02,
+            |ppid| pid == ppid,
+        );
+        if is_pmt {
             parse_pmt(payload, ctx);
         }
 
@@ -342,7 +349,8 @@ fn parse_pat(payload: &[u8], ctx: &mut TsContext) {
         return;
     }
     // Store PMT PID for parsing later (encoded into program_map_PID).
-    let _pmt_pid = ((payload[program_offset + 2] as u16 & 0x1F) << 8) | payload[program_offset + 3] as u16;
+    let pmt_pid = ((payload[program_offset + 2] as u16 & 0x1F) << 8) | payload[program_offset + 3] as u16;
+    ctx.pmt_pid = Some(pmt_pid);
     ctx.video_pid = ctx.video_pid.or(Some(0x0100));
     ctx.audio_pid = ctx.audio_pid.or(Some(PID_DEFAULT_AUDIO));
 }
@@ -463,8 +471,22 @@ fn detect_codec(data: &[u8]) -> CodecId {
         if w == [0x00, 0x00, 0x00, 0x01] {
             let offset = w.as_ptr() as usize - data.as_ptr() as usize;
             if let Some(&b) = data.get(offset + 4) {
-                let nal_type = b & 0x1F;
-                if nal_type > 0 && nal_type <= 21 {
+                let nal5 = b & 0x1F;
+                let nal6 = (b >> 1) & 0x3F;
+                // VPS (32), SPS (33), PPS (34) are H.265-specific
+                if matches!(nal6, 32..=34) {
+                    return CodecId::H265;
+                }
+                // H.264 IRAP/SPS/PPS types use 5-bit coding
+                if matches!(nal5, 5 | 7 | 8) {
+                    return CodecId::H264;
+                }
+                // H.265 IRAP types (16..=21) use 6-bit coding
+                if matches!(nal6, 16..=21) {
+                    return CodecId::H265;
+                }
+                // Default: 5-bit NAL type > 0 suggests H.264
+                if nal5 > 0 {
                     return CodecId::H264;
                 }
             }
@@ -473,6 +495,15 @@ fn detect_codec(data: &[u8]) -> CodecId {
     }
     for w in data.windows(3) {
         if w == [0x00, 0x00, 0x01] {
+            let offset = w.as_ptr() as usize - data.as_ptr() as usize;
+            if let Some(&b) = data.get(offset + 3) {
+                let nal6 = (b >> 1) & 0x3F;
+                let nal5 = b & 0x1F;
+                if matches!(nal6, 32..=34) { return CodecId::H265; }
+                if matches!(nal5, 5 | 7 | 8) { return CodecId::H264; }
+                if matches!(nal6, 16..=21) { return CodecId::H265; }
+                if nal5 > 0 { return CodecId::H264; }
+            }
             return CodecId::H264;
         }
     }
@@ -496,16 +527,12 @@ fn is_keyframe(data: &[u8], codec: CodecId) -> bool {
             false
         }
         CodecId::H265 => {
-            for w in data.windows(6) {
+            for w in data.windows(4) {
                 if (w[0] == 0 && w[1] == 0 && w[2] == 1)
                     || (w[0] == 0 && w[1] == 0 && w[2] == 0 && w[3] == 1)
                 {
-                    let h = if w[2] == 1 {
-                        u16::from_be_bytes([w[3], w[4]])
-                    } else {
-                        u16::from_be_bytes([w[4], w[5]])
-                    };
-                    let nal_type = (h >> 1) & 0x3F;
+                    let b = if w[2] == 1 { w[3] } else { w[3] }; // byte after start code
+                    let nal_type = (b >> 1) & 0x3F;
                     return (16..=21).contains(&nal_type);
                 }
             }

@@ -181,8 +181,8 @@ async fn receive_video(track: Arc<TrackRemote>, source: Arc<MediaSource>) {
             Ok((p, _)) => p,
             Err(_) => break,
         };
-        let ts = pkt.header.timestamp as u64;
-        let seq = pkt.header.sequence_number as u32;
+        // RTP timestamp uses a 90 kHz clock for H.264; convert to milliseconds.
+        let ts_ms = (pkt.header.timestamp as u64) / 90;
         let Some(annexb) = dep.push(&pkt.payload) else {
             continue;
         };
@@ -201,7 +201,7 @@ async fn receive_video(track: Arc<TrackRemote>, source: Arc<MediaSource>) {
             // SPS/PPS only: emit the AVCC decoder config once both are known.
             if sps.is_some() && pps.is_some() {
                 if let Some(cfg) = build_avcc_config(sps.as_deref(), pps.as_deref()) {
-                    let mut f = MediaFrame::new_video(0, CodecId::H264, seq, ts, ts, cfg, true);
+                    let mut f = MediaFrame::new_video(0, CodecId::H264, ts_ms as u32, ts_ms, ts_ms, cfg, true);
                     f.config_frame = true;
                     source.publish_and_cache(f).await;
                     config_sent = true;
@@ -211,7 +211,7 @@ async fn receive_video(track: Arc<TrackRemote>, source: Arc<MediaSource>) {
             // VCL frame: ensure the decoder config was sent first.
             if !config_sent {
                 if let Some(cfg) = build_avcc_config(sps.as_deref(), pps.as_deref()) {
-                    let mut f = MediaFrame::new_video(0, CodecId::H264, seq, ts, ts, cfg, true);
+                    let mut f = MediaFrame::new_video(0, CodecId::H264, ts_ms as u32, ts_ms, ts_ms, cfg, true);
                     f.config_frame = true;
                     source.publish_and_cache(f).await;
                     config_sent = true;
@@ -222,9 +222,9 @@ async fn receive_video(track: Arc<TrackRemote>, source: Arc<MediaSource>) {
                     .publish_and_cache(MediaFrame::new_video(
                         0,
                         CodecId::H264,
-                        seq,
-                        ts,
-                        ts,
+                        ts_ms as u32,
+                        ts_ms,
+                        ts_ms,
                         sample,
                         key,
                     ))
@@ -242,17 +242,17 @@ async fn receive_audio(track: Arc<TrackRemote>, source: Arc<MediaSource>) {
             Ok((p, _)) => p,
             Err(_) => break,
         };
-        let ts = pkt.header.timestamp as u64;
-        let seq = pkt.header.sequence_number as u32;
+        // Opus RTP uses a 48 kHz clock; convert to milliseconds.
+        let ts_ms = (pkt.header.timestamp as u64) / 48;
         // Opus RTP payload is the raw Opus frame(s); forward as-is so a WHEP
         // player can repacketize it.
         source
             .publish_and_cache(MediaFrame::new_audio(
                 1,
                 CodecId::Opus,
-                seq,
-                ts,
-                ts,
+                ts_ms as u32,
+                ts_ms,
+                ts_ms,
                 Bytes::copy_from_slice(&pkt.payload),
             ))
             .await;

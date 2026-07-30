@@ -142,7 +142,10 @@ impl HttpSession {
         } else if route.ends_with(".mpd") {
             self.handle_dash_mpd(path).await?;
         } else if route.ends_with(".m4s") {
-            self.handle_dash_segment(path).await?;
+            // Try CMAF first (seg-{idx}.m4s), fall back to DASH (seg-{rep}-{seq}.m4s)
+            if !self.handle_cmaf_segment(path).await? {
+                self.handle_dash_segment(path).await?;
+            }
         } else if route.ends_with("init.mp4") {
             self.handle_dash_init(path).await?;
         } else if route.ends_with(".cmav.m3u8") {
@@ -435,6 +438,10 @@ impl HttpSession {
             })
             .to_string();
 
+        if let HookResult::Deny(_) = self.hook.on_play("__defaultVhost__", &app, &stream_name, &sign).await {
+            return self.send_401().await;
+        }
+
         if !self.auth.check("__defaultVhost__", &app, &stream_name, "play", &sign) {
             return self.send_401().await;
         }
@@ -674,6 +681,59 @@ impl HttpSession {
         self.stream.write_all(response.as_bytes()).await?;
         self.stream.write_all(&init.data).await?;
         Ok(())
+    }
+
+    /// Serves a CMAF media segment (seg-{index}.m4s).
+    /// Returns `Ok(true)` if the segment was found and served, `Ok(false)` if
+    /// the path did not match CMAF format, so the caller can fall back to DASH.
+    async fn handle_cmaf_segment(&mut self, path: &str) -> anyhow::Result<bool> {
+        let (app, resource, sign) = Self::parse_path_sign(path);
+        let rest = match resource.strip_suffix(".m4s") {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        // CMAF path: /app/stream/seg-{index}.m4s
+        let parts: Vec<&str> = rest.splitn(3, '/').collect();
+        if parts.len() < 2 {
+            return Ok(false);
+        }
+        let stream_name = parts[0];
+        let segment_part = parts[1];
+        if !segment_part.starts_with("seg-") {
+            return Ok(false);
+        }
+        let idx: u64 = segment_part.strip_prefix("seg-").and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
+
+        if !self.auth.check("__defaultVhost__", &app, stream_name, "play", &sign) {
+            return Ok(false);
+        }
+
+        let source = self.source_manager.get("__defaultVhost__", &app, stream_name);
+        let source = match source {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+
+        let key = source.url();
+        if let Some(segments) = CMAF_SEGMENTS.get(&key) {
+            let segs = segments.read().await;
+            if let Some(seg) = segs.iter().find(|s| s.index == idx as u32) {
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: video/mp4\r\n\
+                     Content-Length: {}\r\n\
+                     Access-Control-Allow-Origin: *\r\n\
+                     Cache-Control: max-age=3600\r\n\
+                     Connection: close\r\n\r\n",
+                    seg.data.len()
+                );
+                self.stream.write_all(response.as_bytes()).await?;
+                self.stream.write_all(&seg.data).await?;
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     /// Serves a DASH media segment (.m4s).

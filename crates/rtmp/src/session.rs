@@ -701,7 +701,10 @@ impl RtmpSession {
                     };
                     let encoder = self.msg_encoder.clone();
                     let stream_id = self.stream_id;
-                    let stream = self.stream.take().unwrap();
+                    let stream = match self.stream.take() {
+                        Some(s) => s,
+                        None => return Ok(()),
+                    };
 
                     tokio::spawn(async move {
                         let mut writer = stream;
@@ -915,7 +918,7 @@ impl RtmpSession {
 ///   uses a zero composition time.
 /// - Packets with no media payload (SequenceEnd, Metadata, ...) or with an
 ///   unsupported FourCC return `None` and are dropped.
-fn normalize_enhanced_video(data: &bytes::Bytes) -> Option<bytes::Bytes> {
+pub(crate) fn normalize_enhanced_video(data: &bytes::Bytes) -> Option<bytes::Bytes> {
     if data.len() < 5 || data[0] & 0x80 == 0 {
         return Some(data.clone());
     }

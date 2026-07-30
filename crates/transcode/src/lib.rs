@@ -13,6 +13,7 @@
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
+use anyhow::Context;
 use tracing::{debug, warn};
 
 /// Configuration for a video transcode pipeline.
@@ -125,8 +126,8 @@ impl VideoTranscoder {
         debug!("spawning ffmpeg: {:?}", cmd);
 
         let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take().expect("stdin pipe");
-        let stdout = child.stdout.take().expect("stdout pipe");
+        let stdin = child.stdin.take().context("stdin pipe")?;
+        let stdout = child.stdout.take().context("stdout pipe")?;
 
         Ok(Self {
             child,
@@ -238,10 +239,16 @@ pub fn parse_annex_b_frames(data: &[u8], codec: &str) -> Vec<TranscodeOutput> {
 
 impl Drop for VideoTranscoder {
     fn drop(&mut self) {
-        if let Err(e) = self.child.try_wait() {
-            warn!("ffmpeg process error on drop: {}", e);
+        if let Ok(None) = self.child.try_wait() {
+            // Child still running — send kill and spin-wait to reap.
+            let _ = self.child.start_kill();
+            for _ in 0..50 {
+                if self.child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
-        let _ = self.child.start_kill();
     }
 }
 
@@ -396,17 +403,14 @@ fn contains_idr(data: &[u8], codec: &str) -> bool {
         }
         "h265" | "H265" | "hevc" | "HEVC" => {
             // H.265 IRAP: nal_unit_type >= 16 && nal_unit_type <= 21
-            // (BLA, IDR, CRA)
-            for window in data.windows(5) {
+            // (BLA, IDR, CRA). The NAL unit type is in the lower 6 bits
+            // of the first byte after the start code.
+            for window in data.windows(4) {
                 if (window[0] == 0 && window[1] == 0 && window[2] == 1)
                     || (window[0] == 0 && window[1] == 0 && window[2] == 0 && window[3] == 1)
                 {
-                    let nal_header = if window[2] == 1 {
-                        u16::from_be_bytes([window[3], window[4]])
-                    } else {
-                        u16::from_be_bytes([window[4], if window.len() > 5 { window[5] } else { 0 }])
-                    };
-                    let nal_type = (nal_header >> 1) & 0x3F;
+                    let b = if window[2] == 1 { window[3] } else { window[3] };
+                    let nal_type = (b >> 1) & 0x3F;
                     if (16..=21).contains(&nal_type) {
                         return true;
                     }

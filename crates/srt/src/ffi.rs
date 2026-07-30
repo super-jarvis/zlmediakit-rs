@@ -193,7 +193,9 @@ pub fn parse_streamid(streamid: &str) -> (String, String) {
     //   #!::r=live/stream_name
     //   #!::r=stream_name
     //   app=live/stream=stream_name
-    for token in streamid.split(',') {
+    // Strip the optional "#!::" prefix used by the SRT standard.
+    let body = streamid.trim_start_matches("#!::");
+    for token in body.split(',') {
         if let Some(rest) = token.trim().strip_prefix("r=") {
             let parts: Vec<&str> = rest.splitn(2, '/').collect();
             let app = parts.first().map_or("live", |v| *v);

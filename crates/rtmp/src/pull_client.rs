@@ -238,7 +238,8 @@ pub async fn start(
         for msg in msgs {
             match msg {
                 RtmpMessage::SetChunkSize(sz) => parser.set_chunk_size(sz),
-                RtmpMessage::Video { timestamp, data, .. } => {
+                RtmpMessage::Video { timestamp, data: raw_data, .. } => {
+                    let data = crate::session::normalize_enhanced_video(&raw_data).unwrap_or(raw_data);
                     let (codec, key_frame, is_config) = parse_video_rtmp_packet(&data);
                     if is_config && !has_video {
                         has_video = true;

@@ -75,7 +75,7 @@ async fn handle_conn(
     loop {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
-            return Ok(());
+            return write_response(&mut stream, 400, "Bad Request", &[], b"connection closed before request completed").await;
         }
         buf.extend_from_slice(&tmp[..n]);
 
@@ -87,7 +87,7 @@ async fn handle_conn(
             }
         }
         if buf.len() > 1 << 20 {
-            return Ok(());
+            return write_response(&mut stream, 413, "Request Too Large", &[], b"request exceeds maximum size").await;
         }
     }
 
@@ -105,6 +105,20 @@ async fn handle_conn(
                     play_sessions: &play_sessions,
                     publish_sessions: &publish_sessions,
                 },
+            )
+            .await
+        }
+        "OPTIONS" => {
+            write_response(
+                &mut stream,
+                204,
+                "No Content",
+                &[
+                    ("Access-Control-Allow-Methods", "POST, DELETE, OPTIONS"),
+                    ("Access-Control-Allow-Headers", "Content-Type, Authorization"),
+                    ("Access-Control-Max-Age", "86400"),
+                ],
+                &[],
             )
             .await
         }
@@ -385,6 +399,8 @@ async fn write_response(
 ) -> Result<()> {
     let mut resp = format!("HTTP/1.1 {} {}\r\n", status, reason);
     resp.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    // Always include CORS headers so browser clients can read error responses.
+    resp.push_str("Access-Control-Allow-Origin: *\r\n");
     for (k, v) in headers {
         resp.push_str(&format!("{}: {}\r\n", k, v));
     }

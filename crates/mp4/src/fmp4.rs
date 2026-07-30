@@ -292,7 +292,7 @@ impl Fmp4Muxer {
         // tkhd
         {
             let mut tkhd = BytesMut::new();
-            let flags = if is_video { 7u32 } else { 0u32 }; // track_enabled | in_movie | in_preview for video
+            let flags = 7u32; // track_enabled | in_movie | in_preview for both
             tkhd.put_u32(flags);
             tkhd.put_u32(0); // creation
             tkhd.put_u32(0); // modification
@@ -308,9 +308,11 @@ impl Fmp4Muxer {
                 tkhd.put_u16(0x0100);
             }
             tkhd.put_u16(0); // reserved
-            tkhd.extend_from_slice(&0x00010000u32.to_be_bytes()); // matrix
-            tkhd.extend_from_slice(&[0u8; 32]);
-            tkhd.put_u32(0x40000000u32);
+            // identity matrix (9 fixed-point 16.16 values = 36 bytes):
+            // [ 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0 ]
+            tkhd.put_u32(0x00010000); tkhd.put_u32(0); tkhd.put_u32(0);
+            tkhd.put_u32(0); tkhd.put_u32(0x00010000); tkhd.put_u32(0);
+            tkhd.put_u32(0); tkhd.put_u32(0); tkhd.put_u32(0x40000000);
             tkhd.put_u32((width as u32) << 16); // width fixed-point
             tkhd.put_u32((height as u32) << 16); // height fixed-point
             trak.extend_from_slice(&make_box(b"tkhd", &tkhd));

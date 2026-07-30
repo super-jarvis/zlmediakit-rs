@@ -694,25 +694,28 @@ fn write_stco(buf: &mut BytesMut, chunk_offset: u32) {
 }
 
 fn parse_avcc_config(data: &[u8]) -> Vec<u8> {
-    if data.len() < 5 {
-        return vec![
-            1,    // configurationVersion
-            0x42, // AVCProfileIndication
-            0,    // profile_compatibility
-            0x1e, // AVCLevelIndication
-            0xff, // lengthSizeMinusOne (4 bytes)
-            0xe1, // numOfSequenceParameterSets
-            0, 25, // SPS size
-        ];
+    // data includes the 5-byte FLV video tag header [codec_id, packet_type, comp_time(3)],
+    // so the actual AVCDecoderConfigurationRecord starts at offset 5.
+    let inner = if data.len() > 5 { &data[5..] } else { return vec![
+        1,
+        0x42,
+        0,
+        0x1e,
+        0xff,
+        0xe1,
+        0, 25,
+    ]; };
+    if inner.is_empty() {
+        return vec![1, 0x42, 0, 0x1e, 0xff, 0xe1, 0, 25];
     }
-    let mut avcc = Vec::with_capacity(data.len() + 8);
+    let mut avcc = Vec::with_capacity(inner.len() + 8);
     avcc.push(1);
-    avcc.push(data[1]);
+    avcc.push(inner[0]);
     avcc.push(0);
-    avcc.push(data[4].max(data[2]));
+    avcc.push(inner[1].max(inner[2]));
     avcc.push(0xff);
 
-    let nals = split_nalus_avcc(data);
+    let nals = split_nalus_avcc(inner);
     let sps_list: Vec<&[u8]> = nals
         .iter()
         .filter(|n| n[0] & 0x1f == 7)
@@ -738,10 +741,11 @@ fn parse_avcc_config(data: &[u8]) -> Vec<u8> {
 }
 
 fn parse_hvcc_config(data: &[u8]) -> Vec<u8> {
-    if data.len() < 5 {
+    let inner = if data.len() > 5 { &data[5..] } else { return vec![1]; };
+    if inner.is_empty() {
         return vec![1];
     }
-    let nals = split_nalus_avcc(data);
+    let nals = split_nalus_avcc(inner);
     let vps_list: Vec<&[u8]> = nals
         .iter()
         .filter(|n| (n[0] >> 1) == 16)
@@ -1044,9 +1048,10 @@ mod tests {
 }
 
 fn extract_video_info(codec: &CodecId, data: &[u8]) -> Option<(u32, u32, f64)> {
+    let inner = if data.len() > 5 { &data[5..] } else { data };
     match codec {
         CodecId::H264 => {
-            let nals = split_nalus_avcc(data);
+            let nals = split_nalus_avcc(inner);
             for nal in &nals {
                 if nal.len() >= 5 && (nal[0] & 0x1f) == 7 {
                     let width = ((nal[3] as u32) << 8) | (nal[4] as u32);
@@ -1061,7 +1066,7 @@ fn extract_video_info(codec: &CodecId, data: &[u8]) -> Option<(u32, u32, f64)> {
             None
         }
         CodecId::H265 => {
-            let nals = split_nalus_avcc(data);
+            let nals = split_nalus_avcc(inner);
             for nal in &nals {
                 if nal.len() >= 6 && (nal[0] >> 1) == 17 {
                     let width = ((nal[4] as u32) << 8) | (nal[5] as u32);

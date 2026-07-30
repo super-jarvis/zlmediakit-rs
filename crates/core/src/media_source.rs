@@ -144,8 +144,13 @@ impl MediaSource {
         self.subscribers.read().await.len()
     }
 
+    fn lock_frame_tx(&self) -> std::sync::MutexGuard<'_, Option<broadcast::Sender<MediaFrame>>> {
+        // Recover from poisoned mutex — the inner data is still valid.
+        self.frame_tx.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<MediaFrame> {
-        let guard = self.frame_tx.lock().unwrap();
+        let guard = self.lock_frame_tx();
         match guard.as_ref() {
             Some(tx) => tx.subscribe(),
             None => {
@@ -160,11 +165,11 @@ impl MediaSource {
     /// the management API to kick a stream. New players fail because the source
     /// is also removed from the manager.
     pub fn close(&self) {
-        let _ = self.frame_tx.lock().unwrap().take();
+        let _ = self.lock_frame_tx().take();
     }
 
     pub fn publish(&self, frame: MediaFrame) -> Result<()> {
-        if let Some(tx) = self.frame_tx.lock().unwrap().as_ref() {
+        if let Some(tx) = self.lock_frame_tx().as_ref() {
             let _ = tx.send(frame.clone());
         }
         Ok(())
@@ -176,7 +181,7 @@ impl MediaSource {
             cache.cache_frame(&frame);
         }
         let (receivers, result) = {
-            let guard = self.frame_tx.lock().unwrap();
+            let guard = self.lock_frame_tx();
             match guard.as_ref() {
                 Some(tx) => (tx.receiver_count(), tx.send(frame.clone())),
                 None => (0, Ok(0)),
