@@ -70,7 +70,7 @@ async fn http_get(path: &str) -> (u16, Vec<u8>) {
 
 #[tokio::test]
 async fn hls_e2e_generates_playlist_and_segments() {
-    let mgr = Arc::new(MediaSourceManager::new());
+    let mgr = Arc::new(MediaSourceManager::new(None));
     let auth = StreamAuth::new(false, String::new());
     let hook = HookClient::empty();
     let recorder = Arc::new(RecorderControl::new().0);
@@ -93,6 +93,7 @@ async fn hls_e2e_generates_playlist_and_segments() {
         rtp: None,
         sip: None,
         transcode: None,
+        session_manager: None,
     })
     .await
     .expect("HttpServer should start");

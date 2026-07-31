@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +11,7 @@ use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::config::{RecordConfig, ServerConfig};
 use zlmediakit_core::event_bus::{Event, EventBus};
 use zlmediakit_core::ffmpeg_source::{FFmpegCmd, FFmpegSourceControl, FFmpegTable};
-use zlmediakit_core::hook::HookClient;
+use zlmediakit_core::hook::{HookClient, HookResult};
 use zlmediakit_core::media_source::{MediaSource, MediaSourceManager};
 use zlmediakit_core::recorder::{RecorderCommand, RecorderControl};
 use zlmediakit_core::stream_proxy::{ProxyCmd, ProxyTable, StreamProxyControl};
@@ -107,8 +107,8 @@ async fn main() -> Result<()> {
         config.webrtc_port = port;
     }
 
-    let source_manager = Arc::new(MediaSourceManager::new());
     let event_bus = Arc::new(EventBus::new(1024));
+    let source_manager = Arc::new(MediaSourceManager::new(Some(event_bus.clone())));
     let auth = StreamAuth::new(config.auth_enabled, config.secret.clone());
     let hook = HookClient::new(config.hook.clone());
     let (recorder_control, recorder_cmd_rx) = RecorderControl::new();
@@ -242,6 +242,7 @@ async fn main() -> Result<()> {
         let http_rtp = gb28181_rtp.clone();
         let http_sip = gb28181_sip.clone();
         let http_transcode = transcode_mgr.clone();
+        let http_session_mgr = session_mgr.clone();
         let handle = tokio::spawn(async move {
             match HttpServer::new(HttpServerConfig {
                 addr: addr.clone(),
@@ -255,7 +256,7 @@ async fn main() -> Result<()> {
                 rtp: http_rtp.clone(),
                 sip: http_sip.clone(),
                 transcode: http_transcode.clone(),
-                session_manager: session_mgr.clone(),
+                session_manager: http_session_mgr.clone(),
                 record_root: std::path::PathBuf::from(&http_record_root),
                 www_root: http_www,
                 ssl_cert: http_cert,
@@ -292,6 +293,7 @@ async fn main() -> Result<()> {
         let api_rtp = gb28181_rtp.clone();
         let api_sip = gb28181_sip.clone();
         let api_transcode = transcode_mgr.clone();
+        let api_session_mgr = session_mgr.clone();
         let handle = tokio::spawn(async move {
             match HttpServer::new(HttpServerConfig {
                 addr: addr.clone(),
@@ -305,7 +307,7 @@ async fn main() -> Result<()> {
                 rtp: api_rtp.clone(),
                 sip: api_sip.clone(),
                 transcode: api_transcode.clone(),
-                session_manager: session_mgr.clone(),
+                session_manager: api_session_mgr.clone(),
                 record_root: std::path::PathBuf::from(&api_record_root),
                 www_root: api_www,
                 ssl_cert: api_cert,
@@ -382,6 +384,7 @@ async fn main() -> Result<()> {
             config.record.hls, config.record.flv, config.record.mp4, record_base
         );
         let rec = recorder_control.clone();
+        let sup_hook = hook.clone();
         let handle = tokio::spawn(async move {
             run_recorder_supervisor(
                 sup_event,
@@ -390,6 +393,7 @@ async fn main() -> Result<()> {
                 record_base,
                 recorder_cmd_rx,
                 rec,
+                sup_hook,
             )
             .await;
         });
@@ -500,6 +504,7 @@ async fn run_recorder_supervisor(
     base_path: String,
     mut cmd_rx: mpsc::UnboundedReceiver<RecorderCommand>,
     control: Arc<RecorderControl>,
+    hook: Arc<HookClient>,
 ) {
     let mut rx = event_bus.subscribe();
     let stops: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<Notify>>>> =
@@ -516,7 +521,7 @@ async fn run_recorder_supervisor(
                                 let stop = Arc::new(Notify::new());
                                 stops.lock().await.insert(source_id.clone(), stop.clone());
                                 control.mark_recording(&source_id, hls, flv, mp4);
-                                spawn_recorders(src, &base_path, hls, flv, mp4, stop).await;
+                                spawn_recorders(src, &base_path, hls, flv, mp4, stop, Some(event_bus.clone())).await;
                             }
                         }
                     }
@@ -525,6 +530,75 @@ async fn run_recorder_supervisor(
                             stop.notify_waiters();
                         }
                         control.unmark_recording(&source_id);
+                    }
+                    Ok(Event::StreamPlay { source_id, .. }) => {
+                        // First subscriber joined → stream changed (regist=true).
+                        if let Some((v, a, s)) = split_source_id(&source_id) {
+                            let count = source_manager
+                                .get(&v, &a, &s)
+                                .map(|src| src.subscriber_count_blocking())
+                                .unwrap_or(1);
+                            match hook.on_stream_changed(&v, &a, &s, true, count).await {
+                                HookResult::Allow => {}
+                                HookResult::Deny(reason) => {
+                                    debug!("hook on_stream_changed denied ({}): {}", source_id, reason)
+                                }
+                            }
+                        }
+                    }
+                    Ok(Event::StreamStop { source_id, .. }) => {
+                        // A subscriber left → stream changed (regist=false).
+                        if let Some((v, a, s)) = split_source_id(&source_id) {
+                            let count = source_manager
+                                .get(&v, &a, &s)
+                                .map(|src| src.subscriber_count_blocking())
+                                .unwrap_or(0);
+                            match hook.on_stream_changed(&v, &a, &s, false, count).await {
+                                HookResult::Allow => {}
+                                HookResult::Deny(reason) => {
+                                    debug!("hook on_stream_changed denied ({}): {}", source_id, reason)
+                                }
+                            }
+                        }
+                    }
+                    Ok(Event::NoReader { source_id }) => {
+                        if let Some((v, a, s)) = split_source_id(&source_id) {
+                            let count = source_manager
+                                .get(&v, &a, &s)
+                                .map(|src| src.subscriber_count_blocking())
+                                .unwrap_or(0);
+                            match hook.on_stream_none_reader(&v, &a, &s, count).await {
+                                HookResult::Allow => {}
+                                HookResult::Deny(reason) => {
+                                    debug!("hook on_stream_none_reader denied ({}): {}", source_id, reason)
+                                }
+                            }
+                        }
+                    }
+                    Ok(Event::RecordMp4Done {
+                        vhost,
+                        app,
+                        stream,
+                        file_path,
+                        file_size,
+                        time_len,
+                    }) => {
+                        if let HookResult::Deny(reason) = hook
+                            .on_record_mp4(
+                                &vhost,
+                                &app,
+                                &stream,
+                                &file_path,
+                                file_size,
+                                time_len,
+                            )
+                            .await
+                        {
+                            debug!(
+                                "hook on_record_mp4 denied ({}): {}",
+                                file_path, reason
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -541,7 +615,7 @@ async fn run_recorder_supervisor(
                                     let stop = Arc::new(Notify::new());
                                     stops.lock().await.insert(source_id.clone(), stop.clone());
                                     control.mark_recording(&source_id, hls, flv, mp4);
-                                    spawn_recorders(src, &base_path, hls, flv, mp4, stop).await;
+                                    spawn_recorders(src, &base_path, hls, flv, mp4, stop, Some(event_bus.clone())).await;
                                 } else {
                                     warn!("startRecord: stream not live: {}", source_id);
                                 }
@@ -561,6 +635,19 @@ async fn run_recorder_supervisor(
     }
 }
 
+/// Splits a `MediaSource` id of the form `vhost/app/stream` into its parts.
+/// Returns `None` if the id does not contain at least two `/` separators.
+fn split_source_id(id: &str) -> Option<(String, String, String)> {
+    let mut it = id.splitn(3, '/');
+    let vhost = it.next()?;
+    let app = it.next()?;
+    let stream = it.next()?;
+    if vhost.is_empty() || app.is_empty() || stream.is_empty() {
+        return None;
+    }
+    Some((vhost.to_string(), app.to_string(), stream.to_string()))
+}
+
 /// Spawns the FLV, HLS and/or MP4 recorder tasks for a live source, each
 /// stopped via the shared `Notify` when the stream unpublishes or recording is
 /// cancelled.
@@ -571,6 +658,7 @@ async fn spawn_recorders(
     flv: bool,
     mp4: bool,
     stop: Arc<Notify>,
+    event_bus: Option<Arc<EventBus>>,
 ) {
     if flv {
         let src = source.clone();
@@ -596,8 +684,9 @@ async fn spawn_recorders(
         let src = source.clone();
         let path = base_path.to_string();
         let s = stop.clone();
+        let eb = event_bus.clone();
         tokio::spawn(async move {
-            if let Err(e) = Mp4Recorder::record(src, &path, s).await {
+            if let Err(e) = Mp4Recorder::record(src, &path, s, eb).await {
                 error!("MP4 recorder error: {}", e);
             }
         });

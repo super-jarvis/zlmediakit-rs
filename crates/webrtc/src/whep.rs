@@ -19,22 +19,20 @@ use anyhow::{anyhow, Result};
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::Notify;
+use tokio::sync::{broadcast, Notify};
 use tracing::{debug, info, warn};
-use webrtc::api::media_engine::MediaEngine;
-use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecParameters;
-use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use zlmediakit_core::config::IceServer;
 use zlmediakit_core::media_frame::{CodecId, MediaFrame, TrackInfo};
 use zlmediakit_core::media_source::MediaSource;
+
+use crate::datachannel::{attach_data_channels, DataMessage};
 
 #[cfg(feature = "transcode")]
 use crate::transcode::AudioTranscoder;
@@ -45,9 +43,15 @@ use crate::transcode::AudioTranscoder;
 pub struct WhepSession {
     pub pc: Arc<RTCPeerConnection>,
     pub resource: String,
+    data_tx: broadcast::Sender<DataMessage>,
 }
 
 impl WhepSession {
+    /// Subscribe to messages arriving over this session's WebRTC DataChannels.
+    pub fn subscribe_data(&self) -> broadcast::Receiver<DataMessage> {
+        self.data_tx.subscribe()
+    }
+
     /// Tear down the PeerConnection and stop the media pump.
     pub async fn close(&self) {
         if let Err(e) = self.pc.close().await {
@@ -71,45 +75,17 @@ pub async fn whep_play(
     ice_servers: Vec<IceServer>,
 ) -> Result<(String, WhepSession)> {
     crate::init_crypto();
-    let mut m = MediaEngine::default();
-    // Register exactly the codecs we can send. The `TrackLocalStaticSample`
-    // binds to a matching registered codec to pick the right RTP payloader.
-    m.register_codec(
-        RTCRtpCodecParameters {
-            capability: RTCRtpCodecCapability {
-                mime_type: webrtc::api::media_engine::MIME_TYPE_H264.to_owned(),
-                clock_rate: 90_000,
-                channels: 0,
-                sdp_fmtp_line:
-                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                        .to_string(),
-                rtcp_feedback: vec![],
-            },
-            payload_type: 102,
-            stats_id: String::new(),
-        },
-        RTPCodecType::Video,
-    )?;
-    m.register_codec(
-        RTCRtpCodecParameters {
-            capability: RTCRtpCodecCapability {
-                mime_type: webrtc::api::media_engine::MIME_TYPE_OPUS.to_owned(),
-                clock_rate: 48_000,
-                channels: 2,
-                sdp_fmtp_line: "minptime=10;useinbandfec=1".to_string(),
-                rtcp_feedback: vec![],
-            },
-            payload_type: 111,
-            stats_id: String::new(),
-        },
-        RTPCodecType::Audio,
-    )?;
-
-    let api = APIBuilder::new().with_media_engine(m).build();
+    let api = crate::engine::build_api(crate::engine::WebRtcRole::Sender)?;
     let pc = Arc::new(
-        api.new_peer_connection(build_rtc_config(&ice_servers))
+        api.build()
+            .new_peer_connection(build_rtc_config(&ice_servers))
             .await?,
     );
+
+    // DataChannel plumbing: any channel the player opens is forwarded into a
+    // broadcast pipe the HTTP layer (or a control plane) can subscribe to.
+    let (data_tx, _) = broadcast::channel(64);
+    attach_data_channels(&pc, data_tx.clone());
 
     // Non-trickle WHEP: wait until ICE gathering completes so candidates are
     // embedded in the returned answer SDP.
@@ -248,7 +224,7 @@ pub async fn whep_play(
     spawn_pump(source, video_track, audio_track);
 
     info!("webrtc: WHEP session {} negotiated", resource);
-    Ok((answer_sdp, WhepSession { pc, resource }))
+    Ok((answer_sdp, WhepSession { pc, resource, data_tx }))
 }
 
 #[cfg(not(feature = "transcode"))]

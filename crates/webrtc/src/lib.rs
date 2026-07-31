@@ -15,6 +15,8 @@
 //! transcoding lives in the `transcode` module (behind the `transcode` Cargo
 //! feature, which needs native `libopus`/`libfdk-aac` at build time).
 
+pub mod datachannel;
+pub mod engine;
 pub mod h264_rtp;
 pub mod server;
 pub mod whep;

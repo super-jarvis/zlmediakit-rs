@@ -104,7 +104,7 @@ fn run_supervisor(
 async fn vod_flv_playback_with_range_and_dir_listing() {
     let _ = std::fs::remove_dir_all(RECORD_BASE);
 
-    let mgr = Arc::new(MediaSourceManager::new());
+    let mgr = Arc::new(MediaSourceManager::new(None));
     let auth = StreamAuth::new(false, String::new());
     let hook = HookClient::empty();
     let (recorder, cmd_rx) = RecorderControl::new();
@@ -128,6 +128,7 @@ async fn vod_flv_playback_with_range_and_dir_listing() {
         rtp: None,
         sip: None,
         transcode: None,
+        session_manager: None,
     })
     .await
     .expect("HttpServer start");
@@ -329,7 +330,7 @@ async fn mp4_vod_flv_remux_playback() {
     let port = find_free_port().await;
     let _ = std::fs::remove_dir_all(RECORD_BASE);
 
-    let mgr = Arc::new(MediaSourceManager::new());
+    let mgr = Arc::new(MediaSourceManager::new(None));
     let auth = StreamAuth::new(false, String::new());
     let hook = HookClient::empty();
     let (recorder, _cmd_rx) = RecorderControl::new();
@@ -352,6 +353,7 @@ async fn mp4_vod_flv_remux_playback() {
         rtp: None,
         sip: None,
         transcode: None,
+        session_manager: None,
     })
     .await
     .expect("HttpServer start");
@@ -418,7 +420,7 @@ async fn static_file_serving_from_www_root() {
         .await
         .unwrap();
 
-    let mgr = Arc::new(MediaSourceManager::new());
+    let mgr = Arc::new(MediaSourceManager::new(None));
     let auth = StreamAuth::new(false, String::new());
     let hook = HookClient::empty();
     let (recorder, _cmd_rx) = RecorderControl::new();
@@ -443,6 +445,7 @@ async fn static_file_serving_from_www_root() {
         rtp: None,
         sip: None,
         transcode: None,
+        session_manager: None,
     })
     .await
     .expect("HttpServer start");
@@ -515,7 +518,7 @@ async fn vod_auth_rejects_without_valid_sign() {
     let _ = std::fs::remove_dir_all(RECORD_BASE_AUTH);
 
     let secret = "test-auth-secret";
-    let mgr = Arc::new(MediaSourceManager::new());
+    let mgr = Arc::new(MediaSourceManager::new(None));
     let auth = StreamAuth::new(true, secret.to_string());
     let hook = HookClient::empty();
     let (recorder, cmd_rx) = RecorderControl::new();
@@ -539,6 +542,7 @@ async fn vod_auth_rejects_without_valid_sign() {
         rtp: None,
         sip: None,
         transcode: None,
+        session_manager: None,
     })
     .await
     .expect("HttpServer start");

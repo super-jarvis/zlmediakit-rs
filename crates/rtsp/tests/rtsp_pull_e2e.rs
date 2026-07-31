@@ -145,7 +145,7 @@ async fn rtsp_request_full(
 
 #[tokio::test]
 async fn rtsp_pull_proxy_receives_media() {
-    let upstream_mgr = Arc::new(MediaSourceManager::new());
+    let upstream_mgr = Arc::new(MediaSourceManager::new(None));
     let event_bus = Arc::new(EventBus::new(1024));
     let auth = StreamAuth::new(false, String::new());
 
@@ -210,7 +210,7 @@ async fn rtsp_pull_proxy_receives_media() {
     assert_eq!(code, 200, "RECORD");
 
     // --- Start pull proxy ---
-    let downstream_mgr = Arc::new(MediaSourceManager::new());
+    let downstream_mgr = Arc::new(MediaSourceManager::new(None));
     let stop = Arc::new(Notify::new());
     let stopped = Arc::new(AtomicBool::new(false));
 

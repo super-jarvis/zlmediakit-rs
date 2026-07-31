@@ -3247,6 +3247,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "fdk-aac",
+ "interceptor",
  "opus",
  "rustls",
  "serde",

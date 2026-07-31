@@ -106,7 +106,7 @@ fn run_supervisor(
 async fn recording_api_start_stop_via_http() {
     let _ = std::fs::remove_dir_all(RECORD_BASE);
 
-    let mgr = Arc::new(MediaSourceManager::new());
+    let mgr = Arc::new(MediaSourceManager::new(None));
     let auth = StreamAuth::new(false, String::new());
     let hook = HookClient::empty();
     let (recorder, cmd_rx) = RecorderControl::new();
@@ -130,6 +130,7 @@ async fn recording_api_start_stop_via_http() {
         rtp: None,
         sip: None,
         transcode: None,
+        session_manager: None,
     })
     .await
     .expect("HttpServer start");

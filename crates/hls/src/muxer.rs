@@ -9,8 +9,8 @@ use zlmediakit_core::media_source::MediaSource;
 const TS_PACKET_SIZE: usize = 188;
 const PAT_PID: u16 = 0;
 const PMT_PID: u16 = 4096;
-const VIDEO_PID: u16 = 256;
-const AUDIO_PID: u16 = 257;
+pub(crate) const VIDEO_PID: u16 = 256;
+pub(crate) const AUDIO_PID: u16 = 257;
 
 pub struct HlsSession {
     pub source: Arc<MediaSource>,
@@ -23,7 +23,7 @@ pub struct HlsSegment {
     pub data: Vec<u8>,
 }
 
-struct TsWriter {
+pub(crate) struct TsWriter {
     continuity_video: u8,
     continuity_audio: u8,
     continuity_pat: u8,
@@ -32,7 +32,7 @@ struct TsWriter {
 }
 
 impl TsWriter {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             continuity_video: 0,
             continuity_audio: 0,
@@ -42,7 +42,7 @@ impl TsWriter {
         }
     }
 
-    fn write_pat_pmt(&mut self, out: &mut Vec<u8>, video_stream_type: u8) {
+    pub(crate) fn write_pat_pmt(&mut self, out: &mut Vec<u8>, video_stream_type: u8) {
         let mut pat = BytesMut::with_capacity(20);
         pat.put_u8(0x00); // table_id
         pat.put_u8(0xB0);
@@ -84,7 +84,7 @@ impl TsWriter {
         write_ts_packet(out, PMT_PID, &pmt_payload, true, &mut self.continuity_pmt);
     }
 
-    fn write_pes(&mut self, out: &mut Vec<u8>, pid: u16, pes: &[u8], rand_access: bool, dts_ms: u64) {
+    pub(crate) fn write_pes(&mut self, out: &mut Vec<u8>, pid: u16, pes: &[u8], rand_access: bool, dts_ms: u64) {
         self.pcr = dts_ms * 27000;
         let pcr = self.pcr;
         write_pes_to_ts(out, pid, pes, rand_access, self.continuity_for(pid), pcr);
@@ -283,7 +283,7 @@ impl HlsMuxer {
     }
 }
 
-fn build_config_pes(stream_id: u8, config: &[u8]) -> Vec<u8> {
+pub(crate) fn build_config_pes(stream_id: u8, config: &[u8]) -> Vec<u8> {
     let mut pes = Vec::new();
     pes.extend_from_slice(&[0x00, 0x00, 0x01, stream_id]);
     let total_pes_len = config.len() + 3;
@@ -296,7 +296,7 @@ fn build_config_pes(stream_id: u8, config: &[u8]) -> Vec<u8> {
     pes
 }
 
-fn build_data_pes_raw(stream_id: u8, data: &[u8], timestamp: u32) -> Vec<u8> {
+pub(crate) fn build_data_pes_raw(stream_id: u8, data: &[u8], timestamp: u32) -> Vec<u8> {
     let mut pes = Vec::new();
     pes.extend_from_slice(&[0x00, 0x00, 0x01, stream_id]);
     let pts_dts_len: u8 = 5;
@@ -312,7 +312,7 @@ fn build_data_pes_raw(stream_id: u8, data: &[u8], timestamp: u32) -> Vec<u8> {
     pes
 }
 
-fn flv_video_to_annex_b(data: &[u8]) -> Vec<u8> {
+pub(crate) fn flv_video_to_annex_b(data: &[u8]) -> Vec<u8> {
     if data.len() < 2 {
         return Vec::new();
     }
@@ -336,7 +336,7 @@ fn flv_video_to_annex_b(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn flv_audio_to_raw(data: &[u8]) -> Vec<u8> {
+pub(crate) fn flv_audio_to_raw(data: &[u8]) -> Vec<u8> {
     if data.len() < 2 {
         return Vec::new();
     }
@@ -370,7 +370,7 @@ fn make_adts_header(frame_len: usize, audio_config: &[u8]) -> [u8; 7] {
     ]
 }
 
-fn flv_audio_to_adts(data: &[u8], audio_config: &[u8]) -> Vec<u8> {
+pub(crate) fn flv_audio_to_adts(data: &[u8], audio_config: &[u8]) -> Vec<u8> {
     let raw = flv_audio_to_raw(data);
     if raw.is_empty() || audio_config.len() < 2 {
         return raw;
@@ -558,13 +558,13 @@ fn crc32(data: &[u8]) -> u32 {
     crc
 }
 
-fn is_video_config(frame: &MediaFrame) -> bool {
+pub(crate) fn is_video_config(frame: &MediaFrame) -> bool {
     frame.data.len() >= 2
         && (frame.data[0] & 0x0F == 7 || frame.data[0] & 0x0F == 12)
         && frame.data[1] & 0x0F == 0
 }
 
-fn extract_video_config(frame: &MediaFrame) -> Vec<u8> {
+pub(crate) fn extract_video_config(frame: &MediaFrame) -> Vec<u8> {
     if frame.codec == CodecId::H265 {
         extract_hevc_config(&frame.data)
     } else {
@@ -572,7 +572,7 @@ fn extract_video_config(frame: &MediaFrame) -> Vec<u8> {
     }
 }
 
-fn is_aac_config(frame: &MediaFrame) -> bool {
+pub(crate) fn is_aac_config(frame: &MediaFrame) -> bool {
     frame.data.len() >= 2 && (frame.data[0] >> 4) == 10 && frame.data[1] & 0x0F == 0
 }
 
@@ -657,7 +657,7 @@ fn extract_hevc_config(data: &[u8]) -> Vec<u8> {
     config
 }
 
-fn extract_aac_config(data: &[u8]) -> Vec<u8> {
+pub(crate) fn extract_aac_config(data: &[u8]) -> Vec<u8> {
     if data.len() >= 3 {
         data[2..].to_vec()
     } else {

@@ -108,8 +108,8 @@ fn avcc_sample(key: bool) -> Bytes {
 
 #[tokio::test]
 async fn rtmp_push_forward_to_another_server() {
-    let mgr1 = Arc::new(MediaSourceManager::new());
-    let mgr2 = Arc::new(MediaSourceManager::new());
+    let mgr1 = Arc::new(MediaSourceManager::new(None));
+    let mgr2 = Arc::new(MediaSourceManager::new(None));
     let event_bus1 = Arc::new(EventBus::new(1024));
     let event_bus2 = Arc::new(EventBus::new(1024));
     let auth = StreamAuth::new(false, String::new());

@@ -146,8 +146,8 @@ async fn rtmps_push_to_tls_server() {
     std::fs::write(&cert_path, cert_pem.as_bytes()).unwrap();
     std::fs::write(&key_path, key_pem.as_bytes()).unwrap();
 
-    let mgr1 = Arc::new(MediaSourceManager::new());
-    let mgr2 = Arc::new(MediaSourceManager::new());
+    let mgr1 = Arc::new(MediaSourceManager::new(None));
+    let mgr2 = Arc::new(MediaSourceManager::new(None));
     let event_bus1 = Arc::new(zlmediakit_core::event_bus::EventBus::new(1024));
     let event_bus2 = Arc::new(zlmediakit_core::event_bus::EventBus::new(1024));
     let auth1 = zlmediakit_core::auth::StreamAuth::new(false, String::new());

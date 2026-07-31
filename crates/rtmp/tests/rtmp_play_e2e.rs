@@ -125,7 +125,7 @@ async fn send_and_recv(
 
 #[tokio::test]
 async fn rtmp_play_receives_video() {
-    let mgr = Arc::new(MediaSourceManager::new());
+    let mgr = Arc::new(MediaSourceManager::new(None));
     let event_bus = Arc::new(EventBus::new(1024));
     let auth = StreamAuth::new(false, String::new());
 

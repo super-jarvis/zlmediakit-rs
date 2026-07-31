@@ -16,6 +16,7 @@ use zlmediakit_core::stream_proxy::StreamProxyControl;
 use zlmediakit_core::stream_pusher::StreamPusherControl;
 use zlmediakit_core::transport::TransportStream;
 use zlmediakit_hls::muxer::{self, HlsSegment};
+use zlmediakit_hls::TsLiveMuxer;
 use zlmediakit_srt::{RtpPayloadType, RtpServerManager, SipServer};
 use zlmediakit_transcode::{TranscodeConfig, TranscodeManager};
 
@@ -167,6 +168,13 @@ impl HttpSession {
                     self.auth,
                     self.hook.clone(),
                 );
+                let route = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+                if route.ends_with(".live.ts") {
+                    return ws.run_ts(path).await;
+                }
+                if route.ends_with(".live.mp4") {
+                    return ws.run_fmp4(path).await;
+                }
                 return ws.run_flv(path).await;
             }
         }
@@ -182,6 +190,10 @@ impl HttpSession {
             self.handle_vod(path, &request_str).await?;
         } else if route.ends_with(".flv") {
             self.handle_flv_stream(path).await?;
+        } else if route.ends_with(".live.ts") {
+            self.handle_ts_stream(path).await?;
+        } else if route.ends_with(".live.mp4") {
+            self.handle_fmp4_stream(path).await?;
         } else if route.ends_with(".mpd") {
             self.handle_dash_mpd(path).await?;
         } else if route.ends_with(".m4s") {
@@ -286,6 +298,212 @@ impl HttpSession {
                     }
                     let tag = muxer.write_tag(&frame);
                     self.stream.write_all(&tag).await?;
+                }
+            }
+            None => {
+                self.send_404().await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Serves a continuous MPEG-TS stream (`/app/stream.live.ts`).
+    ///
+    /// Mirrors `handle_flv_stream`: config frames and the latest GOP are
+    /// replayed first so the player can decode immediately, then every live
+    /// frame is muxed to TS on the fly.
+    async fn handle_ts_stream(&mut self, path: &str) -> anyhow::Result<()> {
+        let (app, resource, sign) = Self::parse_path_sign(path);
+        let stream_name = resource
+            .strip_suffix(".live.ts")
+            .map_or("stream", |v| v)
+            .to_string();
+
+        if let HookResult::Deny(msg) = self
+            .hook
+            .on_play("__defaultVhost__", &app, &stream_name, &sign)
+            .await
+        {
+            warn!(
+                "HTTP-TS play rejected (hook): {}/{} - {}",
+                app, stream_name, msg
+            );
+            return self.send_401().await;
+        }
+
+        if !self
+            .auth
+            .check("__defaultVhost__", &app, &stream_name, "play", &sign)
+        {
+            warn!("HTTP-TS play rejected (auth): {}/{}", app, stream_name);
+            return self.send_401().await;
+        }
+
+        let source = self
+            .source_manager
+            .get("__defaultVhost__", &app, &stream_name);
+
+        match source {
+            Some(source) => {
+                let response = "HTTP/1.1 200 OK\r\n\
+                    Content-Type: video/MP2T\r\n\
+                    Connection: close\r\n\
+                    Cache-Control: no-cache\r\n\r\n";
+                self.stream.write_all(response.as_bytes()).await?;
+
+                let mut muxer = TsLiveMuxer::new();
+
+                let configs = {
+                    let cache = source.gop_cache.read().await;
+                    cache.get_config_frames()
+                };
+                for frame in &configs {
+                    let ts = muxer.push_frame(frame);
+                    if !ts.is_empty() {
+                        self.stream.write_all(&ts).await?;
+                    }
+                }
+
+                let cached = {
+                    let cache = source.gop_cache.read().await;
+                    cache.get_latest_gop_frames()
+                };
+                for frame in &cached {
+                    let ts = muxer.push_frame(frame);
+                    if !ts.is_empty() {
+                        self.stream.write_all(&ts).await?;
+                    }
+                }
+
+                let mut rx = source.subscribe();
+                while let Ok(frame) = rx.recv().await {
+                    let ts = muxer.push_frame(&frame);
+                    if !ts.is_empty() {
+                        if let Err(e) = self.stream.write_all(&ts).await {
+                            debug!("HTTP-TS write error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            None => {
+                self.send_404().await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Serves a live fragmented-MP4 stream (`/app/stream.live.mp4`).
+    ///
+    /// The init segment (ftyp+moov) is written once, then a media segment
+    /// (styp+moof+mdat) is written on every keyframe, giving GOP-aligned
+    /// fragments a player can decode progressively.
+    async fn handle_fmp4_stream(&mut self, path: &str) -> anyhow::Result<()> {
+        let (app, resource, sign) = Self::parse_path_sign(path);
+        let stream_name = resource
+            .strip_suffix(".live.mp4")
+            .map_or("stream", |v| v)
+            .to_string();
+
+        if let HookResult::Deny(msg) = self
+            .hook
+            .on_play("__defaultVhost__", &app, &stream_name, &sign)
+            .await
+        {
+            warn!(
+                "HTTP-fMP4 play rejected (hook): {}/{} - {}",
+                app, stream_name, msg
+            );
+            return self.send_401().await;
+        }
+
+        if !self
+            .auth
+            .check("__defaultVhost__", &app, &stream_name, "play", &sign)
+        {
+            warn!(
+                "HTTP-fMP4 play rejected (auth): {}/{}",
+                app, stream_name
+            );
+            return self.send_401().await;
+        }
+
+        let source = self
+            .source_manager
+            .get("__defaultVhost__", &app, &stream_name);
+
+        match source {
+            Some(source) => {
+                let response = "HTTP/1.1 200 OK\r\n\
+                    Content-Type: video/mp4\r\n\
+                    Connection: close\r\n\
+                    Cache-Control: no-cache\r\n\r\n";
+                self.stream.write_all(response.as_bytes()).await?;
+
+                let mut muxer = Fmp4Muxer::new(90_000);
+
+                let configs = {
+                    let cache = source.gop_cache.read().await;
+                    cache.get_config_frames()
+                };
+                for frame in &configs {
+                    muxer.push_frame(frame);
+                }
+                let init = muxer.init_segment();
+                self.stream.write_all(&init.data).await?;
+
+                let cached = {
+                    let cache = source.gop_cache.read().await;
+                    cache.get_latest_gop_frames()
+                };
+                for frame in &cached {
+                    if zlmediakit_core::gop_cache::is_config_frame(frame) {
+                        continue;
+                    }
+                    muxer.push_frame(frame);
+                    if frame.frame_type == zlmediakit_core::media_frame::FrameType::Video
+                        && frame.key_frame
+                    {
+                        if let Some(seg) = muxer.flush_segment() {
+                            if let Err(e) = self.stream.write_all(&seg.data).await {
+                                debug!("HTTP-fMP4 write error: {}", e);
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                if let Some(seg) = muxer.flush_segment() {
+                    if let Err(e) = self.stream.write_all(&seg.data).await {
+                        debug!("HTTP-fMP4 write error: {}", e);
+                        return Ok(());
+                    }
+                }
+
+                let mut rx = source.subscribe();
+                loop {
+                    match rx.recv().await {
+                        Ok(frame) => {
+                            if zlmediakit_core::gop_cache::is_config_frame(&frame) {
+                                continue;
+                            }
+                            muxer.push_frame(&frame);
+                            if frame.frame_type
+                                == zlmediakit_core::media_frame::FrameType::Video
+                                && frame.key_frame
+                            {
+                                if let Some(seg) = muxer.flush_segment() {
+                                    if let Err(e) = self.stream.write_all(&seg.data).await {
+                                        debug!("HTTP-fMP4 write error: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    }
                 }
             }
             None => {
@@ -2410,4 +2628,147 @@ async fn start_dash_task(
             }
         }
     }
+}
+
+impl HttpSession {
+    /// Serves a snapshot (JPEG) of the given stream by extracting the latest
+    /// H.264 key frame from the GOP cache, converting AVCC → AnnexB and piping
+    /// it through `ffmpeg` to produce a single MJPEG frame.
+    ///
+    /// Query params: `vhost`, `app`, `stream` (and optional `.jpeg` suffix in
+    /// `stream` is stripped).
+    async fn handle_get_snap(&mut self, path: &str) -> anyhow::Result<()> {
+        let q = Self::parse_query(path);
+        let vhost = q
+            .get("vhost")
+            .map(|s| s.as_str())
+            .unwrap_or("__defaultVhost__");
+        let app = q.get("app").map(|s| s.as_str()).unwrap_or("live");
+        let stream = q
+            .get("stream")
+            .map(|s| s.as_str())
+            .unwrap_or("")
+            .trim_end_matches(".jpeg")
+            .trim_end_matches(".jpg");
+
+        if stream.is_empty() {
+            self.send_json(&serde_json::json!({"code": -400, "msg": "missing stream param"}))
+                .await?;
+            return Ok(());
+        }
+
+        let source = match self.source_manager.get(vhost, app, stream) {
+            Some(s) => s,
+            None => {
+                self.send_json(&serde_json::json!({"code": -404, "msg": "stream not found"}))
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        let config_frames = source.get_cached_config_frames().await;
+        let gop_frames = source.get_latest_gop_frames().await;
+
+        let sps_pps = config_frames.iter().find(|f| {
+            matches!(f.codec, zlmediakit_core::media_frame::CodecId::H264)
+                && f.config_frame
+                && matches!(f.frame_type, zlmediakit_core::media_frame::FrameType::Video)
+        });
+        let key = gop_frames.iter().find(|f| {
+            matches!(f.codec, zlmediakit_core::media_frame::CodecId::H264)
+                && f.key_frame
+                && matches!(f.frame_type, zlmediakit_core::media_frame::FrameType::Video)
+        });
+
+        let (sps_pps, key) = match (sps_pps, key) {
+            (Some(c), Some(k)) => (c, k),
+            _ => {
+                self.send_json(&serde_json::json!({
+                    "code": -404,
+                    "msg": "no H.264 key frame available yet"
+                }))
+                .await?;
+                return Ok(());
+            }
+        };
+
+        let mut annexb: Vec<u8> = Vec::new();
+        annexb.extend_from_slice(&h264_to_annexb(&sps_pps.data));
+        annexb.extend_from_slice(&h264_to_annexb(&key.data));
+
+        let tmp = std::env::temp_dir().join(format!(
+            "zlm_snap_{}_{}_{}_{}.h264",
+            vhost, app, stream, std::process::id()
+        ));
+        tokio::fs::write(&tmp, &annexb).await?;
+
+        let out = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-loglevel",
+                "error",
+                "-i",
+                tmp.to_str().unwrap_or("/dev/null"),
+                "-frames:v",
+                "1",
+                "-f",
+                "mjpeg",
+                "-",
+            ])
+            .output()
+            .await;
+
+        let _ = tokio::fs::remove_file(&tmp).await;
+
+        match out {
+            Ok(o) if o.status.success() && !o.stdout.is_empty() => {
+                let body = o.stdout;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: image/jpeg\r\n\
+                     Content-Length: {}\r\n\
+                     Access-Control-Allow-Origin: *\r\n\
+                     Cache-Control: no-cache\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                self.stream.write_all(response.as_bytes()).await?;
+                self.stream.write_all(&body).await?;
+            }
+            Ok(o) => {
+                let msg = String::from_utf8_lossy(&o.stderr);
+                error!("ffmpeg getSnap failed: {}", msg);
+                self.send_json(&serde_json::json!({"code": -500, "msg": "ffmpeg failed"}))
+                    .await?;
+            }
+            Err(e) => {
+                error!("could not spawn ffmpeg for getSnap: {}", e);
+                self.send_json(&serde_json::json!({"code": -500, "msg": "ffmpeg not available"}))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Converts an H.264 NALU stream from AVCC (length-prefixed) to AnnexB
+/// (start-code prefixed). If the data already starts with a start code, it is
+/// returned unchanged.
+fn h264_to_annexb(data: &[u8]) -> Vec<u8> {
+    if data.len() >= 4 && &data[0..4] == [0, 0, 0, 1] {
+        return data.to_vec();
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(data.len() + 16);
+    let mut i = 0;
+    while i + 4 <= data.len() {
+        let nalu_len =
+            u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
+        i += 4;
+        if i + nalu_len > data.len() {
+            break;
+        }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&data[i..i + nalu_len]);
+        i += nalu_len;
+    }
+    out
 }

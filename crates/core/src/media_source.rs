@@ -1,3 +1,4 @@
+use crate::event_bus::{Event, EventBus};
 use crate::gop_cache::GopCache;
 use crate::media_frame::{MediaFrame, MediaInfo};
 use crate::session::SessionId;
@@ -23,6 +24,7 @@ mod tests {
             "vhost".into(),
             "app".into(),
             "stream".into(),
+            None,
         ));
         let source_clone = source.clone();
 
@@ -97,10 +99,17 @@ pub struct MediaSource {
     pub gop_cache: Arc<RwLock<GopCache>>,
     pub subscribers: Arc<RwLock<HashMap<SessionId, ()>>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub event_bus: Option<Arc<EventBus>>,
 }
 
 impl MediaSource {
-    pub fn new(id: SourceId, vhost: String, app: String, stream: String) -> Self {
+    pub fn new(
+        id: SourceId,
+        vhost: String,
+        app: String,
+        stream: String,
+        event_bus: Option<Arc<EventBus>>,
+    ) -> Self {
         let (frame_tx, _) = broadcast::channel(256);
         Self {
             id,
@@ -116,6 +125,7 @@ impl MediaSource {
             gop_cache: Arc::new(RwLock::new(GopCache::new())),
             subscribers: Arc::new(RwLock::new(HashMap::new())),
             created_at: chrono::Utc::now(),
+            event_bus,
         }
     }
 
@@ -133,15 +143,47 @@ impl MediaSource {
     }
 
     pub async fn add_subscriber(&self, session_id: SessionId) {
-        self.subscribers.write().await.insert(session_id, ());
+        let was_empty = self.subscribers.read().await.is_empty();
+        self.subscribers.write().await.insert(session_id.clone(), ());
+        if was_empty {
+            // First subscriber → stream changed (regist=true).
+            if let Some(eb) = &self.event_bus {
+                eb.publish(Event::StreamPlay {
+                    source_id: self.id.clone(),
+                    session_id: session_id.clone(),
+                });
+            }
+        }
     }
 
     pub async fn remove_subscriber(&self, session_id: &SessionId) {
         self.subscribers.write().await.remove(session_id);
+        let count = self.subscribers.read().await.len();
+        if let Some(eb) = &self.event_bus {
+            eb.publish(Event::StreamStop {
+                source_id: self.id.clone(),
+                session_id: session_id.clone(),
+            });
+            if count == 0 {
+                eb.publish(Event::NoReader {
+                    source_id: self.id.clone(),
+                });
+            }
+        }
     }
 
     pub async fn subscriber_count(&self) -> usize {
         self.subscribers.read().await.len()
+    }
+
+    /// Non-async variant of [`subscriber_count`], safe to call from a synchronous
+    /// context (e.g. an event-bus handler) since the inner lock is an
+    /// `RwLock` with a non-blocking read path.
+    pub fn subscriber_count_blocking(&self) -> usize {
+        self.subscribers
+            .try_read()
+            .map(|g| g.len())
+            .unwrap_or_else(|_| self.subscribers.blocking_read().len())
     }
 
     fn lock_frame_tx(&self) -> std::sync::MutexGuard<'_, Option<broadcast::Sender<MediaFrame>>> {
@@ -211,17 +253,20 @@ impl MediaSource {
 
 pub struct MediaSourceManager {
     sources: DashMap<SourceId, Arc<MediaSource>>,
+    event_bus: Option<Arc<EventBus>>,
 }
 
 impl MediaSourceManager {
-    pub fn new() -> Self {
+    pub fn new(event_bus: Option<Arc<EventBus>>) -> Self {
         Self {
             sources: DashMap::new(),
+            event_bus,
         }
     }
 
     pub fn get_or_create(&self, vhost: &str, app: &str, stream: &str) -> Arc<MediaSource> {
         let id = format!("{}/{}/{}", vhost, app, stream);
+        let eb = self.event_bus.clone();
         self.sources
             .entry(id.clone())
             .or_insert_with(|| {
@@ -231,6 +276,7 @@ impl MediaSourceManager {
                     vhost.to_string(),
                     app.to_string(),
                     stream.to_string(),
+                    eb,
                 ))
             })
             .clone()
@@ -269,6 +315,6 @@ impl MediaSourceManager {
 
 impl Default for MediaSourceManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }

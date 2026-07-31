@@ -81,7 +81,7 @@ fn avcc_sample(key: bool, seq: u32) -> Bytes {
 async fn whep_e2e_receives_media() {
     zlmediakit_webrtc::init_crypto();
     // 1. Publish a synthetic H.264 stream.
-    let mgr = Arc::new(MediaSourceManager::new());
+    let mgr = Arc::new(MediaSourceManager::new(None));
     let source = mgr.get_or_create("__defaultVhost__", "live", "webrtctest");
     source
         .update_tracks(vec![TrackInfo::Video(VideoInfo {
@@ -332,7 +332,7 @@ async fn http_exchange(
 #[tokio::test]
 async fn whep_http_e2e_receives_media() {
     zlmediakit_webrtc::init_crypto();
-    let mgr = Arc::new(MediaSourceManager::new());
+    let mgr = Arc::new(MediaSourceManager::new(None));
     let source = mgr.get_or_create("__defaultVhost__", "live", "webrtchttp");
     source
         .update_tracks(vec![TrackInfo::Video(VideoInfo {
@@ -572,7 +572,7 @@ fn annexb_frame(nalu_type: u8, payload: &[u8]) -> Bytes {
 #[tokio::test]
 async fn whip_e2e_publish_then_play() {
     zlmediakit_webrtc::init_crypto();
-    let mgr = Arc::new(MediaSourceManager::new());
+    let mgr = Arc::new(MediaSourceManager::new(None));
     let vhost = "__defaultVhost__";
     let app = "live";
     let stream = "whiploop";

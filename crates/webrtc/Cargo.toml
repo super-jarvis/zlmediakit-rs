@@ -23,6 +23,10 @@ serde_json = { workspace = true }
 dashmap = { workspace = true }
 uuid = { workspace = true }
 webrtc = "0.12"
+# Retransmission / congestion-control interceptors (NACK, TWCC, RTCP reports),
+# pulled in directly so the engine can build the interceptor `Registry` that the
+# webrtc `APIBuilder` installs per PeerConnection.
+interceptor = "0.13"
 # Pulled in directly so we can explicitly install a rustls CryptoProvider.
 # When both `ring` (via webrtc) and `aws-lc-rs` (via the http crate's TLS
 # stack) get unified into one `rustls` build, rustls refuses to auto-pick a

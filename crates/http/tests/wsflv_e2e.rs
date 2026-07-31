@@ -89,7 +89,7 @@ async fn wsflv_e2e_receives_flv_over_websocket() {
     let (proxy, _table, _proxy_rx) = StreamProxyControl::new();
     let auth = StreamAuth::new(false, String::new());
     let hook = HookClient::empty();
-    let mgr = Arc::new(MediaSourceManager::new());
+    let mgr = Arc::new(MediaSourceManager::new(None));
 
     let hook = HookClient::empty();
     let addr = format!("127.0.0.1:{}", TEST_PORT);
@@ -109,6 +109,7 @@ async fn wsflv_e2e_receives_flv_over_websocket() {
         rtp: None,
         sip: None,
         transcode: None,
+        session_manager: None,
     })
     .await
     .expect("HttpServer should start");

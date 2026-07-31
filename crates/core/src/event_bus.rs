@@ -37,8 +37,19 @@ pub enum Event {
         source_id: SourceId,
         frame: MediaFrame,
     },
+    /// Emitted by the MP4 recorder once a recording file has been written to
+    /// disk, so listeners (e.g. the HTTP hook watcher) can fire `on_record_mp4`.
+    RecordMp4Done {
+        vhost: String,
+        app: String,
+        stream: String,
+        file_path: String,
+        file_size: u64,
+        time_len: f64,
+    },
 }
 
+#[derive(Debug)]
 pub struct EventBus {
     tx: broadcast::Sender<Event>,
     listeners: DashMap<String, broadcast::Sender<Event>>,

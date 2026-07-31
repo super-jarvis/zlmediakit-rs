@@ -136,7 +136,7 @@ fn header_value(resp: &str, name: &str) -> Option<String> {
 
 #[tokio::test]
 async fn rtsp_e2e_publish_receives_media() {
-    let mgr = Arc::new(MediaSourceManager::new());
+    let mgr = Arc::new(MediaSourceManager::new(None));
     let event_bus = Arc::new(EventBus::new(1024));
     let auth = StreamAuth::new(false, String::new());
 

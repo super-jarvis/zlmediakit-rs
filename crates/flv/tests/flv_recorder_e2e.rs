@@ -40,7 +40,7 @@ async fn flv_recorder_writes_valid_file() {
         .join("teststream");
     let _ = std::fs::remove_dir_all(&dir_path);
 
-    let mgr = Arc::new(MediaSourceManager::new());
+    let mgr = Arc::new(MediaSourceManager::new(None));
     let source = mgr.get_or_create("__defaultVhost__", "live", "teststream");
 
     // Seed the cache with config + key frame so the recorder can build a
@@ -134,7 +134,7 @@ async fn flv_recorder_no_frames_still_writes_header() {
     let dir_path = std::path::Path::new(TEST_BASE).join("empty").join("stream");
     let _ = std::fs::remove_dir_all(&dir_path);
 
-    let mgr = Arc::new(MediaSourceManager::new());
+    let mgr = Arc::new(MediaSourceManager::new(None));
     let source = mgr.get_or_create("__defaultVhost__", "empty", "stream");
 
     let stop = Arc::new(Notify::new());

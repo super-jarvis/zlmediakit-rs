@@ -131,7 +131,7 @@ fn avcc_sample(key: bool) -> Bytes {
 
 #[tokio::test]
 async fn rtmp_e2e_publish_then_wsflv_play() {
-    let mgr = Arc::new(MediaSourceManager::new());
+    let mgr = Arc::new(MediaSourceManager::new(None));
     let event_bus = Arc::new(EventBus::new(1024));
     let auth = StreamAuth::new(false, String::new());
 

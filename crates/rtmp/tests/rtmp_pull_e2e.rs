@@ -90,8 +90,8 @@ fn avcc_sample(key: bool) -> Bytes {
 
 #[tokio::test]
 async fn rtmp_pull_from_another_server() {
-    let mgr_src = Arc::new(MediaSourceManager::new());
-    let mgr_dst = Arc::new(MediaSourceManager::new());
+    let mgr_src = Arc::new(MediaSourceManager::new(None));
+    let mgr_dst = Arc::new(MediaSourceManager::new(None));
     let auth = StreamAuth::new(false, String::new());
 
     let srv_src = RtmpServer::new(

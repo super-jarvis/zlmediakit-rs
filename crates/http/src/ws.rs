@@ -8,10 +8,12 @@ use tokio::sync::broadcast;
 use tracing::{debug, warn};
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::hook::HookClient;
-use zlmediakit_core::media_frame::TrackInfo;
+use zlmediakit_core::media_frame::{FrameType, TrackInfo};
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::transport::TransportStream;
 use zlmediakit_flv::FlvMuxer;
+use zlmediakit_hls::TsLiveMuxer;
+use zlmediakit_mp4::fmp4::Fmp4Muxer;
 
 const MAGIC_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -263,6 +265,280 @@ impl WsSession {
                             if let Err(e) = self.stream.write_all(&ws_frame.encode_server()).await {
                                 debug!("WS write error: {}", e);
                                 break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            rx_closed = true;
+                            break;
+                        }
+                    }
+                }
+                read_result = self.read_frame() => {
+                    match read_result {
+                        Some(frame) => {
+                            match frame.opcode {
+                                0x8 => {
+                                    debug!("WS close frame received");
+                                    let close = WsFrame::close(1000, "bye");
+                                    let _ = self.stream.write_all(&close.encode_server()).await;
+                                    break;
+                                }
+                                0x9 => {
+                                    let pong = WsFrame::pong();
+                                    if let Err(e) = self.stream.write_all(&pong.encode_server()).await {
+                                        debug!("WS pong write error: {}", e);
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        if rx_closed {
+            let close = WsFrame::close(1001, "source gone");
+            let _ = self.stream.write_all(&close.encode_server()).await;
+        }
+
+        Ok(())
+    }
+
+    /// WebSocket MPEG-TS playback (`/app/stream.live.ts` over WebSocket).
+    pub async fn run_ts(&mut self, path: &str) -> anyhow::Result<()> {
+        let (app, resource, sign) = parse_path_sign(path);
+        let stream_name = resource
+            .strip_suffix(".live.ts")
+            .map_or("stream", |v| v)
+            .to_string();
+
+        if let zlmediakit_core::hook::HookResult::Deny(msg) = self
+            .hook
+            .on_play("__defaultVhost__", &app, &stream_name, &sign)
+            .await
+        {
+            warn!(
+                "WS-TS play rejected (hook): {}/{} - {}",
+                app, stream_name, msg
+            );
+            let close = WsFrame::close(3000, "unauthorized");
+            self.stream.write_all(&close.encode_server()).await?;
+            return Ok(());
+        }
+
+        if !self
+            .auth
+            .check("__defaultVhost__", &app, &stream_name, "play", &sign)
+        {
+            warn!("WS-TS play rejected (auth): {}/{}", app, stream_name);
+            let close = WsFrame::close(3000, "unauthorized");
+            self.stream.write_all(&close.encode_server()).await?;
+            return Ok(());
+        }
+
+        let source = match self
+            .source_manager
+            .get("__defaultVhost__", &app, &stream_name)
+        {
+            Some(s) => s,
+            None => {
+                let close = WsFrame::close(3004, "stream not found");
+                self.stream.write_all(&close.encode_server()).await?;
+                return Ok(());
+            }
+        };
+
+        let mut muxer = TsLiveMuxer::new();
+
+        let configs = {
+            let cache = source.gop_cache.read().await;
+            cache.get_config_frames()
+        };
+        for frame in &configs {
+            let ts = muxer.push_frame(frame);
+            if !ts.is_empty() {
+                self.stream
+                    .write_all(&WsFrame::binary(ts.to_vec()).encode_server())
+                    .await?;
+            }
+        }
+
+        let cached = {
+            let cache = source.gop_cache.read().await;
+            cache.get_latest_gop_frames()
+        };
+        for frame in &cached {
+            let ts = muxer.push_frame(frame);
+            if !ts.is_empty() {
+                self.stream
+                    .write_all(&WsFrame::binary(ts.to_vec()).encode_server())
+                    .await?;
+            }
+        }
+
+        let mut rx = source.subscribe();
+        let mut rx_closed = false;
+        loop {
+            tokio::select! {
+                result = rx.recv() => {
+                    match result {
+                        Ok(frame) => {
+                            let ts = muxer.push_frame(&frame);
+                            if !ts.is_empty() {
+                                let ws_frame = WsFrame::binary(ts.to_vec());
+                                if let Err(e) = self.stream.write_all(&ws_frame.encode_server()).await {
+                                    debug!("WS-TS write error: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            rx_closed = true;
+                            break;
+                        }
+                    }
+                }
+                read_result = self.read_frame() => {
+                    match read_result {
+                        Some(frame) => {
+                            match frame.opcode {
+                                0x8 => {
+                                    debug!("WS close frame received");
+                                    let close = WsFrame::close(1000, "bye");
+                                    let _ = self.stream.write_all(&close.encode_server()).await;
+                                    break;
+                                }
+                                0x9 => {
+                                    let pong = WsFrame::pong();
+                                    if let Err(e) = self.stream.write_all(&pong.encode_server()).await {
+                                        debug!("WS pong write error: {}", e);
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        if rx_closed {
+            let close = WsFrame::close(1001, "source gone");
+            let _ = self.stream.write_all(&close.encode_server()).await;
+        }
+
+        Ok(())
+    }
+
+    /// WebSocket live fMP4 playback (`/app/stream.live.mp4` over WebSocket).
+    pub async fn run_fmp4(&mut self, path: &str) -> anyhow::Result<()> {
+        let (app, resource, sign) = parse_path_sign(path);
+        let stream_name = resource
+            .strip_suffix(".live.mp4")
+            .map_or("stream", |v| v)
+            .to_string();
+
+        if let zlmediakit_core::hook::HookResult::Deny(msg) = self
+            .hook
+            .on_play("__defaultVhost__", &app, &stream_name, &sign)
+            .await
+        {
+            warn!(
+                "WS-fMP4 play rejected (hook): {}/{} - {}",
+                app, stream_name, msg
+            );
+            let close = WsFrame::close(3000, "unauthorized");
+            self.stream.write_all(&close.encode_server()).await?;
+            return Ok(());
+        }
+
+        if !self
+            .auth
+            .check("__defaultVhost__", &app, &stream_name, "play", &sign)
+        {
+            warn!("WS-fMP4 play rejected (auth): {}/{}", app, stream_name);
+            let close = WsFrame::close(3000, "unauthorized");
+            self.stream.write_all(&close.encode_server()).await?;
+            return Ok(());
+        }
+
+        let source = match self
+            .source_manager
+            .get("__defaultVhost__", &app, &stream_name)
+        {
+            Some(s) => s,
+            None => {
+                let close = WsFrame::close(3004, "stream not found");
+                self.stream.write_all(&close.encode_server()).await?;
+                return Ok(());
+            }
+        };
+
+        let mut muxer = Fmp4Muxer::new(90_000);
+
+        let configs = {
+            let cache = source.gop_cache.read().await;
+            cache.get_config_frames()
+        };
+        for frame in &configs {
+            muxer.push_frame(frame);
+        }
+        let init = muxer.init_segment();
+        self.stream
+            .write_all(&WsFrame::binary(init.data.to_vec()).encode_server())
+            .await?;
+
+        let cached = {
+            let cache = source.gop_cache.read().await;
+            cache.get_latest_gop_frames()
+        };
+        for frame in &cached {
+            if zlmediakit_core::gop_cache::is_config_frame(frame) {
+                continue;
+            }
+            muxer.push_frame(frame);
+            if frame.frame_type == FrameType::Video && frame.key_frame {
+                if let Some(seg) = muxer.flush_segment() {
+                    let ws_frame = WsFrame::binary(seg.data.to_vec());
+                    self.stream
+                        .write_all(&ws_frame.encode_server())
+                        .await?;
+                }
+            }
+        }
+        if let Some(seg) = muxer.flush_segment() {
+            let ws_frame = WsFrame::binary(seg.data.to_vec());
+            self.stream
+                .write_all(&ws_frame.encode_server())
+                .await?;
+        }
+
+        let mut rx = source.subscribe();
+        let mut rx_closed = false;
+        loop {
+            tokio::select! {
+                result = rx.recv() => {
+                    match result {
+                        Ok(frame) => {
+                            if zlmediakit_core::gop_cache::is_config_frame(&frame) {
+                                continue;
+                            }
+                            muxer.push_frame(&frame);
+                            if frame.frame_type == FrameType::Video && frame.key_frame {
+                                if let Some(seg) = muxer.flush_segment() {
+                                    let ws_frame = WsFrame::binary(seg.data.to_vec());
+                                    if let Err(e) = self.stream.write_all(&ws_frame.encode_server()).await {
+                                        debug!("WS-fMP4 write error: {}", e);
+                                        break;
+                                    }
+                                }
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,

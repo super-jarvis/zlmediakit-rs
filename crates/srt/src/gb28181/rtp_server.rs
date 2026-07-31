@@ -535,7 +535,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtp_h264_single_nalu_publishes_frame() {
-        let mgr = std::sync::Arc::new(MediaSourceManager::new());
+        let mgr = std::sync::Arc::new(MediaSourceManager::new(None));
         let rtp = RtpServerManager::new(mgr.clone(), 30000);
         let port = rtp
             .open(0, "__defaultVhost__", "rtp", "h264u", RtpPayloadType::H264, None)
@@ -563,7 +563,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_close_list() {
-        let mgr = std::sync::Arc::new(MediaSourceManager::new());
+        let mgr = std::sync::Arc::new(MediaSourceManager::new(None));
         let rtp = RtpServerManager::new(mgr.clone(), 31000);
         let p = rtp
             .open(31010, "__defaultVhost__", "rtp", "c1", RtpPayloadType::Ps, None)

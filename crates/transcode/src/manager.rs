@@ -551,7 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transcode_manager_list_and_del() {
-        let mgr = TranscodeManager::new(Arc::new(MediaSourceManager::new()));
+        let mgr = TranscodeManager::new(Arc::new(MediaSourceManager::new(None)));
         assert!(mgr.list_transcode().await.is_empty());
 
         let cfg = TranscodeConfig::from_api_params(

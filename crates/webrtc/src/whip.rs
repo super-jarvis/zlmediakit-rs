@@ -12,15 +12,11 @@
 use anyhow::{anyhow, Result};
 use bytes::{BufMut, Bytes, BytesMut};
 use std::sync::Arc;
-use tokio::sync::Notify;
+use tokio::sync::{broadcast, Notify};
 use tracing::{debug, info, warn};
-use webrtc::api::media_engine::MediaEngine;
-use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecParameters;
 use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
 use webrtc::rtp_transceiver::RTCRtpTransceiver;
@@ -29,22 +25,24 @@ use zlmediakit_core::config::IceServer;
 use zlmediakit_core::media_frame::{AudioInfo, CodecId, MediaFrame, TrackInfo, VideoInfo};
 use zlmediakit_core::media_source::MediaSource;
 
+use crate::datachannel::{attach_data_channels, DataMessage};
 use crate::h264_rtp::H264RtpDepacketizer;
 use crate::whep::build_rtc_config;
-
-const H264_MIME: &str = webrtc::api::media_engine::MIME_TYPE_H264;
-const OPUS_MIME: &str = webrtc::api::media_engine::MIME_TYPE_OPUS;
-const H264_CAP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
-const OPUS_CAP: &str = "minptime=10;useinbandfec=1";
 
 /// A live WHIP session. Held by the HTTP server until the client issues a
 /// DELETE or the server shuts down.
 pub struct WhipSession {
     pub pc: Arc<RTCPeerConnection>,
     pub resource: String,
+    data_tx: broadcast::Sender<DataMessage>,
 }
 
 impl WhipSession {
+    /// Subscribe to messages arriving over this session's WebRTC DataChannels.
+    pub fn subscribe_data(&self) -> broadcast::Receiver<DataMessage> {
+        self.data_tx.subscribe()
+    }
+
     /// Tear down the PeerConnection.
     pub async fn close(&self) {
         if let Err(e) = self.pc.close().await {
@@ -67,19 +65,14 @@ pub async fn whip_publish(
     ice_servers: Vec<IceServer>,
 ) -> Result<(String, WhipSession)> {
     crate::init_crypto();
-    let mut m = MediaEngine::default();
-    m.register_codec(
-        codec_params(H264_MIME, 90_000, 0, H264_CAP, 102),
-        RTPCodecType::Video,
-    )?;
-    m.register_codec(
-        codec_params(OPUS_MIME, 48_000, 2, OPUS_CAP, 111),
-        RTPCodecType::Audio,
-    )?;
-
-    let api = APIBuilder::new().with_media_engine(m).build();
+    let api = crate::engine::build_api(crate::engine::WebRtcRole::Receiver)?;
     let cfg = build_rtc_config(&ice_servers);
-    let pc = Arc::new(api.new_peer_connection(cfg).await?);
+    let pc = Arc::new(api.build().new_peer_connection(cfg).await?);
+
+    // DataChannel plumbing: any channel the publisher opens is forwarded into a
+    // broadcast pipe the HTTP layer (or a control plane) can subscribe to.
+    let (data_tx, _) = broadcast::channel(64);
+    attach_data_channels(&pc, data_tx.clone());
 
     // Advertise what this stream carries so a later WHEP player creates the
     // matching send tracks. A browser WHIP publisher typically sends H.264 +
@@ -147,27 +140,7 @@ pub async fn whip_publish(
     let answer_sdp = local.sdp.clone();
 
     info!("webrtc: WHIP session {} negotiated", resource);
-    Ok((answer_sdp, WhipSession { pc, resource }))
-}
-
-fn codec_params(
-    mime: &str,
-    clock: u32,
-    channels: u16,
-    fmtp: &str,
-    pt: u8,
-) -> RTCRtpCodecParameters {
-    RTCRtpCodecParameters {
-        capability: RTCRtpCodecCapability {
-            mime_type: mime.to_owned(),
-            clock_rate: clock,
-            channels,
-            sdp_fmtp_line: fmtp.to_string(),
-            rtcp_feedback: vec![],
-        },
-        payload_type: pt,
-        stats_id: String::new(),
-    }
+    Ok((answer_sdp, WhipSession { pc, resource, data_tx }))
 }
 
 async fn receive_video(track: Arc<TrackRemote>, source: Arc<MediaSource>) {

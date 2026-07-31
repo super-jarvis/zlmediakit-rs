@@ -153,7 +153,7 @@ async fn send_and_recv(
 
 #[tokio::test]
 async fn rtmp_audio_e2e_publish_audio_and_video() {
-    let mgr = Arc::new(MediaSourceManager::new());
+    let mgr = Arc::new(MediaSourceManager::new(None));
     let event_bus = Arc::new(EventBus::new(1024));
     let auth = StreamAuth::new(false, String::new());
 

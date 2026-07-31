@@ -65,7 +65,7 @@ struct TestServer {
 
 impl TestServer {
     async fn new(port: u16) -> Self {
-        let mgr = Arc::new(MediaSourceManager::new());
+        let mgr = Arc::new(MediaSourceManager::new(None));
         let auth = StreamAuth::new(false, String::new());
         let hook = HookClient::empty();
         let recorder = Arc::new(RecorderControl::new().0);
@@ -88,6 +88,7 @@ impl TestServer {
             rtp: None,
             sip: None,
             transcode: None,
+        session_manager: None,
         })
         .await
         .expect("HttpServer start");

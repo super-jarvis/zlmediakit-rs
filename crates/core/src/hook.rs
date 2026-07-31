@@ -525,7 +525,10 @@ mod tests {
             rt.block_on(client.on_record_mp4("v", "a", "s", "/tmp/x.mp4", 0, 0.0)),
             HookResult::Allow
         );
-        assert_eq!(client.on_rtsp_realm("v", "a", "s", "1.2.3.4"), None);
+        assert_eq!(
+            rt.block_on(client.on_rtsp_realm("v", "a", "s", "1.2.3.4")),
+            None
+        );
     }
 
     #[test]
