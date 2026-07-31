@@ -106,6 +106,9 @@ async fn wsflv_e2e_receives_flv_over_websocket() {
         www_root: None,
         ssl_cert: None,
         ssl_key: None,
+        rtp: None,
+        sip: None,
+        transcode: None,
     })
     .await
     .expect("HttpServer should start");

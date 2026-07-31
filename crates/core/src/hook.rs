@@ -48,6 +48,10 @@ impl HookClient {
         self.config.on_publish.is_none()
             && self.config.on_play.is_none()
             && self.config.on_stream_not_found.is_none()
+            && self.config.on_stream_none_reader.is_none()
+            && self.config.on_stream_changed.is_none()
+            && self.config.on_record_mp4.is_none()
+            && self.config.on_rtsp_realm.is_none()
     }
 
     // ── public hook entry-points ──────────────────────────────────────
@@ -66,7 +70,7 @@ impl HookClient {
             Some(u) => u,
             None => return HookResult::Allow,
         };
-        self.call_hook(url, vhost, app, stream, params).await
+        self.call_hook(url, vhost, app, stream, &[("params", params)]).await
     }
 
     /// Called before a player starts consuming a stream.
@@ -81,7 +85,7 @@ impl HookClient {
             Some(u) => u,
             None => return HookResult::Allow,
         };
-        self.call_hook(url, vhost, app, stream, params).await
+        self.call_hook(url, vhost, app, stream, &[("params", params)]).await
     }
 
     /// Called when a player requests a stream that does not exist.
@@ -95,7 +99,123 @@ impl HookClient {
             Some(u) => u,
             None => return HookResult::Allow,
         };
-        self.call_hook(url, vhost, app, stream, "").await
+        self.call_hook(url, vhost, app, stream, &[]).await
+    }
+
+    /// Called when a published stream loses its last reader (no players).
+    /// `regist` is `true` when a reader just left, alongside the current
+    /// total reader count.
+    pub async fn on_stream_none_reader(
+        &self,
+        vhost: &str,
+        app: &str,
+        stream: &str,
+        total_reader_count: usize,
+    ) -> HookResult {
+        let url = match &self.config.on_stream_none_reader {
+            Some(u) => u,
+            None => return HookResult::Allow,
+        };
+        self.call_hook(
+            url,
+            vhost,
+            app,
+            stream,
+            &[
+                ("regist", "0"),
+                ("totalReaderCount", &total_reader_count.to_string()),
+            ],
+        )
+        .await
+    }
+
+    /// Called whenever the reader count of a stream changes.
+    /// `regist` is `1` when a reader joined, `0` when one left.
+    pub async fn on_stream_changed(
+        &self,
+        vhost: &str,
+        app: &str,
+        stream: &str,
+        regist: bool,
+        total_reader_count: usize,
+    ) -> HookResult {
+        let url = match &self.config.on_stream_changed {
+            Some(u) => u,
+            None => return HookResult::Allow,
+        };
+        self.call_hook(
+            url,
+            vhost,
+            app,
+            stream,
+            &[
+                ("regist", if regist { "1" } else { "0" }),
+                ("totalReaderCount", &total_reader_count.to_string()),
+            ],
+        )
+        .await
+    }
+
+    /// Called once an MP4 recording file has been written to disk.
+    pub async fn on_record_mp4(
+        &self,
+        vhost: &str,
+        app: &str,
+        stream: &str,
+        file_path: &str,
+        file_size: u64,
+        time_len: f64,
+    ) -> HookResult {
+        let url = match &self.config.on_record_mp4 {
+            Some(u) => u,
+            None => return HookResult::Allow,
+        };
+        self.call_hook(
+            url,
+            vhost,
+            app,
+            stream,
+            &[
+                ("file_path", file_path),
+                ("file_size", &file_size.to_string()),
+                ("time_len", &time_len.to_string()),
+            ],
+        )
+        .await
+    }
+
+    /// Called to resolve the RTSP authentication realm for a stream.
+    /// Returns the realm string if the hook provides one, else `None`
+    /// (caller falls back to a default realm).
+    pub async fn on_rtsp_realm(
+        &self,
+        vhost: &str,
+        app: &str,
+        stream: &str,
+        ip: &str,
+    ) -> Option<String> {
+        let url = match &self.config.on_rtsp_realm {
+            Some(u) => u,
+            None => return None,
+        };
+        for attempt in 0..=self.config.retry {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            match self.try_call_realm(url, vhost, app, stream, ip).await {
+                Ok(realm) => return realm,
+                Err(e) => {
+                    tracing::warn!(
+                        "Hook call attempt {}/{} to {} failed: {}",
+                        attempt + 1,
+                        self.config.retry + 1,
+                        url,
+                        e
+                    );
+                }
+            }
+        }
+        None
     }
 
     // ── internal helpers ───────────────────────────────────────────────
@@ -108,13 +228,13 @@ impl HookClient {
         vhost: &str,
         app: &str,
         stream: &str,
-        params: &str,
+        extra: &[(&str, &str)],
     ) -> HookResult {
         for attempt in 0..=self.config.retry {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            match self.try_call(url, vhost, app, stream, params).await {
+            match self.try_call(url, vhost, app, stream, extra).await {
                 Ok(result) => return result,
                 Err(e) => {
                     tracing::warn!(
@@ -141,16 +261,18 @@ impl HookClient {
         vhost: &str,
         app: &str,
         stream: &str,
-        params: &str,
+        extra: &[(&str, &str)],
     ) -> anyhow::Result<HookResult> {
         let parsed = parse_url(url)?;
-        let body = format!(
-            "vhost={}&app={}&stream={}&params={}",
+        let mut body = format!(
+            "vhost={}&app={}&stream={}",
             url_encode(vhost),
             url_encode(app),
-            url_encode(stream),
-            url_encode(params)
+            url_encode(stream)
         );
+        for (k, v) in extra {
+            body.push_str(&format!("&{}={}", k, url_encode(v)));
+        }
 
         let request = format!(
             "POST {} HTTP/1.0\r\n\
@@ -218,6 +340,60 @@ impl HookClient {
                 Ok(HookResult::Allow)
             }
         }
+    }
+
+    /// Single realm-resolving hook attempt. Returns `Some(realm)` from the
+    /// response, `None` if the hook produced no realm (use default).
+    async fn try_call_realm(
+        &self,
+        url: &str,
+        vhost: &str,
+        app: &str,
+        stream: &str,
+        ip: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let parsed = parse_url(url)?;
+        let body = format!(
+            "vhost={}&app={}&stream={}&ip={}",
+            url_encode(vhost),
+            url_encode(app),
+            url_encode(stream),
+            url_encode(ip)
+        );
+        let request = format!(
+            "POST {} HTTP/1.0\r\n\
+             Host: {}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {}",
+            parsed.path, parsed.host, body.len(), body
+        );
+        let dur = Duration::from_secs(self.config.timeout_sec);
+        let mut stream = timeout(dur, TcpStream::connect(parsed.addr.as_str())).await??;
+        timeout(dur, stream.write_all(request.as_bytes())).await??;
+        let mut response = Vec::new();
+        timeout(dur, stream.read_to_end(&mut response)).await??;
+        let response_str = String::from_utf8_lossy(&response);
+        let first_line = response_str.lines().next().unwrap_or("");
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+        if parts.len() < 2 {
+            anyhow::bail!("Invalid HTTP response: no status line");
+        }
+        let status: u16 = parts[1].parse()?;
+        if status != 200 {
+            anyhow::bail!("Hook returned HTTP {}", status);
+        }
+        let body_start = response_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+        let json_body = response_str[body_start..].trim();
+        #[derive(Deserialize)]
+        struct RealmResponse {
+            #[serde(default)]
+            realm: Option<String>,
+        }
+        let resp: RealmResponse = serde_json::from_str(json_body)?;
+        Ok(resp.realm)
     }
 }
 
@@ -325,8 +501,31 @@ mod tests {
         assert!(cfg.on_publish.is_none());
         assert!(cfg.on_play.is_none());
         assert!(cfg.on_stream_not_found.is_none());
+        assert!(cfg.on_stream_none_reader.is_none());
+        assert!(cfg.on_stream_changed.is_none());
+        assert!(cfg.on_record_mp4.is_none());
+        assert!(cfg.on_rtsp_realm.is_none());
         assert_eq!(cfg.timeout_sec, 5);
         assert_eq!(cfg.retry, 1);
+    }
+
+    #[test]
+    fn hook_client_empty_allows_new_hooks() {
+        let client = HookClient::empty();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert_eq!(
+            rt.block_on(client.on_stream_none_reader("v", "a", "s", 0)),
+            HookResult::Allow
+        );
+        assert_eq!(
+            rt.block_on(client.on_stream_changed("v", "a", "s", true, 1)),
+            HookResult::Allow
+        );
+        assert_eq!(
+            rt.block_on(client.on_record_mp4("v", "a", "s", "/tmp/x.mp4", 0, 0.0)),
+            HookResult::Allow
+        );
+        assert_eq!(client.on_rtsp_realm("v", "a", "s", "1.2.3.4"), None);
     }
 
     #[test]
@@ -334,6 +533,9 @@ mod tests {
         let toml_str = r#"
 on_publish = "http://127.0.0.1:8080/index/hook/on_publish"
 on_play = "http://127.0.0.1:8080/index/hook/on_play"
+on_stream_none_reader = "http://127.0.0.1:8080/index/hook/on_stream_none_reader"
+on_record_mp4 = "http://127.0.0.1:8080/index/hook/on_record_mp4"
+on_rtsp_realm = "http://127.0.0.1:8080/index/hook/on_rtsp_realm"
 timeout_sec = 3
 retry = 2
 "#;
@@ -342,6 +544,9 @@ retry = 2
             cfg.on_publish.unwrap(),
             "http://127.0.0.1:8080/index/hook/on_publish"
         );
+        assert!(cfg.on_stream_none_reader.is_some());
+        assert!(cfg.on_record_mp4.is_some());
+        assert!(cfg.on_rtsp_realm.is_some());
         assert_eq!(cfg.timeout_sec, 3);
         assert_eq!(cfg.retry, 2);
     }

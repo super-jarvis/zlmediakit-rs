@@ -195,6 +195,28 @@ pub struct HookConfig {
     #[serde(default)]
     pub on_stream_not_found: Option<String>,
 
+    /// Called when a published stream has no more readers (all players gone).
+    /// POST params: vhost, app, stream, regist, totalReaderCount
+    #[serde(default)]
+    pub on_stream_none_reader: Option<String>,
+
+    /// Called when a stream's reader count changes (a player joins/leaves).
+    /// POST params: vhost, app, stream, regist, totalReaderCount
+    #[serde(default)]
+    pub on_stream_changed: Option<String>,
+
+    /// Called after an MP4 recording file is finalized on disk.
+    /// POST params: vhost, app, stream, period, file_path, file_size, url,
+    /// time_len, start_time, time_stamp
+    #[serde(default)]
+    pub on_record_mp4: Option<String>,
+
+    /// Called to resolve the RTSP authentication realm for a stream.
+    /// POST params: vhost, app, stream, ip
+    /// Response should include `realm` to use; absence falls back to default.
+    #[serde(default)]
+    pub on_rtsp_realm: Option<String>,
+
     /// Timeout in seconds for each HTTP hook call (default 5).
     #[serde(default = "default_hook_timeout")]
     pub timeout_sec: u64,
@@ -218,6 +240,10 @@ impl Default for HookConfig {
             on_publish: None,
             on_play: None,
             on_stream_not_found: None,
+            on_stream_none_reader: None,
+            on_stream_changed: None,
+            on_record_mp4: None,
+            on_rtsp_realm: None,
             timeout_sec: default_hook_timeout(),
             retry: default_hook_retry(),
         }
@@ -640,6 +666,10 @@ dir_root = false
         assert!(cfg.on_publish.is_none());
         assert!(cfg.on_play.is_none());
         assert!(cfg.on_stream_not_found.is_none());
+        assert!(cfg.on_stream_none_reader.is_none());
+        assert!(cfg.on_stream_changed.is_none());
+        assert!(cfg.on_record_mp4.is_none());
+        assert!(cfg.on_rtsp_realm.is_none());
         assert_eq!(cfg.timeout_sec, 5);
         assert_eq!(cfg.retry, 1);
     }

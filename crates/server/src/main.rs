@@ -222,6 +222,11 @@ async fn main() -> Result<()> {
         zlmediakit_transcode::TranscodeManager::new(source_manager.clone()),
     ));
 
+    // Global session registry, shared so the kick_session API can terminate
+    // any live connection regardless of which HTTP/API server accepted it.
+    let session_mgr: Option<Arc<zlmediakit_core::session::SessionManager>> =
+        Some(Arc::new(zlmediakit_core::session::SessionManager::new()));
+
     if config.http.enabled {
         let addr = format!("0.0.0.0:{}", config.http_port);
         let sm = source_manager.clone();
@@ -250,6 +255,7 @@ async fn main() -> Result<()> {
                 rtp: http_rtp.clone(),
                 sip: http_sip.clone(),
                 transcode: http_transcode.clone(),
+                session_manager: session_mgr.clone(),
                 record_root: std::path::PathBuf::from(&http_record_root),
                 www_root: http_www,
                 ssl_cert: http_cert,
@@ -299,6 +305,7 @@ async fn main() -> Result<()> {
                 rtp: api_rtp.clone(),
                 sip: api_sip.clone(),
                 transcode: api_transcode.clone(),
+                session_manager: session_mgr.clone(),
                 record_root: std::path::PathBuf::from(&api_record_root),
                 www_root: api_www,
                 ssl_cert: api_cert,

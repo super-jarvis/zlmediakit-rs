@@ -13,6 +13,7 @@ use zlmediakit_core::recorder::{RecorderCommand, RecorderControl};
 use zlmediakit_core::stream_proxy::StreamProxyControl;
 use zlmediakit_flv::FlvRecorder;
 use zlmediakit_http::server::{HttpServer, HttpServerConfig};
+use zlmediakit_mp4::Mp4Muxer;
 
 const TEST_PORT: u16 = 19158;
 const RECORD_BASE: &str = "/tmp/zlmediakit_vod_e2e";
@@ -124,6 +125,9 @@ async fn vod_flv_playback_with_range_and_dir_listing() {
         www_root: None,
         ssl_cert: None,
         ssl_key: None,
+        rtp: None,
+        sip: None,
+        transcode: None,
     })
     .await
     .expect("HttpServer start");
@@ -249,6 +253,152 @@ async fn find_free_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
+/// Builds a small MP4 file (H264 + AAC) entirely in-memory for VOD tests.
+fn build_sample_mp4() -> Vec<u8> {
+    use bytes::Bytes;
+    use zlmediakit_core::media_frame::{CodecId, MediaFrame};
+
+    let mut muxer = Mp4Muxer::new();
+    // H264 config (AVC sequence header).
+    let mut vcfg = MediaFrame::new_video(
+        0,
+        CodecId::H264,
+        0,
+        0,
+        0,
+        Bytes::from(vec![
+            0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x42, 0x00, 0x1e, 0xff, 0xe1, 0x00, 0x05, 0x67,
+            0x42, 0x00, 0x1e, 0xa6, 0x01, 0x68, 0xce, 0x3c, 0x80,
+        ]),
+        true,
+    );
+    vcfg.config_frame = true;
+    muxer.push_frame(&vcfg);
+    // AAC config (AudioSpecificConfig: 44100/2ch/AAC-LC).
+    let mut acfg = MediaFrame::new_audio(
+        1,
+        CodecId::AAC,
+        0,
+        0,
+        0,
+        Bytes::from(vec![0xAF, 0x00, 0x12, 0x10]),
+    );
+    acfg.config_frame = true;
+    muxer.push_frame(&acfg);
+    // 2 video frames.
+    for (i, ts) in [0u32, 33].iter().enumerate() {
+        let is_key = i == 0;
+        let data = vec![
+            if is_key { 0x17 } else { 0x27 },
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0xAA + i as u8,
+            0xBB,
+            0xCC,
+        ];
+        let f = MediaFrame::new_video(
+            0,
+            CodecId::H264,
+            *ts,
+            *ts as u64,
+            *ts as u64,
+            Bytes::from(data),
+            is_key,
+        );
+        muxer.push_frame(&f);
+    }
+    // 2 audio frames.
+    for ts in [0u32, 23] {
+        let f = MediaFrame::new_audio(
+            1,
+            CodecId::AAC,
+            ts,
+            ts as u64,
+            ts as u64,
+            Bytes::from(vec![0xAF, 0x01, 0x01, 0x02, 0x03]),
+        );
+        muxer.push_frame(&f);
+    }
+    muxer.finalize().to_vec()
+}
+
+#[tokio::test]
+async fn mp4_vod_flv_remux_playback() {
+    let port = find_free_port().await;
+    let _ = std::fs::remove_dir_all(RECORD_BASE);
+
+    let mgr = Arc::new(MediaSourceManager::new());
+    let auth = StreamAuth::new(false, String::new());
+    let hook = HookClient::empty();
+    let (recorder, _cmd_rx) = RecorderControl::new();
+    let recorder = Arc::new(recorder);
+    let proxy = Arc::new(StreamProxyControl::new().0);
+
+    let srv = HttpServer::new(HttpServerConfig {
+        addr: format!("127.0.0.1:{}", port),
+        source_manager: mgr.clone(),
+        auth,
+        hook,
+        recorder: recorder.clone(),
+        proxy,
+        pusher: Default::default(),
+        ffmpeg: Default::default(),
+        record_root: std::path::PathBuf::from(RECORD_BASE),
+        www_root: None,
+        ssl_cert: None,
+        ssl_key: None,
+        rtp: None,
+        sip: None,
+        transcode: None,
+    })
+    .await
+    .expect("HttpServer start");
+
+    tokio::spawn(async move {
+        let _ = srv.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Place a sample MP4 under the record root.
+    let dir = Path::new(RECORD_BASE).join("mp4vod");
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let mp4 = build_sample_mp4();
+    tokio::fs::write(dir.join("sample.mp4"), &mp4).await.unwrap();
+
+    // Request the MP4 file remuxed as an HTTP-FLV stream.
+    let (code, body, resp) = http_request(
+        &format!("GET /record/mp4vod/sample.mp4.flv HTTP/1.0\r\nHost: localhost\r\n\r\n"),
+        port,
+    )
+    .await;
+    assert_eq!(code, 200, "MP4 VOD FLV should return 200");
+    assert!(
+        resp.contains("Content-Type: video/x-flv"),
+        "response must be FLV"
+    );
+    assert_eq!(&body[..3], b"FLV", "stream must start with FLV header");
+    // onMetaData script tag should be present right after the header.
+    assert!(
+        body.windows(10).any(|w| w == b"onMetaData"),
+        "FLV stream must carry onMetaData"
+    );
+    // We expect video config + audio config + 2 video + 2 audio frames.
+    assert!(body.len() > 100, "FLV stream should be non-trivial");
+
+    // The raw MP4 is still served as a downloadable file.
+    let (code, raw, _) = http_request(
+        "GET /record/mp4vod/sample.mp4 HTTP/1.0\r\nHost: localhost\r\n\r\n",
+        port,
+    )
+    .await;
+    assert_eq!(code, 200, "raw MP4 should be served");
+    assert_eq!(&raw[4..8], b"ftyp", "raw MP4 should start with ftyp");
+
+    let _ = std::fs::remove_dir_all(RECORD_BASE);
+}
+
 #[tokio::test]
 async fn static_file_serving_from_www_root() {
     let www_temp = tempfile::TempDir::new().expect("temp dir for www_root");
@@ -290,6 +440,9 @@ async fn static_file_serving_from_www_root() {
         www_root: Some(www_root.clone()),
         ssl_cert: None,
         ssl_key: None,
+        rtp: None,
+        sip: None,
+        transcode: None,
     })
     .await
     .expect("HttpServer start");
@@ -383,6 +536,9 @@ async fn vod_auth_rejects_without_valid_sign() {
         www_root: None,
         ssl_cert: None,
         ssl_key: None,
+        rtp: None,
+        sip: None,
+        transcode: None,
     })
     .await
     .expect("HttpServer start");

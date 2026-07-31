@@ -90,6 +90,9 @@ async fn hls_e2e_generates_playlist_and_segments() {
         www_root: None,
         ssl_cert: None,
         ssl_key: None,
+        rtp: None,
+        sip: None,
+        transcode: None,
     })
     .await
     .expect("HttpServer should start");

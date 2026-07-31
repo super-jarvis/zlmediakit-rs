@@ -11,6 +11,7 @@ use zlmediakit_core::ffmpeg_source::FFmpegSourceControl;
 use zlmediakit_core::hook::HookResult;
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::recorder::RecorderControl;
+use zlmediakit_core::session::SessionManager;
 use zlmediakit_core::stream_proxy::StreamProxyControl;
 use zlmediakit_core::stream_pusher::StreamPusherControl;
 use zlmediakit_core::transport::TransportStream;
@@ -21,7 +22,7 @@ use zlmediakit_transcode::{TranscodeConfig, TranscodeManager};
 use crate::ws::{upgrade_response, WsSession};
 use zlmediakit_flv::FlvMuxer;
 use zlmediakit_mp4::fmp4::Fmp4Muxer;
-use zlmediakit_mp4::{build_mpd, DashRepresentation, Fmp4Segment};
+use zlmediakit_mp4::{build_mpd, DashRepresentation, Fmp4Segment, Mp4Demuxer, TrackKind};
 
 pub static HLS_SEGMENTS: once_cell::sync::Lazy<DashMap<String, Arc<RwLock<VecDeque<HlsSegment>>>>> =
     once_cell::sync::Lazy::new(DashMap::new);
@@ -53,6 +54,7 @@ pub struct HttpSession {
     rtp: Option<Arc<RtpServerManager>>,
     sip: Option<Arc<SipServer>>,
     transcode: Option<Arc<TranscodeManager>>,
+    session_manager: Option<Arc<SessionManager>>,
     record_root: PathBuf,
     www_root: Option<PathBuf>,
     buffer: BytesMut,
@@ -72,6 +74,7 @@ impl HttpSession {
         rtp: Option<Arc<RtpServerManager>>,
         sip: Option<Arc<SipServer>>,
         transcode: Option<Arc<TranscodeManager>>,
+        session_manager: Option<Arc<SessionManager>>,
         record_root: PathBuf,
         www_root: Option<PathBuf>,
     ) -> Self {
@@ -88,6 +91,7 @@ impl HttpSession {
             rtp,
             sip,
             transcode,
+            session_manager,
             record_root,
             www_root,
             buffer: BytesMut::with_capacity(4096),
@@ -95,6 +99,28 @@ impl HttpSession {
     }
 
     pub async fn run(mut self) -> anyhow::Result<()> {
+        // Register this connection in the global session registry (if any)
+        // so the kick_session API can terminate it. The guard removes the
+        // record when `run` returns.
+        struct SessionGuard {
+            mgr: Option<Arc<SessionManager>>,
+            id: Option<String>,
+        }
+        impl Drop for SessionGuard {
+            fn drop(&mut self) {
+                if let (Some(mgr), Some(id)) = (&self.mgr, &self.id) {
+                    mgr.remove(id);
+                }
+            }
+        }
+        let _guard = self.session_manager.as_ref().map(|m| {
+            let id = m.create(self.peer_addr.clone(), "HTTP".to_string());
+            SessionGuard {
+                mgr: self.session_manager.clone(),
+                id: Some(id),
+            }
+        });
+
         let mut read_buf = [0u8; 4096];
         match self.stream.read(&mut read_buf).await {
             Ok(0) => return Ok(()),
@@ -860,6 +886,18 @@ impl HttpSession {
             return self.send_401().await;
         }
 
+        // MP4 → FLV remux playback: a request for `<file>.mp4.flv` streams the
+        // MP4 file's media (parsed via Mp4Demuxer) as an HTTP-FLV stream so
+        // existing FLV players can play MP4 archives.
+        if rel.ends_with(".mp4.flv") {
+            let mp4_rel = rel.trim_end_matches(".flv");
+            let mp4_target = match Self::safe_join(&self.record_root, mp4_rel) {
+                Some(t) => t,
+                None => return self.send_404().await,
+            };
+            return self.handle_mp4_vod_flv(&mp4_target).await;
+        }
+
         let target = match Self::safe_join(&self.record_root, rel) {
             Some(t) => t,
             None => return self.send_404().await,
@@ -873,6 +911,64 @@ impl HttpSession {
         }
         let range = Self::extract_range(request);
         self.serve_file(&target, meta.len(), range).await
+    }
+
+    /// Serves an MP4 archive as an HTTP-FLV stream by demuxing it and
+    /// remuxing the frames on the fly (`.mp4.flv` URL convention).
+    async fn handle_mp4_vod_flv(&mut self, file: &Path) -> anyhow::Result<()> {
+        let bytes = match tokio::fs::read(file).await {
+            Ok(b) => b,
+            Err(_) => return self.send_404().await,
+        };
+        let demuxer = match Mp4Demuxer::from_bytes(&bytes) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("MP4 demux failed for {:?}: {:?}", file, e);
+                return self.send_404().await;
+            }
+        };
+
+        let tracks = demuxer.tracks();
+        if tracks.is_empty() {
+            return self.send_404().await;
+        }
+
+        let frames = demuxer.interleaved_media_frames();
+        if frames.is_empty() {
+            return self.send_404().await;
+        }
+
+        let video = tracks.iter().find(|t| t.handler == TrackKind::Video);
+        let audio = tracks.iter().find(|t| t.handler == TrackKind::Audio);
+        let width = video.map(|v| v.width).unwrap_or(0);
+        let height = video.map(|v| v.height).unwrap_or(0);
+        let fps = video.map(|v| v.fps).unwrap_or(0.0);
+        let audio_sample_rate = audio.map(|a| a.sample_rate).unwrap_or(0);
+        let video_codec = match video {
+            Some(v) => v.codec,
+            None => {
+                return self.send_404().await;
+            }
+        };
+
+        let response = "HTTP/1.1 200 OK\r\n\
+            Content-Type: video/x-flv\r\n\
+            Access-Control-Allow-Origin: *\r\n\
+            Cache-Control: no-cache\r\n\
+            Connection: close\r\n\r\n";
+        self.stream.write_all(response.as_bytes()).await?;
+
+        let mut muxer = FlvMuxer::new();
+        self.stream.write_all(&muxer.write_header()).await?;
+        let meta = muxer.write_metadata(width, height, fps, audio_sample_rate, video_codec);
+        self.stream.write_all(&meta).await?;
+
+        for frame in frames {
+            let tag = muxer.write_tag(&frame);
+            self.stream.write_all(&tag).await?;
+        }
+
+        Ok(())
     }
 
     /// Serves a file or directory from `www_root` for paths that didn't match
@@ -1115,6 +1211,53 @@ impl HttpSession {
                 }
                 self.send_json(&serde_json::json!({"code": 0, "result": list}))
                     .await?;
+            }
+            "kick_session" => {
+                let q = Self::parse_query(path);
+                let id = q.get("id").map(|s| s.as_str()).unwrap_or("");
+                let vhost = q
+                    .get("vhost")
+                    .map(|s| s.as_str())
+                    .unwrap_or("__defaultVhost__");
+                let app = q.get("app").map(|s| s.as_str()).unwrap_or("live");
+                let stream = q.get("stream").map(|s| s.as_str()).unwrap_or("");
+
+                let mgr = match &self.session_manager {
+                    Some(m) => m,
+                    None => {
+                        self.send_json(&serde_json::json!({
+                            "code": -400,
+                            "msg": "session manager not available"
+                        }))
+                        .await?;
+                        return Ok(());
+                    }
+                };
+
+                let mut count = 0usize;
+                if !id.is_empty() {
+                    if mgr.kick(id) {
+                        count = 1;
+                    }
+                } else if !stream.is_empty() {
+                    count = mgr.kick_by_stream(vhost, app, stream);
+                } else {
+                    self.send_json(&serde_json::json!({
+                        "code": -400,
+                        "msg": "missing id or stream param"
+                    }))
+                    .await?;
+                    return Ok(());
+                }
+                self.send_json(&serde_json::json!({
+                    "code": 0,
+                    "result": { "count": count },
+                    "msg": format!("kicked {} session(s)", count)
+                }))
+                .await?;
+            }
+            "getSnap" => {
+                self.handle_get_snap(path).await?;
             }
             "getMediaInfo" => {
                 let q = Self::parse_query(path);

@@ -85,6 +85,9 @@ impl TestServer {
             www_root: None,
             ssl_cert: None,
             ssl_key: None,
+            rtp: None,
+            sip: None,
+            transcode: None,
         })
         .await
         .expect("HttpServer start");

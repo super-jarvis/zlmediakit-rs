@@ -8,6 +8,7 @@ use zlmediakit_core::ffmpeg_source::FFmpegSourceControl;
 use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::recorder::RecorderControl;
+use zlmediakit_core::session::SessionManager;
 use zlmediakit_core::stream_proxy::StreamProxyControl;
 use zlmediakit_core::stream_pusher::StreamPusherControl;
 use zlmediakit_core::transport::{load_tls_config, TlsAcceptor, TransportStream};
@@ -29,6 +30,8 @@ pub struct HttpServerConfig {
     pub sip: Option<Arc<SipServer>>,
     /// Optional real-time transcoding manager (addTranscode API).
     pub transcode: Option<Arc<TranscodeManager>>,
+    /// Optional global session registry used by kick_session.
+    pub session_manager: Option<Arc<SessionManager>>,
     pub record_root: PathBuf,
     pub www_root: Option<PathBuf>,
     pub ssl_cert: Option<String>,
@@ -48,6 +51,7 @@ pub struct HttpServer {
     rtp: Option<Arc<RtpServerManager>>,
     sip: Option<Arc<SipServer>>,
     transcode: Option<Arc<TranscodeManager>>,
+    session_manager: Option<Arc<SessionManager>>,
     record_root: PathBuf,
     www_root: Option<PathBuf>,
 }
@@ -74,6 +78,7 @@ impl HttpServer {
             rtp: config.rtp,
             sip: config.sip,
             transcode: config.transcode,
+            session_manager: config.session_manager,
             record_root: config.record_root,
             www_root: config.www_root,
         })
@@ -96,6 +101,7 @@ impl HttpServer {
                     let rtp = self.rtp.clone();
                     let sip = self.sip.clone();
                     let transcode = self.transcode.clone();
+                    let session_manager = self.session_manager.clone();
                     let peer = peer_addr.to_string();
 
                     if let Some(ref tls) = tls {
@@ -117,6 +123,7 @@ impl HttpServer {
                                         rtp.clone(),
                                         sip.clone(),
                                         transcode.clone(),
+                                        session_manager.clone(),
                                         record_root.clone(),
                                         www_root.clone(),
                                     );
@@ -144,6 +151,7 @@ impl HttpServer {
                                 rtp.clone(),
                                 sip.clone(),
                                 transcode.clone(),
+                                session_manager.clone(),
                                 record_root.clone(),
                                 www_root.clone(),
                             );

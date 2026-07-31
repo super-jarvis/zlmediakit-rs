@@ -397,11 +397,11 @@ impl RtpStreamReceiver {
                 Some(v)
             }
         };
-        let last_recv_ms = {
-            let guard = self.stats.last_recv.blocking_lock();
-            guard
+        let last_recv_ms = match self.stats.last_recv.try_lock() {
+            Ok(guard) => guard
                 .map(|i| i.elapsed().as_millis() as u64)
-                .unwrap_or(u64::MAX)
+                .unwrap_or(u64::MAX),
+            Err(_) => u64::MAX,
         };
         let stream_exists = self
             .manager

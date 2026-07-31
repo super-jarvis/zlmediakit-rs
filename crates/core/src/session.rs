@@ -10,6 +10,10 @@ pub struct SessionInfo {
     pub peer_addr: String,
     pub protocol: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Optional stream binding (vhost, app, stream) recorded when this
+    /// session publishes or plays a specific stream. Enables kicking all
+    /// sessions of a stream at once.
+    pub stream: Option<(String, String, String)>,
 }
 
 pub struct SessionManager {
@@ -36,10 +40,18 @@ impl SessionManager {
             peer_addr: peer_addr.clone(),
             protocol,
             created_at: chrono::Utc::now(),
+            stream: None,
         };
         self.sessions.insert(id.clone(), info);
         info!("Session created: {} from {}", id, peer_addr);
         id
+    }
+
+    /// Records the stream a session is attached to (publish or play).
+    pub fn bind_stream(&self, id: &SessionId, vhost: &str, app: &str, stream: &str) {
+        if let Some(mut info) = self.sessions.get_mut(id) {
+            info.stream = Some((vhost.to_string(), app.to_string(), stream.to_string()));
+        }
     }
 
     pub fn remove(&self, id: &SessionId) {
@@ -48,8 +60,46 @@ impl SessionManager {
         }
     }
 
+    /// Kicks a single session by its id. Returns `true` if it existed.
+    pub fn kick(&self, id: &str) -> bool {
+        let existed = self.sessions.contains_key(id);
+        self.sessions.remove(id);
+        if existed {
+            info!("Session kicked: {}", id);
+        }
+        existed
+    }
+
+    /// Kicks every session bound to the given stream. Returns the number
+    /// of sessions kicked.
+    pub fn kick_by_stream(&self, vhost: &str, app: &str, stream: &str) -> usize {
+        let ids: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter_map(|entry| {
+                let info = entry.value();
+                match &info.stream {
+                    Some((v, a, s)) if v == vhost && a == app && s == stream => {
+                        Some(info.id.clone())
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        let n = ids.len();
+        for id in &ids {
+            self.remove(id);
+        }
+        n
+    }
+
     pub fn get(&self, id: &SessionId) -> Option<SessionInfo> {
         self.sessions.get(id).map(|s| s.clone())
+    }
+
+    /// Returns a snapshot of all live sessions.
+    pub fn list(&self) -> Vec<SessionInfo> {
+        self.sessions.iter().map(|e| e.value().clone()).collect()
     }
 
     pub fn count(&self) -> usize {

@@ -127,6 +127,9 @@ async fn recording_api_start_stop_via_http() {
         www_root: None,
         ssl_cert: None,
         ssl_key: None,
+        rtp: None,
+        sip: None,
+        transcode: None,
     })
     .await
     .expect("HttpServer start");
