@@ -1,10 +1,10 @@
 # ZLMediaKit-RS
 
-[![CI](https://github.com/ZLMediaKit/zlmediakit-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/ZLMediaKit/zlmediakit-rs/actions/workflows/ci.yml)
-[![Docker Publish](https://github.com/ZLMediaKit/zlmediakit-rs/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/ZLMediaKit/zlmediakit-rs/actions/workflows/docker-publish.yml)
+[![CI](https://github.com/super-jarvis/zlmediakit-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/ZLMediaKit/zlmediakit-rs/actions/workflows/ci.yml)
+[![Docker Publish](https://github.com/super-jarvis/zlmediakit-rs/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/ZLMediaKit/zlmediakit-rs/actions/workflows/docker-publish.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**ZLMediaKit-RS** 是 [ZLMediaKit](https://github.com/ZLMediaKit/ZLMediaKit) 的 Rust 语言实现。高性能、多协议流媒体服务器，利用 Rust 的内存安全和高性能异步运行时，提供与 ZLMediaKit 兼容的 HTTP API。
+**ZLMediaKit-RS** 是 [ZLMediaKit](https://github.com/super-jarvis/zlmediakit-rs) 的 Rust 语言实现。高性能、多协议流媒体服务器，利用 Rust 的内存安全和高性能异步运行时，提供与 ZLMediaKit 兼容的 HTTP API。
 
 ---
 
@@ -76,7 +76,7 @@
 
 ```bash
 # 拉取镜像
-docker pull ghcr.io/你的用户名/zlmediakit-rs:latest
+docker pull ghcr.io/super-jarvis/zlmediakit-rs:latest
 
 # 或本地构建
 docker build -t zlmediakit-rs .
@@ -291,7 +291,7 @@ cargo fmt --check
 ### 镜像地址
 
 ```
-ghcr.io/<你的用户名>/zlmediakit-rs:latest
+ghcr.io/super-jarvis/zlmediakit-rs:latest
 ```
 
 ### 环境变量
