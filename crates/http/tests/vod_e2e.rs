@@ -41,7 +41,19 @@ fn h264_config_data() -> Vec<u8> {
     let sps = [0x67u8, 0x42, 0x00, 0x1f, 0x9a, 0x66, 0x02, 0x80, 0x2c, 0x8e];
     let pps = [0x68u8, 0xee, 0x3c, 0x80];
     let mut v = vec![
-        0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x42, 0x00, 0x1f, 0xff, 0xe0 | 1, 0x00, 0x0a,
+        0x17,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x01,
+        0x42,
+        0x00,
+        0x1f,
+        0xff,
+        0xe0 | 1,
+        0x00,
+        0x0a,
     ];
     v.extend_from_slice(&sps);
     v.push(0x01);
@@ -93,7 +105,7 @@ async fn vod_flv_playback_with_range_and_dir_listing() {
 
     let mgr = Arc::new(MediaSourceManager::new());
     let auth = StreamAuth::new(false, String::new());
-        let hook = HookClient::empty();
+    let hook = HookClient::empty();
     let (recorder, cmd_rx) = RecorderControl::new();
     let recorder = Arc::new(recorder);
     let proxy = Arc::new(StreamProxyControl::new().0);
@@ -200,7 +212,10 @@ async fn vod_flv_playback_with_range_and_dir_listing() {
 
     // 2) Range request (seek).
     let (code, body, resp) = http_request(
-        &format!("GET {} HTTP/1.0\r\nHost: localhost\r\nRange: bytes=0-99\r\n\r\n", vod_path),
+        &format!(
+            "GET {} HTTP/1.0\r\nHost: localhost\r\nRange: bytes=0-99\r\n\r\n",
+            vod_path
+        ),
         port,
     )
     .await;
@@ -221,11 +236,7 @@ async fn vod_flv_playback_with_range_and_dir_listing() {
     );
 
     // 4) Path traversal is rejected.
-    let (code, _, _) = http_request(
-        "GET /record/../Cargo.toml HTTP/1.0\r\n\r\n",
-        port,
-    )
-    .await;
+    let (code, _, _) = http_request("GET /record/../Cargo.toml HTTP/1.0\r\n\r\n", port).await;
     assert_eq!(code, 404, "path traversal should be rejected");
 
     source.close();
@@ -259,7 +270,7 @@ async fn static_file_serving_from_www_root() {
 
     let mgr = Arc::new(MediaSourceManager::new());
     let auth = StreamAuth::new(false, String::new());
-        let hook = HookClient::empty();
+    let hook = HookClient::empty();
     let (recorder, _cmd_rx) = RecorderControl::new();
     let recorder = Arc::new(recorder);
     let proxy = Arc::new(StreamProxyControl::new().0);
@@ -295,8 +306,11 @@ async fn static_file_serving_from_www_root() {
     assert_eq!(&body, b"hello world\n", "static file content mismatch");
 
     // 2) Serve CSS with correct MIME type.
-    let (code, _, resp) =
-        http_request("GET /css/style.css HTTP/1.0\r\nHost: localhost\r\n\r\n", port).await;
+    let (code, _, resp) = http_request(
+        "GET /css/style.css HTTP/1.0\r\nHost: localhost\r\n\r\n",
+        port,
+    )
+    .await;
     assert_eq!(code, 200);
     assert!(
         resp.contains("Content-Type: text/css"),
@@ -326,8 +340,7 @@ async fn static_file_serving_from_www_root() {
     );
 
     // 5) Directory listing at www root.
-    let (code, body, _) =
-        http_request("GET / HTTP/1.0\r\nHost: localhost\r\n\r\n", port).await;
+    let (code, body, _) = http_request("GET / HTTP/1.0\r\nHost: localhost\r\n\r\n", port).await;
     assert_eq!(code, 200, "www root dir listing should return 200");
     let text = String::from_utf8_lossy(&body);
     assert!(
@@ -336,8 +349,11 @@ async fn static_file_serving_from_www_root() {
     );
 
     // 6) Path traversal from www_root is rejected.
-    let (code, _, _) =
-        http_request("GET /../etc/passwd HTTP/1.0\r\nHost: localhost\r\n\r\n", port).await;
+    let (code, _, _) = http_request(
+        "GET /../etc/passwd HTTP/1.0\r\nHost: localhost\r\n\r\n",
+        port,
+    )
+    .await;
     assert_eq!(code, 404, "path traversal from www_root should be rejected");
 }
 
@@ -348,7 +364,7 @@ async fn vod_auth_rejects_without_valid_sign() {
     let secret = "test-auth-secret";
     let mgr = Arc::new(MediaSourceManager::new());
     let auth = StreamAuth::new(true, secret.to_string());
-        let hook = HookClient::empty();
+    let hook = HookClient::empty();
     let (recorder, cmd_rx) = RecorderControl::new();
     let recorder = Arc::new(recorder);
     let proxy = Arc::new(StreamProxyControl::new().0);
@@ -389,8 +405,15 @@ async fn vod_auth_rejects_without_valid_sign() {
     let cfg = MediaFrame::new_video(0, CodecId::H264, 0, 0, 0, h264_config_data().into(), false);
     source.publish_and_cache(cfg).await;
     let key = MediaFrame::new_video(
-        0, CodecId::H264, 0, 0, 0,
-        vec![0x17, 0x01, 0x00, 0x00, 0x00, 0x05, 0x65, 0x9a, 0x00, 0x15, 0x20].into(),
+        0,
+        CodecId::H264,
+        0,
+        0,
+        0,
+        vec![
+            0x17, 0x01, 0x00, 0x00, 0x00, 0x05, 0x65, 0x9a, 0x00, 0x15, 0x20,
+        ]
+        .into(),
         true,
     );
     source.publish_and_cache(key).await;
@@ -416,13 +439,22 @@ async fn vod_auth_rejects_without_valid_sign() {
     let vod_path = format!("/record/live/vodtest/{}", flv_name);
 
     // 1) Without sign → 401.
-    let (code, _, _) =
-        http_request(&format!("GET {} HTTP/1.0\r\nHost: localhost\r\n\r\n", vod_path), port).await;
-    assert_eq!(code, 401, "VOD without sign should be rejected when auth_enabled");
+    let (code, _, _) = http_request(
+        &format!("GET {} HTTP/1.0\r\nHost: localhost\r\n\r\n", vod_path),
+        port,
+    )
+    .await;
+    assert_eq!(
+        code, 401,
+        "VOD without sign should be rejected when auth_enabled"
+    );
 
     // 2) With invalid sign → 401.
     let (code, _, _) = http_request(
-        &format!("GET {}?sign=badtoken HTTP/1.0\r\nHost: localhost\r\n\r\n", vod_path),
+        &format!(
+            "GET {}?sign=badtoken HTTP/1.0\r\nHost: localhost\r\n\r\n",
+            vod_path
+        ),
         port,
     )
     .await;
@@ -430,9 +462,15 @@ async fn vod_auth_rejects_without_valid_sign() {
 
     // 3) With valid sign → 200.
     let stream_path = format!("live/vodtest/{}", flv_name);
-    let valid_sign = generate_sign(secret, &["__defaultVhost__", "record", &stream_path, "play"]);
+    let valid_sign = generate_sign(
+        secret,
+        &["__defaultVhost__", "record", &stream_path, "play"],
+    );
     let (code, body, _) = http_request(
-        &format!("GET {}?sign={} HTTP/1.0\r\nHost: localhost\r\n\r\n", vod_path, valid_sign),
+        &format!(
+            "GET {}?sign={} HTTP/1.0\r\nHost: localhost\r\n\r\n",
+            vod_path, valid_sign
+        ),
         port,
     )
     .await;
@@ -440,14 +478,26 @@ async fn vod_auth_rejects_without_valid_sign() {
     assert_eq!(&body[..3], b"FLV", "VOD with valid sign should serve FLV");
 
     // 4) Directory listing without sign → 401.
-    let (code, _, _) =
-        http_request("GET /record/live/vodtest/ HTTP/1.0\r\nHost: localhost\r\n\r\n", port).await;
-    assert_eq!(code, 401, "VOD dir listing without sign should be rejected when auth_enabled");
+    let (code, _, _) = http_request(
+        "GET /record/live/vodtest/ HTTP/1.0\r\nHost: localhost\r\n\r\n",
+        port,
+    )
+    .await;
+    assert_eq!(
+        code, 401,
+        "VOD dir listing without sign should be rejected when auth_enabled"
+    );
 
     // 5) Directory listing with valid sign → 200.
-    let dir_sign = generate_sign(secret, &["__defaultVhost__", "record", "live/vodtest", "play"]);
+    let dir_sign = generate_sign(
+        secret,
+        &["__defaultVhost__", "record", "live/vodtest", "play"],
+    );
     let (code, body, _) = http_request(
-        &format!("GET /record/live/vodtest/?sign={} HTTP/1.0\r\nHost: localhost\r\n\r\n", dir_sign),
+        &format!(
+            "GET /record/live/vodtest/?sign={} HTTP/1.0\r\nHost: localhost\r\n\r\n",
+            dir_sign
+        ),
         port,
     )
     .await;

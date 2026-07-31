@@ -1,8 +1,10 @@
 //! Video transcoding via ffmpeg subprocess.
 //!
 //! Supports H.264 ↔ H.265 re-encoding with optional resolution scaling
-//! and bitrate control. Each `VideoTranscoder` spawns a long-running
-//! ffmpeg process with stdin/stdout pipes.
+//! and bitrate control. [`VideoTranscoder`] performs batch transcoding,
+//! while the [`manager`] module provides real-time `addTranscode`-style
+//! sessions that subscribe to a [`zlmediakit_core::MediaSource`], transcode
+//! continuously, and re-publish the output as a new playable stream.
 //!
 //! # Data format
 //! - **Input**: Annex-B byte-stream (start-code delimited NAL units).
@@ -10,10 +12,14 @@
 //! - **Output**: Annex-B byte-stream, parsed back into individual NAL
 //!   unit groups (one group per output access unit / frame).
 
+pub mod manager;
+
+pub use manager::{TranscodeInfo, TranscodeManager, TranscodeSession};
+
+use anyhow::Context;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
-use anyhow::Context;
 use tracing::{debug, warn};
 
 /// Configuration for a video transcode pipeline.
@@ -31,6 +37,18 @@ pub struct TranscodeConfig {
     pub bitrate: String,
     /// ffmpeg preset (default "ultrafast" for low-latency streaming).
     pub preset: String,
+    /// Optional output stream suffix. The transcoded stream is published as
+    /// `{stream}{name}` (default `_out`). Ignored when `dst_stream` is set.
+    pub name: String,
+    /// Optional explicit output app. Defaults to the source app.
+    pub dst_app: Option<String>,
+    /// Optional explicit output stream name. Defaults to `{stream}{name}`.
+    pub dst_stream: Option<String>,
+    /// If true, only transcode video and copy audio through untouched.
+    /// (Audio pass-through is currently best-effort and may be dropped.)
+    pub enable_audio: bool,
+    /// ffmpeg bin path (default "ffmpeg").
+    pub ffmpeg_bin: String,
 }
 
 impl Default for TranscodeConfig {
@@ -42,7 +60,67 @@ impl Default for TranscodeConfig {
             height: None,
             bitrate: "2M".into(),
             preset: "ultrafast".into(),
+            name: "_out".into(),
+            dst_app: None,
+            dst_stream: None,
+            enable_audio: false,
+            ffmpeg_bin: "ffmpeg".into(),
         }
+    }
+}
+
+impl TranscodeConfig {
+    /// Builds a config from ZLMediaKit-style API params. Missing fields fall
+    /// back to defaults. `name` / `dst_app` / `dst_stream` control the output
+    /// stream identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_api_params(
+        input_codec: &str,
+        output_codec: &str,
+        scale: Option<(u32, u32)>,
+        bitrate: Option<&str>,
+        name: Option<&str>,
+        dst_app: Option<&str>,
+        dst_stream: Option<&str>,
+        ffmpeg_bin: Option<&str>,
+    ) -> Self {
+        let mut cfg = TranscodeConfig::default();
+        if !input_codec.is_empty() {
+            cfg.input_codec = input_codec.to_string();
+        }
+        if !output_codec.is_empty() {
+            cfg.output_codec = output_codec.to_ascii_lowercase();
+        }
+        if let Some((w, h)) = scale {
+            cfg.width = Some(w);
+            cfg.height = Some(h);
+        }
+        if let Some(b) = bitrate {
+            if !b.is_empty() {
+                cfg.bitrate = b.to_string();
+            }
+        }
+        if let Some(n) = name {
+            if !n.is_empty() {
+                cfg.name = n.to_string();
+            }
+        }
+        if let Some(a) = dst_app {
+            if !a.is_empty() {
+                cfg.dst_app = Some(a.to_string());
+            }
+        }
+        if let Some(s) = dst_stream {
+            if !s.is_empty() {
+                cfg.dst_stream = Some(s.to_string());
+            }
+        }
+        if let Some(f) = ffmpeg_bin {
+            if !f.is_empty() {
+                cfg.ffmpeg_bin = f.to_string();
+            }
+        }
+        cfg
     }
 }
 
@@ -109,19 +187,14 @@ impl VideoTranscoder {
 
         // Scale filter if requested
         if let (Some(w), Some(h)) = (config.width, config.height) {
-            cmd.arg("-vf")
-                .arg(format!("scale={}:{}", w, h));
+            cmd.arg("-vf").arg(format!("scale={}:{}", w, h));
         } else if let Some(w) = config.width {
-            cmd.arg("-vf")
-                .arg(format!("scale={}:-1", w));
+            cmd.arg("-vf").arg(format!("scale={}:-1", w));
         } else if let Some(h) = config.height {
-            cmd.arg("-vf")
-                .arg(format!("scale=-1:{}", h));
+            cmd.arg("-vf").arg(format!("scale=-1:{}", h));
         }
 
-        cmd.arg("-f")
-            .arg(output_format)
-            .arg("pipe:1");
+        cmd.arg("-f").arg(output_format).arg("pipe:1");
 
         debug!("spawning ffmpeg: {:?}", cmd);
 
@@ -275,12 +348,8 @@ pub fn flv_video_to_annex_b(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut pos = 5; // skip FLV tag header (1 + 1 + 3)
     while pos + 4 <= data.len() {
-        let nalu_len = u32::from_be_bytes([
-            data[pos],
-            data[pos + 1],
-            data[pos + 2],
-            data[pos + 3],
-        ]) as usize;
+        let nalu_len =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
         if pos + nalu_len > data.len() {
             break;
@@ -405,11 +474,16 @@ fn contains_idr(data: &[u8], codec: &str) -> bool {
             // H.265 IRAP: nal_unit_type >= 16 && nal_unit_type <= 21
             // (BLA, IDR, CRA). The NAL unit type is in the lower 6 bits
             // of the first byte after the start code.
-            for window in data.windows(4) {
+            for window in data.windows(5) {
+                let b = if window[2] == 1 {
+                    window[3]
+                } else {
+                    // 4-byte start code (00 00 00 01): first NAL byte is window[4]
+                    window[4]
+                };
                 if (window[0] == 0 && window[1] == 0 && window[2] == 1)
                     || (window[0] == 0 && window[1] == 0 && window[2] == 0 && window[3] == 1)
                 {
-                    let b = if window[2] == 1 { window[3] } else { window[3] };
                     let nal_type = (b >> 1) & 0x3F;
                     if (16..=21).contains(&nal_type) {
                         return true;

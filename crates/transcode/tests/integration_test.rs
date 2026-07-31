@@ -9,14 +9,22 @@ use zlmediakit_transcode::{parse_annex_b_frames, TranscodeConfig, VideoTranscode
 async fn generate_h264_test_stream() -> Vec<u8> {
     let output = tokio::process::Command::new("ffmpeg")
         .args([
-            "-f", "lavfi",
-            "-i", "testsrc=duration=1:size=320x240:rate=10",
-            "-frames:v", "5",
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
-            "-pix_fmt", "yuv420p",
-            "-f", "h264",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=1:size=320x240:rate=10",
+            "-frames:v",
+            "5",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "h264",
             "pipe:1",
         ])
         .stdout(std::process::Stdio::piped())
@@ -32,14 +40,22 @@ async fn generate_h264_test_stream() -> Vec<u8> {
 async fn generate_h265_test_stream() -> Vec<u8> {
     let output = tokio::process::Command::new("ffmpeg")
         .args([
-            "-f", "lavfi",
-            "-i", "testsrc=duration=1:size=320x240:rate=10",
-            "-frames:v", "5",
-            "-c:v", "libx265",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
-            "-pix_fmt", "yuv420p",
-            "-f", "hevc",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=1:size=320x240:rate=10",
+            "-frames:v",
+            "5",
+            "-c:v",
+            "libx265",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "hevc",
             "pipe:1",
         ])
         .stdout(std::process::Stdio::piped())
@@ -67,6 +83,11 @@ async fn transcode_h264_to_h264_passthrough() {
         height: None,
         bitrate: "1M".into(),
         preset: "ultrafast".into(),
+        name: "_out".into(),
+        dst_app: None,
+        dst_stream: None,
+        enable_audio: false,
+        ffmpeg_bin: "ffmpeg".into(),
     };
 
     let transcoder = VideoTranscoder::new(&config)
@@ -107,6 +128,11 @@ async fn transcode_h264_to_h264_with_scale() {
         height: Some(120),
         bitrate: "500k".into(),
         preset: "ultrafast".into(),
+        name: "_out".into(),
+        dst_app: None,
+        dst_stream: None,
+        enable_audio: false,
+        ffmpeg_bin: "ffmpeg".into(),
     };
 
     let transcoder = VideoTranscoder::new(&config)
@@ -139,6 +165,11 @@ async fn transcode_h264_to_h265() {
         height: None,
         bitrate: "1M".into(),
         preset: "ultrafast".into(),
+        name: "_out".into(),
+        dst_app: None,
+        dst_stream: None,
+        enable_audio: false,
+        ffmpeg_bin: "ffmpeg".into(),
     };
 
     let transcoder = VideoTranscoder::new(&config)
@@ -175,6 +206,11 @@ async fn transcode_h265_to_h264() {
         height: Some(120),
         bitrate: "800k".into(),
         preset: "ultrafast".into(),
+        name: "_out".into(),
+        dst_app: None,
+        dst_stream: None,
+        enable_audio: false,
+        ffmpeg_bin: "ffmpeg".into(),
     };
 
     let transcoder = VideoTranscoder::new(&config)
@@ -199,9 +235,8 @@ async fn transcode_h265_to_h264() {
 #[test]
 fn flv_to_annex_b_with_real_config() {
     let avcc_config = [
-        0x01, 0x64, 0x00, 0x0a, 0xFF, 0xE1, 0x00, 0x04,
-        0x67, 0x64, 0x00, 0x0a, 0x01, 0x00, 0x04, 0x68,
-        0xee, 0x3c, 0x80,
+        0x01, 0x64, 0x00, 0x0a, 0xFF, 0xE1, 0x00, 0x04, 0x67, 0x64, 0x00, 0x0a, 0x01, 0x00, 0x04,
+        0x68, 0xee, 0x3c, 0x80,
     ];
 
     let mut flv_frame = vec![0x17, 0x00, 0x00, 0x00, 0x00];
@@ -226,6 +261,6 @@ fn parse_annex_b_frames_smoke() {
 
     let frames = parse_annex_b_frames(&stream, "h264");
     assert_eq!(frames.len(), 2);
-    assert!(frames[0].key_frame);  // type=5 → IDR
+    assert!(frames[0].key_frame); // type=5 → IDR
     assert!(!frames[1].key_frame); // type=1 → non-IDR
 }

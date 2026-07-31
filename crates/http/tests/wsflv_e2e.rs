@@ -88,7 +88,7 @@ async fn wsflv_e2e_receives_flv_over_websocket() {
     let (recorder, _recv) = RecorderControl::new();
     let (proxy, _table, _proxy_rx) = StreamProxyControl::new();
     let auth = StreamAuth::new(false, String::new());
-        let hook = HookClient::empty();
+    let hook = HookClient::empty();
     let mgr = Arc::new(MediaSourceManager::new());
 
     let hook = HookClient::empty();

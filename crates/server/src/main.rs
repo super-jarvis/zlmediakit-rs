@@ -10,22 +10,22 @@ use tokio::sync::Notify;
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::config::{RecordConfig, ServerConfig};
 use zlmediakit_core::event_bus::{Event, EventBus};
+use zlmediakit_core::ffmpeg_source::{FFmpegCmd, FFmpegSourceControl, FFmpegTable};
 use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::media_source::{MediaSource, MediaSourceManager};
 use zlmediakit_core::recorder::{RecorderCommand, RecorderControl};
-use zlmediakit_core::ffmpeg_source::{FFmpegCmd, FFmpegSourceControl, FFmpegTable};
 use zlmediakit_core::stream_proxy::{ProxyCmd, ProxyTable, StreamProxyControl};
 use zlmediakit_core::stream_pusher::{PusherCmd, PusherTable, StreamPusherControl};
 use zlmediakit_flv::FlvRecorder;
 use zlmediakit_hls::HlsRecorder;
 use zlmediakit_http::{HttpServer, HttpServerConfig};
 use zlmediakit_mp4::recorder::Mp4Recorder;
-use zlmediakit_srt::{Gb28181Server, RtpServerManager, SipServer, SrtServer, SrtServerConfig};
 use zlmediakit_rtmp::pull_client as rtmp_pull_client;
 use zlmediakit_rtmp::push_client as rtmp_push_client;
 use zlmediakit_rtmp::RtmpServer;
 use zlmediakit_rtsp::rtsp_pull_start;
 use zlmediakit_rtsp::RtspServer;
+use zlmediakit_srt::{Gb28181Server, RtpServerManager, SipServer, SrtServer, SrtServerConfig};
 use zlmediakit_webrtc::WebRtcServer;
 
 #[derive(Parser, Debug)]
@@ -207,11 +207,20 @@ async fn main() -> Result<()> {
             Ok(srv) => {
                 gb28181_rtp = Some(srv.rtp.clone());
                 gb28181_sip = Some(srv.sip.clone());
-                info!("GB28181 SIP server started on port {}", config.gb28181.sip_port);
+                info!(
+                    "GB28181 SIP server started on port {}",
+                    config.gb28181.sip_port
+                );
             }
             Err(e) => error!("Failed to start GB28181 server: {}", e),
         }
     }
+
+    // Real-time transcoding manager (addTranscode API). Always available; the
+    // HTTP API returns an error if a caller asks for it but ffmpeg is missing.
+    let transcode_mgr: Option<Arc<zlmediakit_transcode::TranscodeManager>> = Some(Arc::new(
+        zlmediakit_transcode::TranscodeManager::new(source_manager.clone()),
+    ));
 
     if config.http.enabled {
         let addr = format!("0.0.0.0:{}", config.http_port);
@@ -227,6 +236,7 @@ async fn main() -> Result<()> {
         let http_hook = hook.clone();
         let http_rtp = gb28181_rtp.clone();
         let http_sip = gb28181_sip.clone();
+        let http_transcode = transcode_mgr.clone();
         let handle = tokio::spawn(async move {
             match HttpServer::new(HttpServerConfig {
                 addr: addr.clone(),
@@ -239,6 +249,7 @@ async fn main() -> Result<()> {
                 ffmpeg,
                 rtp: http_rtp.clone(),
                 sip: http_sip.clone(),
+                transcode: http_transcode.clone(),
                 record_root: std::path::PathBuf::from(&http_record_root),
                 www_root: http_www,
                 ssl_cert: http_cert,
@@ -274,6 +285,7 @@ async fn main() -> Result<()> {
         let api_hook = hook.clone();
         let api_rtp = gb28181_rtp.clone();
         let api_sip = gb28181_sip.clone();
+        let api_transcode = transcode_mgr.clone();
         let handle = tokio::spawn(async move {
             match HttpServer::new(HttpServerConfig {
                 addr: addr.clone(),
@@ -286,6 +298,7 @@ async fn main() -> Result<()> {
                 ffmpeg,
                 rtp: api_rtp.clone(),
                 sip: api_sip.clone(),
+                transcode: api_transcode.clone(),
                 record_root: std::path::PathBuf::from(&api_record_root),
                 www_root: api_www,
                 ssl_cert: api_cert,
@@ -363,8 +376,15 @@ async fn main() -> Result<()> {
         );
         let rec = recorder_control.clone();
         let handle = tokio::spawn(async move {
-            run_recorder_supervisor(sup_event, sup_sm, rec_cfg, record_base, recorder_cmd_rx, rec)
-                .await;
+            run_recorder_supervisor(
+                sup_event,
+                sup_sm,
+                rec_cfg,
+                record_base,
+                recorder_cmd_rx,
+                rec,
+            )
+            .await;
         });
         handles.push(handle);
     }
@@ -392,7 +412,10 @@ async fn main() -> Result<()> {
             };
             let ok = proxy_control.add(&entry.url, &entry.vhost, &entry.app, &stream);
             if ok {
-                info!("Auto proxy: {} -> {}/{}/{}", entry.url, entry.vhost, entry.app, stream);
+                info!(
+                    "Auto proxy: {} -> {}/{}/{}",
+                    entry.url, entry.vhost, entry.app, stream
+                );
             } else {
                 warn!("Auto proxy: {} already active, skipping", stream);
             }
@@ -675,14 +698,13 @@ async fn run_pusher_supervisor(
     }
 }
 
-fn spawn_push_task(
-    cmd: PusherCmd,
-    source_manager: Arc<MediaSourceManager>,
-    active: PusherTable,
-) {
+fn spawn_push_task(cmd: PusherCmd, source_manager: Arc<MediaSourceManager>, active: PusherTable) {
     let key = format!("{}/{}/{}", cmd.vhost, cmd.app, cmd.stream);
     tokio::spawn(async move {
-        info!("Stream pusher: {}/{}/{} -> {}", cmd.vhost, cmd.app, cmd.stream, cmd.dst_url);
+        info!(
+            "Stream pusher: {}/{}/{} -> {}",
+            cmd.vhost, cmd.app, cmd.stream, cmd.dst_url
+        );
         if let Err(e) = rtmp_push_client::start(
             &cmd.dst_url,
             &cmd.vhost,
@@ -727,17 +749,26 @@ async fn run_ffmpeg_supervisor(
 
         match Command::new("ffmpeg")
             .args([
-                "-i", &cmd.src_url,
-                "-c", "copy",
-                "-f", "flv",
-                "-timeout", &cmd.timeout_ms.to_string(),
+                "-i",
+                &cmd.src_url,
+                "-c",
+                "copy",
+                "-f",
+                "flv",
+                "-timeout",
+                &cmd.timeout_ms.to_string(),
                 &dst_url,
             ])
             .kill_on_drop(true)
             .spawn()
         {
             Ok(child) => {
-                info!("FFmpeg source started: {} -> {} (pid={:?})", cmd.src_url, dst_url, child.id());
+                info!(
+                    "FFmpeg source started: {} -> {} (pid={:?})",
+                    cmd.src_url,
+                    dst_url,
+                    child.id()
+                );
                 children.insert(key, child);
             }
             Err(e) => {
@@ -773,20 +804,22 @@ async fn run_cluster_push_relay(
 
     loop {
         match rx.recv().await {
-            Ok(Event::StreamPublish { vhost, app, stream, .. }) => {
+            Ok(Event::StreamPublish {
+                vhost, app, stream, ..
+            }) => {
                 for peer in &peers {
                     let _peer_vhost = if peer.vhost.is_empty() {
                         &vhost
                     } else {
                         &peer.vhost
                     };
-                    let peer_app = if peer.app.is_empty() { "live" } else { &peer.app };
-                    let push_url = format!(
-                        "{}/{}/{}",
-                        peer.url.trim_end_matches('/'),
-                        peer_app,
-                        stream
-                    );
+                    let peer_app = if peer.app.is_empty() {
+                        "live"
+                    } else {
+                        &peer.app
+                    };
+                    let push_url =
+                        format!("{}/{}/{}", peer.url.trim_end_matches('/'), peer_app, stream);
 
                     let sm = source_manager.clone();
                     let src_vhost = vhost.clone();

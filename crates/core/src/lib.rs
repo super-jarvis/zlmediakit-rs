@@ -21,7 +21,7 @@ pub use config::Gb28181Config;
 pub use error::{Error, Result};
 pub use event_bus::{Event, EventBus};
 pub use hook::{HookClient, HookConfig, HookResult};
-pub use media_frame::{AudioInfo, FrameType, MediaFrame, MediaInfo, TrackInfo, VideoInfo};
+pub use media_frame::{AudioInfo, CodecId, FrameType, MediaFrame, MediaInfo, TrackInfo, VideoInfo};
 pub use media_sink::MediaSink;
 pub use media_source::{MediaSource, MediaSourceManager, SourceId};
 pub use recorder::{RecorderCommand, RecorderControl};

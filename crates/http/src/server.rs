@@ -12,6 +12,7 @@ use zlmediakit_core::stream_proxy::StreamProxyControl;
 use zlmediakit_core::stream_pusher::StreamPusherControl;
 use zlmediakit_core::transport::{load_tls_config, TlsAcceptor, TransportStream};
 use zlmediakit_srt::{RtpServerManager, SipServer};
+use zlmediakit_transcode::TranscodeManager;
 
 /// Bundled configuration for the HTTP server.
 pub struct HttpServerConfig {
@@ -26,6 +27,8 @@ pub struct HttpServerConfig {
     /// Optional GB28181 / openRtpServer RTP reception manager.
     pub rtp: Option<Arc<RtpServerManager>>,
     pub sip: Option<Arc<SipServer>>,
+    /// Optional real-time transcoding manager (addTranscode API).
+    pub transcode: Option<Arc<TranscodeManager>>,
     pub record_root: PathBuf,
     pub www_root: Option<PathBuf>,
     pub ssl_cert: Option<String>,
@@ -44,6 +47,7 @@ pub struct HttpServer {
     ffmpeg: Arc<FFmpegSourceControl>,
     rtp: Option<Arc<RtpServerManager>>,
     sip: Option<Arc<SipServer>>,
+    transcode: Option<Arc<TranscodeManager>>,
     record_root: PathBuf,
     www_root: Option<PathBuf>,
 }
@@ -69,6 +73,7 @@ impl HttpServer {
             ffmpeg: config.ffmpeg,
             rtp: config.rtp,
             sip: config.sip,
+            transcode: config.transcode,
             record_root: config.record_root,
             www_root: config.www_root,
         })
@@ -90,6 +95,7 @@ impl HttpServer {
                     let ffmpeg = self.ffmpeg.clone();
                     let rtp = self.rtp.clone();
                     let sip = self.sip.clone();
+                    let transcode = self.transcode.clone();
                     let peer = peer_addr.to_string();
 
                     if let Some(ref tls) = tls {
@@ -110,6 +116,7 @@ impl HttpServer {
                                         ffmpeg,
                                         rtp.clone(),
                                         sip.clone(),
+                                        transcode.clone(),
                                         record_root.clone(),
                                         www_root.clone(),
                                     );
@@ -136,6 +143,7 @@ impl HttpServer {
                                 ffmpeg,
                                 rtp.clone(),
                                 sip.clone(),
+                                transcode.clone(),
                                 record_root.clone(),
                                 www_root.clone(),
                             );

@@ -72,27 +72,27 @@ async fn http_get(path: &str) -> (u16, Vec<u8>) {
 async fn hls_e2e_generates_playlist_and_segments() {
     let mgr = Arc::new(MediaSourceManager::new());
     let auth = StreamAuth::new(false, String::new());
-        let hook = HookClient::empty();
+    let hook = HookClient::empty();
     let recorder = Arc::new(RecorderControl::new().0);
     let proxy = Arc::new(StreamProxyControl::new().0);
 
     let addr = format!("127.0.0.1:{}", TEST_PORT);
     let srv = HttpServer::new(HttpServerConfig {
-            addr,
-            source_manager: mgr.clone(),
-            auth,
-            hook,
-            recorder,
-            proxy,
-            pusher: Default::default(),
-            ffmpeg: Default::default(),
-            record_root: std::path::PathBuf::from("./record"),
-            www_root: None,
-            ssl_cert: None,
-            ssl_key: None,
-        })
-        .await
-        .expect("HttpServer should start");
+        addr,
+        source_manager: mgr.clone(),
+        auth,
+        hook,
+        recorder,
+        proxy,
+        pusher: Default::default(),
+        ffmpeg: Default::default(),
+        record_root: std::path::PathBuf::from("./record"),
+        www_root: None,
+        ssl_cert: None,
+        ssl_key: None,
+    })
+    .await
+    .expect("HttpServer should start");
 
     tokio::spawn(async move {
         let _ = srv.run().await;

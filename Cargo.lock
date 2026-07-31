@@ -3125,6 +3125,7 @@ dependencies = [
  "zlmediakit-hls",
  "zlmediakit-mp4",
  "zlmediakit-srt",
+ "zlmediakit-transcode",
 ]
 
 [[package]]
@@ -3203,6 +3204,7 @@ dependencies = [
  "zlmediakit-rtmp",
  "zlmediakit-rtsp",
  "zlmediakit-srt",
+ "zlmediakit-transcode",
  "zlmediakit-webrtc",
 ]
 
@@ -3228,6 +3230,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "chrono",
+ "dashmap",
+ "serde",
  "tokio",
  "tracing",
  "zlmediakit-codec",

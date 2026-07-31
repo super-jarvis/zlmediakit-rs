@@ -7,15 +7,16 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 use zlmediakit_core::auth::StreamAuth;
+use zlmediakit_core::ffmpeg_source::FFmpegSourceControl;
 use zlmediakit_core::hook::HookResult;
 use zlmediakit_core::media_source::MediaSourceManager;
-use zlmediakit_core::ffmpeg_source::FFmpegSourceControl;
 use zlmediakit_core::recorder::RecorderControl;
 use zlmediakit_core::stream_proxy::StreamProxyControl;
 use zlmediakit_core::stream_pusher::StreamPusherControl;
 use zlmediakit_core::transport::TransportStream;
-use zlmediakit_srt::{RtpPayloadType, RtpServerManager, SipServer};
 use zlmediakit_hls::muxer::{self, HlsSegment};
+use zlmediakit_srt::{RtpPayloadType, RtpServerManager, SipServer};
+use zlmediakit_transcode::{TranscodeConfig, TranscodeManager};
 
 use crate::ws::{upgrade_response, WsSession};
 use zlmediakit_flv::FlvMuxer;
@@ -26,17 +27,18 @@ pub static HLS_SEGMENTS: once_cell::sync::Lazy<DashMap<String, Arc<RwLock<VecDeq
     once_cell::sync::Lazy::new(DashMap::new);
 
 /// DASH fMP4 segment cache. Key = stream URL (vhost/app/stream).
-pub static DASH_SEGMENTS: once_cell::sync::Lazy<DashMap<String, Arc<RwLock<VecDeque<Fmp4Segment>>>>> =
-    once_cell::sync::Lazy::new(DashMap::new);
+pub static DASH_SEGMENTS: once_cell::sync::Lazy<
+    DashMap<String, Arc<RwLock<VecDeque<Fmp4Segment>>>>,
+> = once_cell::sync::Lazy::new(DashMap::new);
 
 /// CMAF HLS segment cache (fMP4-based). Key = stream URL.
-pub static CMAF_SEGMENTS: once_cell::sync::Lazy<DashMap<String, Arc<RwLock<VecDeque<zlmediakit_hls::HlsSegment>>>>> =
-    once_cell::sync::Lazy::new(DashMap::new);
+pub static CMAF_SEGMENTS: once_cell::sync::Lazy<
+    DashMap<String, Arc<RwLock<VecDeque<zlmediakit_hls::HlsSegment>>>>,
+> = once_cell::sync::Lazy::new(DashMap::new);
 
 /// CMAF HLS init segment cache. Key = stream URL.
-pub static CMAF_INIT_CACHE: once_cell::sync::Lazy<
-    DashMap<String, Arc<RwLock<Option<Vec<u8>>>>>,
-> = once_cell::sync::Lazy::new(DashMap::new);
+pub static CMAF_INIT_CACHE: once_cell::sync::Lazy<DashMap<String, Arc<RwLock<Option<Vec<u8>>>>>> =
+    once_cell::sync::Lazy::new(DashMap::new);
 
 pub struct HttpSession {
     stream: TransportStream,
@@ -50,6 +52,7 @@ pub struct HttpSession {
     ffmpeg: Arc<FFmpegSourceControl>,
     rtp: Option<Arc<RtpServerManager>>,
     sip: Option<Arc<SipServer>>,
+    transcode: Option<Arc<TranscodeManager>>,
     record_root: PathBuf,
     www_root: Option<PathBuf>,
     buffer: BytesMut,
@@ -68,6 +71,7 @@ impl HttpSession {
         ffmpeg: Arc<FFmpegSourceControl>,
         rtp: Option<Arc<RtpServerManager>>,
         sip: Option<Arc<SipServer>>,
+        transcode: Option<Arc<TranscodeManager>>,
         record_root: PathBuf,
         www_root: Option<PathBuf>,
     ) -> Self {
@@ -83,6 +87,7 @@ impl HttpSession {
             ffmpeg,
             rtp,
             sip,
+            transcode,
             record_root,
             www_root,
             buffer: BytesMut::with_capacity(4096),
@@ -130,7 +135,12 @@ impl HttpSession {
             if !ws_key.is_empty() {
                 let response = upgrade_response(ws_key);
                 self.stream.write_all(response.as_bytes()).await?;
-                let mut ws = WsSession::new(self.stream, self.source_manager, self.auth, self.hook.clone());
+                let mut ws = WsSession::new(
+                    self.stream,
+                    self.source_manager,
+                    self.auth,
+                    self.hook.clone(),
+                );
                 return ws.run_flv(path).await;
             }
         }
@@ -438,22 +448,27 @@ impl HttpSession {
         let stream_name = resource
             .strip_suffix(".cmav.m3u8")
             .and_then(|s| s.strip_suffix("/hls"))
-            .unwrap_or_else(|| {
-                resource
-                    .strip_suffix(".cmav.m3u8")
-                    .unwrap_or("stream")
-            })
+            .unwrap_or_else(|| resource.strip_suffix(".cmav.m3u8").unwrap_or("stream"))
             .to_string();
 
-        if let HookResult::Deny(_) = self.hook.on_play("__defaultVhost__", &app, &stream_name, &sign).await {
+        if let HookResult::Deny(_) = self
+            .hook
+            .on_play("__defaultVhost__", &app, &stream_name, &sign)
+            .await
+        {
             return self.send_401().await;
         }
 
-        if !self.auth.check("__defaultVhost__", &app, &stream_name, "play", &sign) {
+        if !self
+            .auth
+            .check("__defaultVhost__", &app, &stream_name, "play", &sign)
+        {
             return self.send_401().await;
         }
 
-        let source = self.source_manager.get("__defaultVhost__", &app, &stream_name);
+        let source = self
+            .source_manager
+            .get("__defaultVhost__", &app, &stream_name);
         let source = match source {
             Some(s) => s,
             None => return self.send_404().await,
@@ -485,12 +500,7 @@ impl HttpSession {
         });
 
         let segs_guard = _segs.read().await;
-        let m3u8 = zlmediakit_hls::cmaf::build_cmaf_playlist(
-            &segs_guard,
-            4,
-            &app,
-            &stream_name,
-        );
+        let m3u8 = zlmediakit_hls::cmaf::build_cmaf_playlist(&segs_guard, 4, &app, &stream_name);
 
         let body = m3u8;
         let response = format!(
@@ -517,11 +527,16 @@ impl HttpSession {
             .map_or("stream", |v| v)
             .to_string();
 
-        if !self.auth.check("__defaultVhost__", &app, &stream_name, "play", &sign) {
+        if !self
+            .auth
+            .check("__defaultVhost__", &app, &stream_name, "play", &sign)
+        {
             return self.send_401().await;
         }
 
-        let source = self.source_manager.get("__defaultVhost__", &app, &stream_name);
+        let source = self
+            .source_manager
+            .get("__defaultVhost__", &app, &stream_name);
         let source = match source {
             Some(s) => s,
             None => return self.send_404().await,
@@ -609,7 +624,10 @@ impl HttpSession {
                 .split('/')
                 .nth(1)
                 .unwrap_or("stream");
-            if let Some(source) = self.source_manager.get("__defaultVhost__", &app, stream_name) {
+            if let Some(source) = self
+                .source_manager
+                .get("__defaultVhost__", &app, stream_name)
+            {
                 if let Some(init_cache) = CMAF_INIT_CACHE.get(&source.url()) {
                     let guard = init_cache.read().await;
                     if let Some(ref data) = *guard {
@@ -641,11 +659,16 @@ impl HttpSession {
             rest
         };
 
-        if !self.auth.check("__defaultVhost__", &app, stream_name, "play", &sign) {
+        if !self
+            .auth
+            .check("__defaultVhost__", &app, stream_name, "play", &sign)
+        {
             return self.send_401().await;
         }
 
-        let source = self.source_manager.get("__defaultVhost__", &app, stream_name);
+        let source = self
+            .source_manager
+            .get("__defaultVhost__", &app, stream_name);
         let source = match source {
             Some(s) => s,
             None => return self.send_404().await,
@@ -709,13 +732,21 @@ impl HttpSession {
         if !segment_part.starts_with("seg-") {
             return Ok(false);
         }
-        let idx: u64 = segment_part.strip_prefix("seg-").and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
+        let idx: u64 = segment_part
+            .strip_prefix("seg-")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(u64::MAX);
 
-        if !self.auth.check("__defaultVhost__", &app, stream_name, "play", &sign) {
+        if !self
+            .auth
+            .check("__defaultVhost__", &app, stream_name, "play", &sign)
+        {
             return Ok(false);
         }
 
-        let source = self.source_manager.get("__defaultVhost__", &app, stream_name);
+        let source = self
+            .source_manager
+            .get("__defaultVhost__", &app, stream_name);
         let source = match source {
             Some(s) => s,
             None => return Ok(false),
@@ -758,11 +789,16 @@ impl HttpSession {
             let _seq: u64 = parts.last().unwrap_or(&"0").parse().unwrap_or(0);
         }
 
-        if !self.auth.check("__defaultVhost__", &app, stream_name, "play", &sign) {
+        if !self
+            .auth
+            .check("__defaultVhost__", &app, stream_name, "play", &sign)
+        {
             return self.send_401().await;
         }
 
-        let source = self.source_manager.get("__defaultVhost__", &app, stream_name);
+        let source = self
+            .source_manager
+            .get("__defaultVhost__", &app, stream_name);
         let source = match source {
             Some(s) => s,
             None => return self.send_404().await,
@@ -901,7 +937,10 @@ impl HttpSession {
             status_line, mime, len
         );
         if status_line.starts_with("206") {
-            header.push_str(&format!("Content-Range: bytes {}-{}/{}\r\n", start, end, total));
+            header.push_str(&format!(
+                "Content-Range: bytes {}-{}/{}\r\n",
+                start, end, total
+            ));
         }
         header.push_str("Connection: close\r\n\r\n");
         self.stream.write_all(header.as_bytes()).await?;
@@ -1164,6 +1203,146 @@ impl HttpSession {
                 }))
                 .await?;
             }
+            "addTranscode" => {
+                let mgr = match &self.transcode {
+                    Some(m) => m.clone(),
+                    None => {
+                        self.send_json(
+                            &serde_json::json!({"code": -1, "msg": "transcode disabled"}),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                let q = Self::parse_query(path);
+                let vhost = q
+                    .get("vhost")
+                    .map(|s| s.as_str())
+                    .unwrap_or("__defaultVhost__")
+                    .to_string();
+                let app = q
+                    .get("app")
+                    .map(|s| s.as_str())
+                    .unwrap_or("live")
+                    .to_string();
+                let stream = match q.get("stream").map(|s| s.as_str()) {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => {
+                        self.send_json(&serde_json::json!({"code": -400, "msg": "missing stream"}))
+                            .await?;
+                        return Ok(());
+                    }
+                };
+                let input_codec = q.get("acodec").map(|s| s.as_str()).unwrap_or("");
+                let codec = q.get("code").map(|s| s.as_str()).unwrap_or("H264");
+                // ZLMediaKit uses numeric-ish / named codes; normalize.
+                let output_codec = match codec.to_uppercase().as_str() {
+                    "H264" | "H_264" | "264" | "AVC" | "7" => "h264",
+                    "H265" | "H_265" | "265" | "HEVC" | "16777216" => "h265",
+                    _ => "h264",
+                };
+                let scale = q.get("scale").and_then(|s| {
+                    let mut it = s.split('x');
+                    let w = it.next()?.parse::<u32>().ok()?;
+                    let h = it.next()?.parse::<u32>().ok()?;
+                    Some((w, h))
+                });
+                let bitrate = q.get("bitrate").map(|s| s.as_str());
+                let name = q.get("name").map(|s| s.as_str());
+                let dst_app = q.get("dst_app").map(|s| s.as_str());
+                let dst_stream = q.get("dst_stream").map(|s| s.as_str());
+                let config = TranscodeConfig::from_api_params(
+                    input_codec,
+                    output_codec,
+                    scale,
+                    bitrate,
+                    name,
+                    dst_app,
+                    dst_stream,
+                    None,
+                );
+                match mgr.add_transcode(&vhost, &app, &stream, config).await {
+                    Ok(info) => {
+                        self.send_json(&serde_json::json!({
+                            "code": 0,
+                            "result": {
+                                "key": info.key,
+                                "dst_app": info.dst_app,
+                                "dst_stream": info.dst_stream,
+                                "url": format!("{}/{}/{}", vhost, info.dst_app, info.dst_stream),
+                            }
+                        }))
+                        .await?;
+                    }
+                    Err(e) => {
+                        self.send_json(&serde_json::json!({"code": -1, "msg": e.to_string()}))
+                            .await?;
+                    }
+                }
+            }
+            "delTranscode" => {
+                let mgr = match &self.transcode {
+                    Some(m) => m.clone(),
+                    None => {
+                        self.send_json(
+                            &serde_json::json!({"code": -1, "msg": "transcode disabled"}),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                let q = Self::parse_query(path);
+                let key = q.get("key").map(|s| s.as_str()).unwrap_or("").to_string();
+                let ok = if key.is_empty() {
+                    false
+                } else {
+                    mgr.del_transcode(&key)
+                };
+                self.send_json(&serde_json::json!({"code": 0, "result": ok}))
+                    .await?;
+            }
+            "getTranscode" => {
+                let mgr = match &self.transcode {
+                    Some(m) => m.clone(),
+                    None => {
+                        self.send_json(
+                            &serde_json::json!({"code": -1, "msg": "transcode disabled"}),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                let q = Self::parse_query(path);
+                let key = q.get("key").map(|s| s.as_str()).unwrap_or("").to_string();
+                match mgr.get_transcode(&key).await {
+                    Some(info) => {
+                        self.send_json(&serde_json::to_value(&info).unwrap())
+                            .await?
+                    }
+                    None => {
+                        self.send_json(&serde_json::json!({"code": -404, "msg": "not found"}))
+                            .await?
+                    }
+                }
+            }
+            "getTranscodeList" => {
+                let mgr = match &self.transcode {
+                    Some(m) => m.clone(),
+                    None => {
+                        self.send_json(
+                            &serde_json::json!({"code": -1, "msg": "transcode disabled"}),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                let list = mgr.list_transcode().await;
+                self.send_json(&serde_json::json!({
+                    "code": 0,
+                    "result": list.iter().map(|i| serde_json::to_value(i).unwrap()).collect::<Vec<_>>()
+                }))
+                .await?;
+            }
             "closeStream" => {
                 let q = Self::parse_query(path);
                 let vhost = q
@@ -1246,7 +1425,11 @@ impl HttpSession {
             }
             "addStreamPusher" => {
                 let q = Self::parse_query(path);
-                let dst_url = q.get("dst_url").map(|s| s.as_str()).unwrap_or("").to_string();
+                let dst_url = q
+                    .get("dst_url")
+                    .map(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let vhost = q
                     .get("vhost")
                     .map(|s| s.as_str())
@@ -1322,8 +1505,16 @@ impl HttpSession {
             }
             "addFFmpegSource" => {
                 let q = Self::parse_query(path);
-                let src_url = q.get("src_url").map(|s| s.as_str()).unwrap_or("").to_string();
-                let dst_url = q.get("dst_url").map(|s| s.as_str()).unwrap_or("").to_string();
+                let src_url = q
+                    .get("src_url")
+                    .map(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let dst_url = q
+                    .get("dst_url")
+                    .map(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let vhost = q
                     .get("vhost")
                     .map(|s| s.as_str())
@@ -1356,7 +1547,9 @@ impl HttpSession {
                 } else {
                     stream
                 };
-                let ok = self.ffmpeg.add(&src_url, &dst_url, &vhost, &app, &stream, timeout_ms);
+                let ok = self
+                    .ffmpeg
+                    .add(&src_url, &dst_url, &vhost, &app, &stream, timeout_ms);
                 if ok {
                     self.send_json(
                         &serde_json::json!({"code": 0, "result": "ffmpeg source started"}),
@@ -1386,8 +1579,10 @@ impl HttpSession {
                     )
                     .await?;
                 } else {
-                    self.send_json(&serde_json::json!({"code": -404, "msg": "ffmpeg source not found"}))
-                        .await?;
+                    self.send_json(
+                        &serde_json::json!({"code": -404, "msg": "ffmpeg source not found"}),
+                    )
+                    .await?;
                 }
             }
             "getFFmpegSourceList" => {
@@ -1488,10 +1683,7 @@ impl HttpSession {
                     let q = Self::parse_query(path);
                     let port: u16 = q.get("port").and_then(|v| v.parse().ok()).unwrap_or(0);
                     let ssrc: Option<u32> = q.get("ssrc").and_then(|v| v.parse().ok());
-                    let app = q
-                        .get("app")
-                        .cloned()
-                        .unwrap_or_else(|| "rtp".to_string());
+                    let app = q.get("app").cloned().unwrap_or_else(|| "rtp".to_string());
                     let stream = q
                         .get("stream_id")
                         .cloned()
@@ -1508,12 +1700,14 @@ impl HttpSession {
                         .to_string();
                     match rtp.open(port, &vhost, &app, &stream, payload, ssrc).await {
                         Ok(p) => {
-                            let _ = self.send_json(&serde_json::json!({"code": 0, "result": p})).await;
+                            let _ = self
+                                .send_json(&serde_json::json!({"code": 0, "result": p}))
+                                .await;
                         }
                         Err(e) => {
-                            let _ =
-                                self.send_json(&serde_json::json!({"code": -1, "msg": e.to_string()}))
-                                    .await;
+                            let _ = self
+                                .send_json(&serde_json::json!({"code": -1, "msg": e.to_string()}))
+                                .await;
                         }
                     }
                 } else {
@@ -1525,12 +1719,11 @@ impl HttpSession {
             "closeRtpServer" => {
                 if let Some(rtp) = &self.rtp {
                     let q = Self::parse_query(path);
-                    let port: u16 = q
-                        .get("port")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
+                    let port: u16 = q.get("port").and_then(|v| v.parse().ok()).unwrap_or(0);
                     rtp.close(port);
-                    let _ = self.send_json(&serde_json::json!({"code": 0, "result": "ok"})).await;
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": 0, "result": "ok"}))
+                        .await;
                 } else {
                     let _ = self
                         .send_json(&serde_json::json!({"code": -1, "msg": "rtp server disabled"}))
@@ -1540,7 +1733,9 @@ impl HttpSession {
             "listRtpServer" => {
                 if let Some(rtp) = &self.rtp {
                     let list = rtp.list();
-                    let _ = self.send_json(&serde_json::json!({"code": 0, "result": list})).await;
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": 0, "result": list}))
+                        .await;
                 } else {
                     let _ = self
                         .send_json(&serde_json::json!({"code": -1, "msg": "rtp server disabled"}))
@@ -1550,12 +1745,11 @@ impl HttpSession {
             "getRtpInfo" => {
                 if let Some(rtp) = &self.rtp {
                     let q = Self::parse_query(path);
-                    let port: u16 = q
-                        .get("port")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
+                    let port: u16 = q.get("port").and_then(|v| v.parse().ok()).unwrap_or(0);
                     let info = rtp.get_info(port);
-                    let _ = self.send_json(&serde_json::json!({"code": 0, "result": info})).await;
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": 0, "result": info}))
+                        .await;
                 } else {
                     let _ = self
                         .send_json(&serde_json::json!({"code": -1, "msg": "rtp server disabled"}))
@@ -1573,12 +1767,14 @@ impl HttpSession {
                         .unwrap_or_default();
                     match sip.invite(&device, &channel).await {
                         Ok(port) => {
-                            let _ = self.send_json(&serde_json::json!({"code": 0, "result": port})).await;
+                            let _ = self
+                                .send_json(&serde_json::json!({"code": 0, "result": port}))
+                                .await;
                         }
                         Err(e) => {
-                            let _ =
-                                self.send_json(&serde_json::json!({"code": -1, "msg": e.to_string()}))
-                                    .await;
+                            let _ = self
+                                .send_json(&serde_json::json!({"code": -1, "msg": e.to_string()}))
+                                .await;
                         }
                     }
                 } else {
@@ -1599,7 +1795,9 @@ impl HttpSession {
                             rtp.close(info.port);
                         }
                     }
-                    let _ = self.send_json(&serde_json::json!({"code": 0, "result": "ok"})).await;
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": 0, "result": "ok"}))
+                        .await;
                 } else {
                     let _ = self
                         .send_json(&serde_json::json!({"code": -1, "msg": "rtp server disabled"}))

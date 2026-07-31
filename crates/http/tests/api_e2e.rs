@@ -86,8 +86,8 @@ impl TestServer {
             ssl_cert: None,
             ssl_key: None,
         })
-            .await
-            .expect("HttpServer start");
+        .await
+        .expect("HttpServer start");
 
         tokio::spawn(async move {
             let _ = srv.run().await;

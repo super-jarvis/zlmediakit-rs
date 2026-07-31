@@ -108,7 +108,7 @@ async fn recording_api_start_stop_via_http() {
 
     let mgr = Arc::new(MediaSourceManager::new());
     let auth = StreamAuth::new(false, String::new());
-        let hook = HookClient::empty();
+    let hook = HookClient::empty();
     let (recorder, cmd_rx) = RecorderControl::new();
     let recorder = Arc::new(recorder);
     let proxy = Arc::new(StreamProxyControl::new().0);
