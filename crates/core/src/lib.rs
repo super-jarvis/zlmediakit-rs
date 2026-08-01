@@ -10,6 +10,7 @@ pub mod media_sink;
 pub mod media_source;
 pub mod recorder;
 pub mod session;
+pub mod signal;
 pub mod stream_proxy;
 pub mod stream_pusher;
 pub mod transport;

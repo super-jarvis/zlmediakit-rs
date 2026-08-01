@@ -251,7 +251,12 @@ async fn rtsp_digest_fallback_default_realm() {
 
     let mgr = Arc::new(MediaSourceManager::new(None));
     let event_bus = Arc::new(EventBus::new(1024));
-    let auth = StreamAuth::new_with_realm(true, secret.to_string(), Some(realm.to_string()));
+    let auth = StreamAuth::new_with_realm(
+        true,
+        secret.to_string(),
+        Some(realm.to_string()),
+        std::collections::HashMap::new(),
+    );
     // No hook configured.
     let hook: Option<Arc<HookClient>> = None;
 
