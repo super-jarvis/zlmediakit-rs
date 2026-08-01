@@ -4,6 +4,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::event_bus::EventBus;
+use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::transport::{load_tls_config, TlsAcceptor, TransportStream};
 
@@ -13,6 +14,7 @@ pub struct RtspServer {
     source_manager: Arc<MediaSourceManager>,
     event_bus: Arc<EventBus>,
     auth: Arc<StreamAuth>,
+    hook: Option<Arc<HookClient>>,
 }
 
 impl RtspServer {
@@ -21,6 +23,7 @@ impl RtspServer {
         source_manager: Arc<MediaSourceManager>,
         event_bus: Arc<EventBus>,
         auth: Arc<StreamAuth>,
+        hook: Option<Arc<HookClient>>,
         ssl_cert: Option<String>,
         ssl_key: Option<String>,
     ) -> anyhow::Result<Self> {
@@ -37,6 +40,7 @@ impl RtspServer {
             source_manager,
             event_bus,
             auth,
+            hook,
         })
     }
 
@@ -48,6 +52,7 @@ impl RtspServer {
                     let source_manager = self.source_manager.clone();
                     let event_bus = self.event_bus.clone();
                     let auth = self.auth.clone();
+                    let hook = self.hook.clone();
                     let peer = peer_addr.to_string();
 
                     if let Some(ref tls) = tls {
@@ -63,6 +68,7 @@ impl RtspServer {
                                         source_manager,
                                         event_bus,
                                         auth,
+                                        hook,
                                     );
                                     if let Err(e) = session.run().await {
                                         error!("RTSPS session error: {}", e);
@@ -82,6 +88,7 @@ impl RtspServer {
                                 source_manager,
                                 event_bus,
                                 auth,
+                                hook,
                             );
                             if let Err(e) = session.run().await {
                                 error!("RTSP session error: {}", e);

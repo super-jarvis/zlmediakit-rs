@@ -10,6 +10,7 @@ use tokio::net::UdpSocket;
 use tracing::{debug, error, info, warn};
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::event_bus::{Event, EventBus};
+use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::media_frame::{
     AudioInfo, CodecId, FrameType, MediaFrame, TrackInfo, VideoInfo,
 };
@@ -23,6 +24,9 @@ pub struct RtspSession {
     source_manager: Arc<MediaSourceManager>,
     event_bus: Arc<EventBus>,
     auth: Arc<StreamAuth>,
+    hook: Option<Arc<HookClient>>,
+    realm: Option<String>,
+    nonce: String,
     source: Option<Arc<MediaSource>>,
     cseq: u32,
     session_id: String,
@@ -57,8 +61,10 @@ impl RtspSession {
         source_manager: Arc<MediaSourceManager>,
         event_bus: Arc<EventBus>,
         auth: Arc<StreamAuth>,
+        hook: Option<Arc<HookClient>>,
     ) -> Self {
         let session_id = format!("{:08x}", rand::rng().random::<u32>());
+        let nonce = format!("{:08x}{:08x}", rand::rng().random::<u32>(), rand::rng().random::<u32>());
         let client_ip = peer_addr
             .split(':')
             .next()
@@ -71,6 +77,9 @@ impl RtspSession {
             source_manager,
             event_bus,
             auth,
+            hook,
+            realm: None,
+            nonce,
             source: None,
             cseq: 0,
             session_id,
@@ -176,7 +185,7 @@ impl RtspSession {
             "OPTIONS" => self.handle_options().await,
             "DESCRIBE" => self.handle_describe(&request).await,
             "SETUP" => self.handle_setup(&request).await,
-            "PLAY" => self.handle_play().await,
+            "PLAY" => self.handle_play(&request).await,
             "ANNOUNCE" => self.handle_announce(&request).await,
             "RECORD" => self.handle_record().await,
             "TEARDOWN" => self.handle_teardown().await,
@@ -205,20 +214,13 @@ impl RtspSession {
             self.app, self.stream_name
         );
 
-        if !self.auth.check(
-            "__defaultVhost__",
-            &self.app,
-            &self.stream_name,
-            "play",
-            &self.stream_sign,
-        ) {
+        if !self.is_authenticated(request, "play").await {
             warn!(
                 "RTSP play rejected (auth): {}/{}",
                 self.app, self.stream_name
             );
-            let response =
-                RtspResponse::new(401, "Unauthorized").with_header("CSeq", &self.cseq.to_string());
-            return self.send_response(&response).await;
+            let resp = self.auth_reject(request).await;
+            return self.send_response(&resp).await;
         }
 
         let source = self
@@ -355,23 +357,16 @@ impl RtspSession {
         Ok(())
     }
 
-    async fn handle_play(&mut self) -> anyhow::Result<()> {
+    async fn handle_play(&mut self, request: &RtspRequest) -> anyhow::Result<()> {
         self.is_publisher = false;
 
-        if !self.auth.check(
-            "__defaultVhost__",
-            &self.app,
-            &self.stream_name,
-            "play",
-            &self.stream_sign,
-        ) {
+        if !self.is_authenticated(request, "play").await {
             warn!(
                 "RTSP play rejected (auth): {}/{}",
                 self.app, self.stream_name
             );
-            let response =
-                RtspResponse::new(401, "Unauthorized").with_header("CSeq", &self.cseq.to_string());
-            return self.send_response(&response).await;
+            let resp = self.auth_reject(request).await;
+            return self.send_response(&resp).await;
         }
 
         // If DESCRIBE was skipped, look up the source now.
@@ -498,24 +493,82 @@ impl RtspSession {
         Ok(())
     }
 
+    /// Returns `true` when the request is authorized for `action`
+    /// (`"play"` or `"pub"`). It first tries the legacy `sign` query
+    /// parameter, then a `Digest` `Authorization` header when a realm has
+    /// already been negotiated via `on_rtsp_realm`.
+    async fn is_authenticated(&self, request: &RtspRequest, action: &str) -> bool {
+        if self.auth.check(
+            "__defaultVhost__",
+            &self.app,
+            &self.stream_name,
+            action,
+            &self.stream_sign,
+        ) {
+            return true;
+        }
+
+        if let Some(realm) = &self.realm {
+            if let Some((_, header)) = request
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("Authorization"))
+            {
+                return self
+                    .auth
+                    .check_digest(realm, &request.method, &request.uri, header);
+            }
+        }
+        false
+    }
+
+    /// Builds the 401 response for an unauthorized request. When a hook is
+    /// configured and `on_rtsp_realm` yields a realm, the response carries a
+    /// `WWW-Authenticate: Digest` challenge so the client can retry with a
+    /// Digest `Authorization` header. The negotiated realm is cached on the
+    /// session for subsequent requests.
+    async fn auth_reject(&mut self, request: &RtspRequest) -> RtspResponse {
+        if self.realm.is_none() {
+            if let Some(hook) = &self.hook {
+                if let Some(realm) = hook
+                    .on_rtsp_realm(
+                        "__defaultVhost__",
+                        &self.app,
+                        &self.stream_name,
+                        &self.client_ip,
+                    )
+                    .await
+                {
+                    if !realm.is_empty() {
+                        self.realm = Some(realm);
+                    }
+                }
+            }
+        }
+
+        let mut response =
+            RtspResponse::new(401, "Unauthorized").with_header("CSeq", &self.cseq.to_string());
+        if let Some(realm) = &self.realm {
+            response = response.with_header(
+                "WWW-Authenticate",
+                &format!("Digest realm=\"{}\", nonce=\"{}\"", realm, self.nonce),
+            );
+        }
+        let _ = request;
+        response
+    }
+
     async fn handle_announce(&mut self, request: &RtspRequest) -> anyhow::Result<()> {
         self.is_publisher = true;
         self.parse_uri(&request.uri);
 
-        if !self.auth.check(
-            "__defaultVhost__",
-            &self.app,
-            &self.stream_name,
-            "pub",
-            &self.stream_sign,
-        ) {
+        if !self.is_authenticated(request, "pub").await {
             warn!(
                 "RTSP publish rejected (auth): {}/{}",
                 self.app, self.stream_name
             );
-            let response =
-                RtspResponse::new(401, "Unauthorized").with_header("CSeq", &self.cseq.to_string());
-            return self.send_response(&response).await;
+            let resp = self.auth_reject(request).await;
+            return self.send_response(&resp).await;
         }
 
         // Parse the SDP body to learn payload types, codecs and decoder config.

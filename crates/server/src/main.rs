@@ -160,9 +160,23 @@ async fn main() -> Result<()> {
     // moved into the recorder supervisor).
     let http_record_root = record_base.clone();
     let api_record_root = record_base.clone();
-    // Static file web root: only enabled when dir_root is true in config
+    // Static file web root: only enabled when dir_root is true in config.
+    // When `www_root` is empty/relative, fall back to the bundled `www/`
+    // directory shipped with the source tree so `cargo run` works out of the
+    // box. Absolute paths in config always win.
     let www_root = if config.http.dir_root {
-        Some(std::path::PathBuf::from(&config.http.www_root))
+        let cfg = config.http.www_root.trim();
+        let p = if cfg.is_empty() {
+            default_www_root_path()
+        } else {
+            let p = std::path::PathBuf::from(cfg);
+            if p.is_absolute() {
+                p
+            } else {
+                default_www_root_path().join(cfg)
+            }
+        };
+        Some(p)
     } else {
         None
     };
@@ -201,8 +215,9 @@ async fn main() -> Result<()> {
         let rtsp_auth = auth.clone();
         let rtsp_cert = config.rtsp.ssl_cert.clone();
         let rtsp_key = config.rtsp.ssl_key.clone();
+        let rtsp_hook = hook.clone();
         let handle = tokio::spawn(async move {
-            match RtspServer::new(&addr, sm, eb, rtsp_auth, rtsp_cert, rtsp_key).await {
+            match RtspServer::new(&addr, sm, eb, rtsp_auth, Some(rtsp_hook), rtsp_cert, rtsp_key).await {
                 Ok(server) => {
                     if let Err(e) = server.run().await {
                         error!("RTSP server error: {}", e);
@@ -652,6 +667,16 @@ async fn run_recorder_supervisor(
 
 /// Splits a `MediaSource` id of the form `vhost/app/stream` into its parts.
 /// Returns `None` if the id does not contain at least two `/` separators.
+/// Resolves the bundled `www/` directory shipped with the source tree.
+///
+/// The server binary lives in `crates/server`, so the web UI is two levels up
+/// at `<repo>/www`. Using `CARGO_MANIFEST_DIR` makes `cargo run` and tests
+/// serve the management UI without any config tweaking.
+fn default_www_root_path() -> std::path::PathBuf {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    std::path::PathBuf::from(manifest).join("../../www")
+}
+
 fn split_source_id(id: &str) -> Option<(String, String, String)> {
     let mut it = id.splitn(3, '/');
     let vhost = it.next()?;

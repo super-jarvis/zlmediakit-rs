@@ -141,7 +141,7 @@ async fn rtsp_e2e_publish_receives_media() {
     let auth = StreamAuth::new(false, String::new());
 
     let addr = format!("127.0.0.1:{}", TEST_PORT);
-    let srv = RtspServer::new(&addr, mgr.clone(), event_bus, auth, None, None)
+    let srv = RtspServer::new(&addr, mgr.clone(), event_bus, auth, None, None, None)
         .await
         .expect("RtspServer should start");
 

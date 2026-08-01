@@ -1,4 +1,6 @@
+use md5::Md5;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Shared authentication settings, passed to every protocol session.
@@ -27,6 +29,94 @@ impl StreamAuth {
         }
         validate_sign(&self.secret, sign, &[vhost, app, stream, action])
     }
+
+    /// Validates an RTSP `Digest` `Authorization` header (RFC 2617/2617-style).
+    ///
+    /// The server acts as the HTTP Digest entity: the shared secret is used as
+    /// the password, so `HA1 = md5(username:realm:secret)`. The client computes
+    /// `response = md5(HA1:nonce:md5(method:uri))`. Any username is accepted as
+    /// long as the response matches (the secret is the only credential).
+    ///
+    /// Returns `true` when `header` is a well-formed Digest response whose
+    /// `realm`/`nonce`/`uri`/`method` produce the expected `response` for the
+    /// configured `secret`.
+    pub fn check_digest(&self, realm: &str, method: &str, uri: &str, header: &str) -> bool {
+        let header = header.trim();
+        let lower = header.to_ascii_lowercase();
+        let rest = match lower.strip_prefix("digest ") {
+            Some(r) => r,
+            None => return false,
+        };
+
+        let mut fields: HashMap<String, String> = HashMap::new();
+        for part in rest.split(',') {
+            if let Some((k, v)) = part.split_once('=') {
+                let key = k.trim().to_ascii_lowercase();
+                let val = v.trim().trim_matches('"').to_string();
+                fields.insert(key, val);
+            }
+        }
+
+        let hdr_realm = match fields.get("realm") {
+            Some(r) => r,
+            None => return false,
+        };
+        if hdr_realm != realm {
+            return false;
+        }
+        let nonce = match fields.get("nonce") {
+            Some(n) => n,
+            None => return false,
+        };
+        let hdr_uri = match fields.get("uri") {
+            Some(u) => u,
+            None => return false,
+        };
+        let response = match fields.get("response") {
+            Some(r) => r,
+            None => return false,
+        };
+
+        let ha1 = md5_hex(&format!(
+            "{}:{}:{}",
+            fields.get("username").unwrap_or(&String::new()),
+            realm,
+            self.secret
+        ));
+        let ha2 = md5_hex(&format!("{}:{}", method, uri));
+        let expected = md5_hex(&format!("{}:{}:{}", ha1, nonce, ha2));
+
+        // Optional qop=auth integrity check (RFC 2617).
+        if let Some(qop) = fields.get("qop") {
+            if qop == "auth" {
+                if let (Some(nc), Some(cnonce)) = (fields.get("nc"), fields.get("cnonce")) {
+                    let ha2_alt = md5_hex(&format!("{}:{}", method, hdr_uri));
+                    let expected_alt = md5_hex(&format!(
+                        "{}:{}:{}:{}:{}:{}",
+                        ha1, nonce, nc, cnonce, "auth", ha2_alt
+                    ));
+                    return response == &expected_alt;
+                }
+                return false;
+            }
+        }
+
+        // Even when qop is absent, compare against the uri the server saw.
+        let _ = hdr_uri;
+        response == &expected
+    }
+}
+
+/// Computes `md5(input)` as a lowercase hex string.
+pub fn md5_hex(input: &str) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(input.as_bytes());
+    let out = hasher.finalize();
+    let mut s = String::with_capacity(out.len() * 2);
+    for b in out {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }
 
 /// Computes `sha256(secret | part0 | part1 | ...)` as a lowercase hex string.

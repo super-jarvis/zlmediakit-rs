@@ -3058,6 +3058,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "futures",
+ "md-5 0.11.0",
  "parking_lot",
  "rand 0.10.2",
  "rustls-pemfile",

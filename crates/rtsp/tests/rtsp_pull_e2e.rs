@@ -157,6 +157,7 @@ async fn rtsp_pull_proxy_receives_media() {
         auth,
         None,
         None,
+        None,
     )
     .await
     .expect("upstream server start");
