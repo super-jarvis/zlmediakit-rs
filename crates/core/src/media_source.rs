@@ -234,7 +234,8 @@ impl MediaSource {
 
     pub async fn publish_and_cache(&self, frame: MediaFrame) {
         let payload_len = frame.data.len() as u64;
-        self.bytes_in.fetch_add(payload_len, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_in
+            .fetch_add(payload_len, std::sync::atomic::Ordering::Relaxed);
         {
             let mut cache = self.gop_cache.write().await;
             cache.cache_frame(&frame);
@@ -248,8 +249,10 @@ impl MediaSource {
         };
         // Traffic delivered to players (one copy per live subscriber).
         if receivers > 0 {
-            self.bytes_out
-                .fetch_add(payload_len * receivers as u64, std::sync::atomic::Ordering::Relaxed);
+            self.bytes_out.fetch_add(
+                payload_len * receivers as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         debug!(
             "publish_and_cache: type={:?} key={} receivers={} send_result={:?}",
@@ -339,8 +342,14 @@ impl MediaSourceManager {
         let mut in_sum = 0u64;
         let mut out_sum = 0u64;
         for src in self.sources.iter() {
-            in_sum += src.value().bytes_in.load(std::sync::atomic::Ordering::Relaxed);
-            out_sum += src.value().bytes_out.load(std::sync::atomic::Ordering::Relaxed);
+            in_sum += src
+                .value()
+                .bytes_in
+                .load(std::sync::atomic::Ordering::Relaxed);
+            out_sum += src
+                .value()
+                .bytes_out
+                .load(std::sync::atomic::Ordering::Relaxed);
         }
         (in_sum, out_sum)
     }

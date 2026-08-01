@@ -64,7 +64,11 @@ impl RtspSession {
         hook: Option<Arc<HookClient>>,
     ) -> Self {
         let session_id = format!("{:08x}", rand::rng().random::<u32>());
-        let nonce = format!("{:08x}{:08x}", rand::rng().random::<u32>(), rand::rng().random::<u32>());
+        let nonce = format!(
+            "{:08x}{:08x}",
+            rand::rng().random::<u32>(),
+            rand::rng().random::<u32>()
+        );
         let client_ip = peer_addr
             .split(':')
             .next()

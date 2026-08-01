@@ -108,7 +108,11 @@ fn extract_digest(resp: &str) -> (String, String) {
     let www = header_value(resp, "WWW-Authenticate").expect("WWW-Authenticate header missing");
     let realm = www
         .split(',')
-        .find_map(|p| p.trim().strip_prefix("realm=").or_else(|| p.trim().strip_prefix("Digest realm=")))
+        .find_map(|p| {
+            p.trim()
+                .strip_prefix("realm=")
+                .or_else(|| p.trim().strip_prefix("Digest realm="))
+        })
         .map(|v| v.trim_matches('"').to_string())
         .expect("realm not found");
     let nonce = www
@@ -119,7 +123,14 @@ fn extract_digest(resp: &str) -> (String, String) {
     (realm, nonce)
 }
 
-fn make_digest_auth(username: &str, realm: &str, secret: &str, method: &str, uri: &str, nonce: &str) -> String {
+fn make_digest_auth(
+    username: &str,
+    realm: &str,
+    secret: &str,
+    method: &str,
+    uri: &str,
+    nonce: &str,
+) -> String {
     let ha1 = md5_hex(&format!("{}:{}:{}", username, realm, secret));
     let ha2 = md5_hex(&format!("{}:{}", method, uri));
     let response = md5_hex(&format!("{}:{}:{}", ha1, nonce, ha2));
@@ -169,12 +180,17 @@ async fn rtsp_digest_auth_flow() {
     let (code1, resp1) = rtsp_request(&mut sock, describe_no_auth.as_bytes(), &mut buf).await;
     assert_eq!(code1, 401, "unauthenticated DESCRIBE must be 401");
     let www = header_value(&resp1, "WWW-Authenticate").expect("must carry WWW-Authenticate");
-    assert!(www.starts_with("Digest"), "must be a Digest challenge: {}", www);
+    assert!(
+        www.starts_with("Digest"),
+        "must be a Digest challenge: {}",
+        www
+    );
     let (chal_realm, nonce) = extract_digest(&resp1);
     assert_eq!(chal_realm, realm, "realm must come from on_rtsp_realm hook");
 
     // --- Second DESCRIBE with correct Digest credentials -> passes auth ---
-    let authorization = make_digest_auth(stream_name, &chal_realm, secret, "DESCRIBE", &uri, &nonce);
+    let authorization =
+        make_digest_auth(stream_name, &chal_realm, secret, "DESCRIBE", &uri, &nonce);
     let describe_auth = format!(
         "DESCRIBE {} RTSP/1.0\r\nCSeq: 2\r\nAccept: application/sdp\r\nAuthorization: {}\r\n\r\n",
         uri, authorization
@@ -182,8 +198,15 @@ async fn rtsp_digest_auth_flow() {
     let (code2, _) = rtsp_request(&mut sock, describe_auth.as_bytes(), &mut buf).await;
     // Stream does not exist, so we expect 404 (not 401). The important part is
     // that the auth gate is passed.
-    assert_ne!(code2, 401, "valid Digest credentials must pass the auth gate");
-    assert!(code2 == 404 || code2 == 200, "expected 404 (no such stream) but got {}", code2);
+    assert_ne!(
+        code2, 401,
+        "valid Digest credentials must pass the auth gate"
+    );
+    assert!(
+        code2 == 404 || code2 == 200,
+        "expected 404 (no such stream) but got {}",
+        code2
+    );
 }
 
 #[tokio::test]
@@ -218,7 +241,11 @@ async fn rtsp_digest_rejects_wrong_response() {
     let mut buf = Vec::new();
     let (code1, resp1) = rtsp_request(
         &mut sock,
-        format!("DESCRIBE {} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n", uri).as_bytes(),
+        format!(
+            "DESCRIBE {} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n",
+            uri
+        )
+        .as_bytes(),
         &mut buf,
     )
     .await;
@@ -226,7 +253,14 @@ async fn rtsp_digest_rejects_wrong_response() {
     let (chal_realm, nonce) = extract_digest(&resp1);
 
     // Wrong secret -> wrong response.
-    let authorization = make_digest_auth("test", &chal_realm, "wrong-secret", "DESCRIBE", &uri, &nonce);
+    let authorization = make_digest_auth(
+        "test",
+        &chal_realm,
+        "wrong-secret",
+        "DESCRIBE",
+        &uri,
+        &nonce,
+    );
     let (code2, _) = rtsp_request(
         &mut sock,
         format!(
@@ -237,7 +271,10 @@ async fn rtsp_digest_rejects_wrong_response() {
         &mut buf,
     )
     .await;
-    assert_eq!(code2, 401, "wrong Digest response must be rejected with 401");
+    assert_eq!(
+        code2, 401,
+        "wrong Digest response must be rejected with 401"
+    );
 }
 
 /// When no `on_rtsp_realm` hook is configured, the configured static realm
@@ -275,13 +312,21 @@ async fn rtsp_digest_fallback_default_realm() {
     let mut buf = Vec::new();
     let (code1, resp1) = rtsp_request(
         &mut sock,
-        format!("DESCRIBE {} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n", uri).as_bytes(),
+        format!(
+            "DESCRIBE {} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n",
+            uri
+        )
+        .as_bytes(),
         &mut buf,
     )
     .await;
     assert_eq!(code1, 401, "anonymous DESCRIBE must be rejected with 401");
     let www = header_value(&resp1, "WWW-Authenticate").expect("must carry a Digest challenge");
-    assert!(www.starts_with("Digest"), "must be a Digest challenge: {}", www);
+    assert!(
+        www.starts_with("Digest"),
+        "must be a Digest challenge: {}",
+        www
+    );
     let (chal_realm, nonce) = extract_digest(&resp1);
     assert_eq!(chal_realm, realm, "fallback realm must be used");
 
@@ -297,6 +342,13 @@ async fn rtsp_digest_fallback_default_realm() {
         &mut buf,
     )
     .await;
-    assert_ne!(code2, 401, "valid Digest credentials must pass the auth gate");
-    assert!(code2 == 404 || code2 == 200, "expected 404 (no such stream) but got {}", code2);
+    assert_ne!(
+        code2, 401,
+        "valid Digest credentials must pass the auth gate"
+    );
+    assert!(
+        code2 == 404 || code2 == 200,
+        "expected 404 (no such stream) but got {}",
+        code2
+    );
 }

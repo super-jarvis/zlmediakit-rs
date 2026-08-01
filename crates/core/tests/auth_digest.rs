@@ -12,13 +12,27 @@ fn auth(secret: &str) -> Arc<StreamAuth> {
 ///
 /// `HA1 = md5(username:realm:secret)`, `HA2 = md5(method:uri)`,
 /// `response = md5(HA1:nonce:HA2)`.
-fn client_response(username: &str, realm: &str, secret: &str, method: &str, uri: &str, nonce: &str) -> String {
+fn client_response(
+    username: &str,
+    realm: &str,
+    secret: &str,
+    method: &str,
+    uri: &str,
+    nonce: &str,
+) -> String {
     let ha1 = md5_hex(&format!("{}:{}:{}", username, realm, secret));
     let ha2 = md5_hex(&format!("{}:{}", method, uri));
     md5_hex(&format!("{}:{}:{}", ha1, nonce, ha2))
 }
 
-fn digest_header(username: &str, realm: &str, secret: &str, method: &str, uri: &str, nonce: &str) -> String {
+fn digest_header(
+    username: &str,
+    realm: &str,
+    secret: &str,
+    method: &str,
+    uri: &str,
+    nonce: &str,
+) -> String {
     let response = client_response(username, realm, secret, method, uri, nonce);
     format!(
         "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\"",
@@ -41,7 +55,14 @@ fn valid_digest_passes() {
 fn wrong_secret_fails() {
     let a = auth("rightsecret");
     // client computed response with a different secret
-    let hdr = digest_header("stream", "zlmediakit", "wrongsecret", "DESCRIBE", "rtsp://x/live/s", "n1");
+    let hdr = digest_header(
+        "stream",
+        "zlmediakit",
+        "wrongsecret",
+        "DESCRIBE",
+        "rtsp://x/live/s",
+        "n1",
+    );
     assert!(!a.check_digest("zlmediakit", "DESCRIBE", "rtsp://x/live/s", &hdr));
 }
 
@@ -102,7 +123,10 @@ fn digest_with_qop_auth_passes() {
     let ha2 = md5_hex(&format!("{}:{}", "PLAY", uri));
     let nc = "00000001";
     let cnonce = "cnonce-xyz";
-    let response = md5_hex(&format!("{}:{}:{}:{}:{}:{}", ha1, nonce, nc, cnonce, "auth", ha2));
+    let response = md5_hex(&format!(
+        "{}:{}:{}:{}:{}:{}",
+        ha1, nonce, nc, cnonce, "auth", ha2
+    ));
     let hdr = format!(
         "Digest username=\"u\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", qop=auth, nc={}, cnonce=\"{}\", response=\"{}\"",
         realm, nonce, uri, nc, cnonce, response
@@ -121,7 +145,12 @@ fn digest_uses_per_user_password() {
     let mut users = HashMap::new();
     users.insert("alice".to_string(), "alice-pass".to_string());
     users.insert("bob".to_string(), "bob-pass".to_string());
-    let a = StreamAuth::new_with_realm(true, "shared-secret".to_string(), Some(realm.to_string()), users);
+    let a = StreamAuth::new_with_realm(
+        true,
+        "shared-secret".to_string(),
+        Some(realm.to_string()),
+        users,
+    );
 
     // Alice with her own password -> passes.
     let hdr_alice = digest_header("alice", realm, "alice-pass", "DESCRIBE", uri, nonce);

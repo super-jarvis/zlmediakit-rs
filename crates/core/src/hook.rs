@@ -230,7 +230,13 @@ impl HookClient {
     pub async fn on_server_started(&self, server_id: &str) {
         if let Some(url) = &self.config.on_server_started {
             let _ = self
-                .call_hook(url, "__defaultVhost__", "", "", &[("mediaServerId", server_id)])
+                .call_hook(
+                    url,
+                    "__defaultVhost__",
+                    "",
+                    "",
+                    &[("mediaServerId", server_id)],
+                )
                 .await;
         }
     }
@@ -239,7 +245,13 @@ impl HookClient {
     pub async fn on_server_exited(&self, server_id: &str) {
         if let Some(url) = &self.config.on_server_exited {
             let _ = self
-                .call_hook(url, "__defaultVhost__", "", "", &[("mediaServerId", server_id)])
+                .call_hook(
+                    url,
+                    "__defaultVhost__",
+                    "",
+                    "",
+                    &[("mediaServerId", server_id)],
+                )
                 .await;
         }
     }

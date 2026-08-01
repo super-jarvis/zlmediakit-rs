@@ -223,7 +223,17 @@ async fn main() -> Result<()> {
         let rtsp_key = config.rtsp.ssl_key.clone();
         let rtsp_hook = hook.clone();
         let handle = tokio::spawn(async move {
-            match RtspServer::new(&addr, sm, eb, rtsp_auth, Some(rtsp_hook), rtsp_cert, rtsp_key).await {
+            match RtspServer::new(
+                &addr,
+                sm,
+                eb,
+                rtsp_auth,
+                Some(rtsp_hook),
+                rtsp_cert,
+                rtsp_key,
+            )
+            .await
+            {
                 Ok(server) => {
                     if let Err(e) = server.run().await {
                         error!("RTSP server error: {}", e);
@@ -528,10 +538,7 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(interval)).await;
                 let (bytes_in, bytes_out) = flow_sm.total_traffic();
                 let readable = flow_sm.source_count();
-                let writable = flow_sessions
-                    .as_ref()
-                    .map(|s| s.count())
-                    .unwrap_or(0);
+                let writable = flow_sessions.as_ref().map(|s| s.count()).unwrap_or(0);
                 flow_hook
                     .on_flow_report(&flow_sid, bytes_in, bytes_out, readable, writable)
                     .await;

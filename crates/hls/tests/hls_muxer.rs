@@ -34,11 +34,27 @@ fn avcc(nalu: &[u8], key: bool) -> Bytes {
 
 fn h264_key(dts: u64) -> MediaFrame {
     // NALU type 5 (IDR) payload.
-    MediaFrame::new_video(0, CodecId::H264, 0, dts, dts, avcc(&[0x65, 0x01, 0x02, 0x03], true), true)
+    MediaFrame::new_video(
+        0,
+        CodecId::H264,
+        0,
+        dts,
+        dts,
+        avcc(&[0x65, 0x01, 0x02, 0x03], true),
+        true,
+    )
 }
 
 fn h264_nonkey(dts: u64) -> MediaFrame {
-    MediaFrame::new_video(0, CodecId::H264, 0, dts, dts, avcc(&[0x41, 0x01, 0x02, 0x03], false), false)
+    MediaFrame::new_video(
+        0,
+        CodecId::H264,
+        0,
+        dts,
+        dts,
+        avcc(&[0x41, 0x01, 0x02, 0x03], false),
+        false,
+    )
 }
 
 const TS_SYNC: u8 = 0x47;
@@ -51,7 +67,10 @@ fn hls_muxer_produces_ts_segment_on_key_frame() {
     assert!(muxer.push_frame(h264_key(1500)).is_none());
     // Second key frame pushes elapsed past target_duration -> segment produced.
     let produced = muxer.push_frame(h264_key(3000));
-    assert!(produced.is_some(), "a TS segment must be produced when target duration is exceeded");
+    assert!(
+        produced.is_some(),
+        "a TS segment must be produced when target duration is exceeded"
+    );
     let (_id, seg) = produced.unwrap();
     assert!(!seg.is_empty());
     assert_eq!(seg[0], TS_SYNC, "TS segment must start with sync byte");
