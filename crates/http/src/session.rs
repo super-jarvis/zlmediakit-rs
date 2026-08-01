@@ -200,16 +200,16 @@ impl HttpSession {
             let peer_ip = self.peer_addr.split(':').next().unwrap_or(&self.peer_addr);
             if let HookResult::Deny(msg) = self
                 .hook
-                .on_http_access(
-                    "__defaultVhost__",
-                    &app,
-                    &stream_name,
-                    peer_ip,
-                    &params,
-                    route,
-                    true,
-                    path,
-                )
+                .on_http_access(zlmediakit_core::hook::HttpAccessParams {
+                    vhost: "__defaultVhost__",
+                    app: &app,
+                    stream: &stream_name,
+                    ip: peer_ip,
+                    params: &params,
+                    path: route,
+                    is_play: true,
+                    url: path,
+                })
                 .await
             {
                 warn!(

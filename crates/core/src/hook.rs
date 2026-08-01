@@ -26,6 +26,18 @@ pub enum HookResult {
     Deny(String),
 }
 
+/// Parameters for an HTTP access-control hook call.
+pub struct HttpAccessParams<'a> {
+    pub vhost: &'a str,
+    pub app: &'a str,
+    pub stream: &'a str,
+    pub ip: &'a str,
+    pub params: &'a str,
+    pub path: &'a str,
+    pub is_play: bool,
+    pub url: &'a str,
+}
+
 /// Stateless HTTP client that calls external hook URLs.
 pub struct HookClient {
     config: HookConfig,
@@ -236,17 +248,7 @@ impl HookClient {
     /// responds with `{code:1}`, otherwise `Allow`. Fail-open on hook errors.
     /// `is_play` indicates a playback (FLV/HLS) request vs. a static/file
     /// request.
-    pub async fn on_http_access(
-        &self,
-        vhost: &str,
-        app: &str,
-        stream: &str,
-        ip: &str,
-        params: &str,
-        path: &str,
-        is_play: bool,
-        url: &str,
-    ) -> HookResult {
+    pub async fn on_http_access(&self, p: HttpAccessParams<'_>) -> HookResult {
         let hook_url = match &self.config.on_http_access {
             Some(u) => u,
             None => return HookResult::Allow,
@@ -256,15 +258,15 @@ impl HookClient {
         // params is not needed — the server simply checks the returned code.
         self.call_hook(
             hook_url,
-            vhost,
-            app,
-            stream,
+            p.vhost,
+            p.app,
+            p.stream,
             &[
-                ("ip", ip),
-                ("params", params),
-                ("path", path),
-                ("is_play", if is_play { "1" } else { "0" }),
-                ("url", url),
+                ("ip", p.ip),
+                ("params", p.params),
+                ("path", p.path),
+                ("is_play", if p.is_play { "1" } else { "0" }),
+                ("url", p.url),
             ],
         )
         .await
