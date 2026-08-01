@@ -1,0 +1,42 @@
+# 进度日志
+
+## 2026-08-01
+
+- 读取项目级全局指令 `RTK.md` 与 planning-with-files-zh 技能说明。
+- 尝试读取代码知识图谱；确认本项目未索引，记录后切换为本地检索。
+- 检查 Git 状态：`master...origin/master`，无已有修改。
+- 创建任务计划、发现记录与进度日志。
+- 首次批量读取因 Windows PATH 中没有 `cat` 而失败；已记录并改用 `rtk rg` 读取文本。
+- 读取 README、Cargo 工作区、仓库文件清单、Actions 文件概览和最近提交历史。
+- 初步确认项目是多协议 Rust 流媒体服务器，当前有 CI、Docker 发布、release-plz 三套工作流。
+- 完整读取三套 workflow、根 Cargo 清单、server 清单、Dockerfile 和 README 构建相关内容。
+- 发现 CI 未安装 Dockerfile 中显式存在的原生构建依赖，且 macOS/Windows job 仍无条件构建完整 workspace；下一步核对 GitHub 实际失败日志并在 WSL 复现。
+- 尝试通过 Web 获取 Actions 状态失败，已记录并切换到 GitHub CLI/API 路径。
+- 检查发现 Windows PATH 中没有 `gh`，不再重复该路径，改查 GitHub REST API。
+- 经批准访问公开 GitHub REST API，确认当前最新提交上的 CI、Docker Publish、Release 三套 Actions 全部失败，并取得 run ID。
+- 读取全部失败 job 的步骤状态和 GitHub annotations，确认至少四类独立问题：Linux 测试失败、SRT FFI 的 macOS/Windows 不兼容、Docker Debian 包名错误、release-plz token 输入名错误。
+- 首次 WSL 枚举被沙箱拒绝（E_ACCESSDENIED）；已记录，下一步以批准模式重试。
+- 成功枚举 WSL2 `Ubuntu-26.04`，并读取 SRT FFI/服务器实现，确认其当前为 Linux 风格实现。
+- GitHub 原始日志 API 返回 403；已改为在 WSL 执行与 Ubuntu CI 相同的测试命令。
+- 检查 WSL 工具链：Rust 1.96.0 可用，但 SRT 开发库当前缺失；准备先原样运行 CI 测试命令复现。
+- 在 WSL 原样运行 `cargo test --workspace --tests`，复现 GitHub Ubuntu CI 的退出码 101：多个测试目标链接时找不到 `-lsrt-gnutls`。
+- 阶段 1、2 完成，进入 workflow/Docker 修复阶段。
+- 在 WSL 安装 `pkg-config`/`libsrt-gnutls-dev` 并应用首轮配置修复。
+- 修复后 workspace 与测试目标全部编译成功；首轮完整测试因工具 180 秒超时被终止，将利用现有缓存以更长超时重跑。
+- 第二轮测试确认绝大多数 workspace 测试通过，剩余转码集成测试缺少 `ffmpeg`；已将 FFmpeg 加入 CI 系统依赖。
+- 在 WSL 安装 FFmpeg 并重跑转码集成测试：6/6 通过。
+- `git diff --check` 通过；历史提交确认项目此前确实在 release 流程暂时停用了 macOS/Windows 目标。
+- 首次完整 Docker build 在 10 分钟工具上限处被终止且未返回阶段日志；下一步检查是否已生成镜像以及 BuildKit 缓存，再选择更可观察的验证方式。
+- 确认超时前未产出最终镜像，但 BuildKit 中间缓存已保留；准备拆分检查 Docker 运行时包和 Rust 1.80 MSRV。
+- 尝试汇总 Cargo metadata 的 MSRV 时遇到 PowerShell/WSL 嵌套引号错误；改为直接使用 `rust:1.80-slim-bookworm` 临时容器验证。
+- 一次性 Debian 包安装验证因本地 Docker 网络过慢超时；不重复该网络操作，依赖 Debian 官方包索引确认包名。
+- 通过 `docker buildx history logs` 取回超时构建日志，确认卡点是 Docker Hub 基础镜像下载速度，不是代码编译或包名错误。
+- 直接读取锁定依赖清单，确认 `time 0.3.54` 要求 Rust 1.88，而 Dockerfile 仍是 1.80；已把 builder 更新到官方存在的 Rust 1.96.1 bookworm 镜像。
+- WSL 全量 `cargo test --workspace --tests` 成功，无失败测试。
+- 修复阶段完成，进入最终编译与静态检查阶段。
+- WSL 格式检查、Clippy warnings-as-errors、release build 全部通过。
+- WSL 不带 Ruby，YAML 解析器改查已有 Python 环境。
+- 使用 WSL 现有 PyYAML 成功解析 CI、Docker Publish、Release 三份 workflow。
+- 最终 `git diff --check` 通过；产品改动限定在 3 个配置文件。
+- 补充阅读 server 入口与媒体源核心，实现项目运行时架构总结。
+- 所有计划阶段完成。

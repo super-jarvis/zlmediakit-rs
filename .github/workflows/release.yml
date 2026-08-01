@@ -39,7 +39,7 @@ jobs:
         id: release-plz
         uses: release-plz/action@v0.5
         with:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # 仅当 release-plz 创建了新 tag（即合入 Release PR 后触发）时才构建二进制
   # 二进制发布暂时禁用，仅保留 Docker 镜像发布（见 docker-publish.yml）

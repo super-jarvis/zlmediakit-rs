@@ -4,7 +4,7 @@
 # ============================================================
 
 # ---- 编译阶段 ----
-FROM rust:1.80-slim-bookworm AS builder
+FROM rust:1.96.1-slim-bookworm AS builder
 
 # 安装编译依赖
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -66,7 +66,7 @@ FROM debian:bookworm-slim
 # 运行时依赖
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     ca-certificates \
-    libsrt-gnutls1.5 \
+    libsrt1.5-gnutls \
     ffmpeg \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
