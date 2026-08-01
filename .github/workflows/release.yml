@@ -42,90 +42,91 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # 仅当 release-plz 创建了新 tag（即合入 Release PR 后触发）时才构建二进制
-  build:
-    name: Build ${{ matrix.target }}
-    needs: release-plz
-    if: ${{ fromJSON(needs.release-plz.outputs.releases)[0].tag_name != '' }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            ext: ""
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            ext: ""
-          # - target: x86_64-apple-darwin
-          #   os: macos-latest
-          #   ext: ""
-          # - target: aarch64-apple-darwin
-          #   os: macos-latest
-          #   ext: ""
-          # - target: x86_64-pc-windows-msvc
-          #   os: windows-latest
-          #   ext: ".exe"
+  # 二进制发布暂时禁用，仅保留 Docker 镜像发布（见 docker-publish.yml）
+  # build:
+  #   name: Build ${{ matrix.target }}
+  #   needs: release-plz
+  #   if: ${{ fromJSON(needs.release-plz.outputs.releases)[0].tag_name != '' }}
+  #   runs-on: ${{ matrix.os }}
+  #   strategy:
+  #     matrix:
+  #       include:
+  #         - target: x86_64-unknown-linux-gnu
+  #           os: ubuntu-latest
+  #           ext: ""
+  #         - target: aarch64-unknown-linux-gnu
+  #           os: ubuntu-latest
+  #           ext: ""
+  #         # - target: x86_64-apple-darwin
+  #         #   os: macos-latest
+  #         #   ext: ""
+  #         # - target: aarch64-apple-darwin
+  #         #   os: macos-latest
+  #         #   ext: ""
+  #         # - target: x86_64-pc-windows-msvc
+  #         #   os: windows-latest
+  #         #   ext: ".exe"
+  #
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Install Rust toolchain
+  #       uses: actions-rust-lang/setup-rust-toolchain@v1
+  #       with:
+  #         target: ${{ matrix.target }}
+  #
+  #     - name: Install cross-compilation dependencies (Linux ARM64)
+  #       if: matrix.target == 'aarch64-unknown-linux-gnu'
+  #       run: |
+  #         sudo apt-get update
+  #         sudo apt-get install -y gcc-aarch64-linux-gnu
+  #         echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+  #
+  #     - name: Build release
+  #       run: cargo build --release --target ${{ matrix.target }}
+  #
+  #     - name: Prepare artifact
+  #       shell: bash
+  #       run: |
+  #         BIN="target/${{ matrix.target }}/release/zlmediakit${{ matrix.ext }}"
+  #         PKG="zlmediakit-${{ matrix.target }}${{ matrix.ext }}"
+  #         cp "$BIN" "$PKG"
+  #         echo "PKG=$PKG" >> $GITHUB_ENV
+  #
+  #     - name: Upload artifact
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: zlmediakit-${{ matrix.target }}
+  #         path: ${{ env.PKG }}
 
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          target: ${{ matrix.target }}
-
-      - name: Install cross-compilation dependencies (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-
-      - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Prepare artifact
-        shell: bash
-        run: |
-          BIN="target/${{ matrix.target }}/release/zlmediakit${{ matrix.ext }}"
-          PKG="zlmediakit-${{ matrix.target }}${{ matrix.ext }}"
-          cp "$BIN" "$PKG"
-          echo "PKG=$PKG" >> $GITHUB_ENV
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: zlmediakit-${{ matrix.target }}
-          path: ${{ env.PKG }}
-
-  publish:
-    name: Publish GitHub Release
-    needs: [release-plz, build]
-    if: ${{ fromJSON(needs.release-plz.outputs.releases)[0].tag_name != '' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Generate checksums
-        run: |
-          find artifacts -type f -exec sha256sum {} \; > checksums.txt
-          cat checksums.txt
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ fromJSON(needs.release-plz.outputs.releases)[0].tag_name }}
-          name: ZLMediaKit-RS ${{ fromJSON(needs.release-plz.outputs.releases)[0].tag_name }}
-          body: ${{ fromJSON(needs.release-plz.outputs.releases)[0].release_notes }}
-          draft: false
-          prerelease: false
-          files: |
-            artifacts/**/*
-            checksums.txt
+  # publish:
+  #   name: Publish GitHub Release
+  #   needs: [release-plz, build]
+  #   if: ${{ fromJSON(needs.release-plz.outputs.releases)[0].tag_name != '' }}
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: write
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Download all artifacts
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         path: artifacts
+  #
+  #     - name: Generate checksums
+  #       run: |
+  #         find artifacts -type f -exec sha256sum {} \; > checksums.txt
+  #         cat checksums.txt
+  #
+  #     - name: Create GitHub Release
+  #       uses: softprops/action-gh-release@v2
+  #       with:
+  #         tag_name: ${{ fromJSON(needs.release-plz.outputs.releases)[0].tag_name }}
+  #         name: ZLMediaKit-RS ${{ fromJSON(needs.release-plz.outputs.releases)[0].tag_name }}
+  #         body: ${{ fromJSON(needs.release-plz.outputs.releases)[0].release_notes }}
+  #         draft: false
+  #         prerelease: false
+  #         files: |
+  #           artifacts/**/*
+  #           checksums.txt

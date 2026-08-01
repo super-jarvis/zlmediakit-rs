@@ -51,7 +51,7 @@ fn flv_tags_emitted_for_video_audio() {
 
 #[test]
 fn flv_metadata_tag() {
-    let mut muxer = FlvMuxer::new();
+    let muxer = FlvMuxer::new();
     let meta = muxer.write_metadata(1280, 720, 25.0, 48000, CodecId::H264);
     assert!(!meta.is_empty());
 }
