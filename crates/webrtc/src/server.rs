@@ -75,7 +75,14 @@ async fn handle_conn(
     loop {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
-            return write_response(&mut stream, 400, "Bad Request", &[], b"connection closed before request completed").await;
+            return write_response(
+                &mut stream,
+                400,
+                "Bad Request",
+                &[],
+                b"connection closed before request completed",
+            )
+            .await;
         }
         buf.extend_from_slice(&tmp[..n]);
 
@@ -87,7 +94,14 @@ async fn handle_conn(
             }
         }
         if buf.len() > 1 << 20 {
-            return write_response(&mut stream, 413, "Request Too Large", &[], b"request exceeds maximum size").await;
+            return write_response(
+                &mut stream,
+                413,
+                "Request Too Large",
+                &[],
+                b"request exceeds maximum size",
+            )
+            .await;
         }
     }
 
@@ -115,7 +129,10 @@ async fn handle_conn(
                 "No Content",
                 &[
                     ("Access-Control-Allow-Methods", "POST, DELETE, OPTIONS"),
-                    ("Access-Control-Allow-Headers", "Content-Type, Authorization"),
+                    (
+                        "Access-Control-Allow-Headers",
+                        "Content-Type, Authorization",
+                    ),
                     ("Access-Control-Max-Age", "86400"),
                 ],
                 &[],

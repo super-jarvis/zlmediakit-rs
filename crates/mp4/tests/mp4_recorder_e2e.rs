@@ -64,7 +64,9 @@ async fn mp4_recorder_writes_valid_file() {
     let rec_stop = stop.clone();
     let rec_dir = TEST_BASE.to_string();
     let handle =
-        tokio::spawn(async move { Mp4Recorder::record(rec_source, &rec_dir, rec_stop, None).await });
+        tokio::spawn(
+            async move { Mp4Recorder::record(rec_source, &rec_dir, rec_stop, None).await },
+        );
 
     // Publish live frames, then close the source.
     for i in 0..3 {
@@ -146,7 +148,9 @@ async fn mp4_recorder_no_frames_still_writes_header() {
     let rec_stop = stop.clone();
     let rec_dir = TEST_BASE.to_string();
     let handle =
-        tokio::spawn(async move { Mp4Recorder::record(rec_source, &rec_dir, rec_stop, None).await });
+        tokio::spawn(
+            async move { Mp4Recorder::record(rec_source, &rec_dir, rec_stop, None).await },
+        );
 
     source.close();
 

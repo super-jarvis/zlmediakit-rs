@@ -637,7 +637,8 @@ impl RtmpSession {
 
         let source = self
             .source_manager
-            .get("__defaultVhost__", &self.app, &self.stream_name);
+            .get_or_pull("__defaultVhost__", &self.app, &self.stream_name)
+            .await;
 
         match source {
             Some(source) => {
@@ -846,7 +847,7 @@ impl RtmpSession {
             ),
             (
                 "description".to_string(),
-                AmfValue::String(format!("{}", reason)),
+                AmfValue::String(reason.to_string()),
             ),
         ]);
         self.send_msg(&RtmpMessage::Amf0Command {
@@ -873,7 +874,7 @@ impl RtmpSession {
             ),
             (
                 "description".to_string(),
-                AmfValue::String(format!("{}", reason)),
+                AmfValue::String(reason.to_string()),
             ),
         ]);
         self.send_msg(&RtmpMessage::Amf0Command {
@@ -1005,7 +1006,7 @@ pub fn parse_audio_rtmp_packet(data: &[u8]) -> CodecId {
         7 => CodecId::G711A,
         8 => CodecId::G711U,
         13 => CodecId::Opus,
-        14 => CodecId::L16,   // PCM Little-endian 16-bit
+        14 => CodecId::L16, // PCM Little-endian 16-bit
         _ => CodecId::AAC,
     }
 }

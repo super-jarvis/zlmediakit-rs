@@ -12,7 +12,6 @@ use zlmediakit_mp4::fmp4::Fmp4Muxer;
 
 use crate::muxer::HlsSegment;
 
-
 /// Starts a CMAF HLS task for a live stream.
 ///
 /// Subscribes to the MediaSource, generates fMP4 segments every 4 seconds,
@@ -110,7 +109,10 @@ pub fn build_cmaf_playlist(
     let mut m3u8 = String::new();
     m3u8.push_str("#EXTM3U\n");
     m3u8.push_str("#EXT-X-VERSION:7\n");
-    m3u8.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", target_duration.max(1)));
+    m3u8.push_str(&format!(
+        "#EXT-X-TARGETDURATION:{}\n",
+        target_duration.max(1)
+    ));
     m3u8.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
 
     if !segments.is_empty() {
@@ -123,10 +125,7 @@ pub fn build_cmaf_playlist(
         ));
         for seg in segments.iter() {
             m3u8.push_str(&format!("#EXTINF:{:.3},\n", seg.duration));
-            m3u8.push_str(&format!(
-                "/{}/{}/seg-{}.m4s\n",
-                app, stream, seg.index
-            ));
+            m3u8.push_str(&format!("/{}/{}/seg-{}.m4s\n", app, stream, seg.index));
         }
     } else {
         m3u8.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");

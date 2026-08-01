@@ -18,8 +18,8 @@ use zlmediakit_rtmp::message::{RtmpMessage, RtmpMessageEncoder, RtmpMessageParse
 use zlmediakit_rtmp::push_client;
 use zlmediakit_rtmp::RtmpServer;
 
-const PUB_PORT: u16 = 19160;
-const PUSH_TLS_PORT: u16 = 19161;
+const PUB_PORT: u16 = 19270;
+const PUSH_TLS_PORT: u16 = 19271;
 
 #[derive(Debug)]
 struct NoVerifier;
@@ -85,7 +85,11 @@ fn build_c1() -> Vec<u8> {
 
 fn encode_video(stream_id: u32, timestamp: u32, data: Bytes) -> Vec<u8> {
     RtmpMessageEncoder::new()
-        .encode(&RtmpMessage::Video { stream_id, timestamp, data })
+        .encode(&RtmpMessage::Video {
+            stream_id,
+            timestamp,
+            data,
+        })
         .to_vec()
 }
 
@@ -93,7 +97,19 @@ fn avcc_config() -> Bytes {
     let sps = [0x67u8, 0x42, 0x00, 0x1f, 0x9a, 0x66, 0x02, 0x80, 0x2c, 0x8e];
     let pps = [0x68u8, 0xee, 0x3c, 0x80];
     let mut v = vec![
-        0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x42, 0x00, 0x1f, 0xff, 0xe0 | 1, 0x00, 0x0a,
+        0x17,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x01,
+        0x42,
+        0x00,
+        0x1f,
+        0xff,
+        0xe0 | 1,
+        0x00,
+        0x0a,
     ];
     v.extend_from_slice(&sps);
     v.push(0x01);
@@ -103,9 +119,23 @@ fn avcc_config() -> Bytes {
 }
 
 fn avcc_sample(key: bool) -> Bytes {
-    let nalu = if key { [0x65u8, 0x9a, 0x00, 0x15, 0x20] } else { [0x41u8, 0x9a, 0x00, 0x10, 0x20] };
+    let nalu = if key {
+        [0x65u8, 0x9a, 0x00, 0x15, 0x20]
+    } else {
+        [0x41u8, 0x9a, 0x00, 0x10, 0x20]
+    };
     let frame_type: u8 = if key { 0x10 } else { 0x20 };
-    let mut v = vec![frame_type | 0x07, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05];
+    let mut v = vec![
+        frame_type | 0x07,
+        0x01,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x05,
+    ];
     v.extend_from_slice(&nalu);
     Bytes::from(v)
 }
@@ -165,7 +195,9 @@ async fn rtmps_push_to_tls_server() {
     )
     .await
     .expect("server1 start");
-    tokio::spawn(async move { let _ = srv1.run().await; });
+    tokio::spawn(async move {
+        let _ = srv1.run().await;
+    });
 
     // Server B: RTMPS
     let srv2 = RtmpServer::new(
@@ -179,7 +211,9 @@ async fn rtmps_push_to_tls_server() {
     )
     .await
     .expect("server2 start");
-    tokio::spawn(async move { let _ = srv2.run().await; });
+    tokio::spawn(async move {
+        let _ = srv2.run().await;
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // =========== Publish to server1 ===========
@@ -204,13 +238,27 @@ async fn rtmps_push_to_tls_server() {
         AmfValue::Number(1.0),
         AmfValue::Object(vec![
             ("app".to_string(), AmfValue::String("live".to_string())),
-            ("tcUrl".to_string(), AmfValue::String(format!("rtmp://127.0.0.1:{}/live", PUB_PORT))),
+            (
+                "tcUrl".to_string(),
+                AmfValue::String(format!("rtmp://127.0.0.1:{}/live", PUB_PORT)),
+            ),
         ]),
     ])
     .freeze();
-    let connect_msg = RtmpMessage::Amf0Command { stream_id: 0, timestamp: 0, data: connect_payload };
-    let msgs = send_and_recv(&mut pub_stream, &mut pub_parser, &pub_encoder.encode(&connect_msg)).await;
-    assert!(msgs.iter().any(|m| matches!(m, RtmpMessage::SetChunkSize(_))));
+    let connect_msg = RtmpMessage::Amf0Command {
+        stream_id: 0,
+        timestamp: 0,
+        data: connect_payload,
+    };
+    let msgs = send_and_recv(
+        &mut pub_stream,
+        &mut pub_parser,
+        &pub_encoder.encode(&connect_msg),
+    )
+    .await;
+    assert!(msgs
+        .iter()
+        .any(|m| matches!(m, RtmpMessage::SetChunkSize(_))));
     pub_encoder.set_chunk_size(4096);
     pub_parser.set_chunk_size(4096);
 
@@ -220,16 +268,35 @@ async fn rtmps_push_to_tls_server() {
         AmfValue::Null,
     ])
     .freeze();
-    let cs_msg = RtmpMessage::Amf0Command { stream_id: 0, timestamp: 0, data: cs_payload };
-    let msgs = send_and_recv(&mut pub_stream, &mut pub_parser, &pub_encoder.encode(&cs_msg)).await;
-    let pub_stream_id = msgs.iter().find_map(|m| {
-        if let RtmpMessage::Amf0Command { data, .. } = m {
-            let vals = AmfDecoder::decode(data).ok()?;
-            if matches!(vals.first(), Some(AmfValue::String(s)) if s == "_result") {
-                vals.get(3).and_then(|v| match v { AmfValue::Number(n) => Some(*n as u32), _ => None })
-            } else { None }
-        } else { None }
-    }).expect("_result for createStream");
+    let cs_msg = RtmpMessage::Amf0Command {
+        stream_id: 0,
+        timestamp: 0,
+        data: cs_payload,
+    };
+    let msgs = send_and_recv(
+        &mut pub_stream,
+        &mut pub_parser,
+        &pub_encoder.encode(&cs_msg),
+    )
+    .await;
+    let pub_stream_id = msgs
+        .iter()
+        .find_map(|m| {
+            if let RtmpMessage::Amf0Command { data, .. } = m {
+                let vals = AmfDecoder::decode(data).ok()?;
+                if matches!(vals.first(), Some(AmfValue::String(s)) if s == "_result") {
+                    vals.get(3).and_then(|v| match v {
+                        AmfValue::Number(n) => Some(*n as u32),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .expect("_result for createStream");
     drop(msgs);
 
     let pub_payload = AmfEncoder::encode(&[
@@ -240,18 +307,33 @@ async fn rtmps_push_to_tls_server() {
         AmfValue::String("live".to_string()),
     ])
     .freeze();
-    let pub_msg = RtmpMessage::Amf0Command { stream_id: pub_stream_id, timestamp: 0, data: pub_payload };
-    let msgs = send_and_recv(&mut pub_stream, &mut pub_parser, &pub_encoder.encode(&pub_msg)).await;
+    let pub_msg = RtmpMessage::Amf0Command {
+        stream_id: pub_stream_id,
+        timestamp: 0,
+        data: pub_payload,
+    };
+    let msgs = send_and_recv(
+        &mut pub_stream,
+        &mut pub_parser,
+        &pub_encoder.encode(&pub_msg),
+    )
+    .await;
     assert!(msgs.iter().any(|m| {
-        matches!(m, RtmpMessage::Amf0Command { data, .. } if AmfDecoder::decode(data).ok().map_or(false, |v|
+        matches!(m, RtmpMessage::Amf0Command { data, .. } if AmfDecoder::decode(data).ok().is_some_and(|v|
             matches!(v.first(), Some(AmfValue::String(s)) if s == "onStatus")
         ))
     }));
     drop(msgs);
 
     // Send config + key frame
-    pub_stream.write_all(&encode_video(pub_stream_id, 0, avcc_config())).await.unwrap();
-    pub_stream.write_all(&encode_video(pub_stream_id, 0, avcc_sample(true))).await.unwrap();
+    pub_stream
+        .write_all(&encode_video(pub_stream_id, 0, avcc_config()))
+        .await
+        .unwrap();
+    pub_stream
+        .write_all(&encode_video(pub_stream_id, 0, avcc_sample(true)))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // =========== Start push relay to RTMPS ===========
@@ -264,7 +346,16 @@ async fn rtmps_push_to_tls_server() {
         let stopped = stopped.clone();
         let url = push_url.clone();
         async move {
-            push_client::start(&url, "__defaultVhost__", "live", "pushtest", mgr1, stop, stopped).await
+            push_client::start(
+                &url,
+                "__defaultVhost__",
+                "live",
+                "pushtest",
+                mgr1,
+                stop,
+                stopped,
+            )
+            .await
         }
     });
 
@@ -279,79 +370,135 @@ async fn rtmps_push_to_tls_server() {
             .with_no_client_auth(),
     );
     let connector = tokio_rustls::TlsConnector::from(config);
-    let domain = ServerName::IpAddress(
-        rustls_pki_types::IpAddr::V4(rustls_pki_types::Ipv4Addr::from([127, 0, 0, 1])),
-    );
-    let tcp = TcpStream::connect(("127.0.0.1", PUSH_TLS_PORT)).await.unwrap();
+    let domain = ServerName::IpAddress(rustls_pki_types::IpAddr::V4(
+        rustls_pki_types::Ipv4Addr::from([127, 0, 0, 1]),
+    ));
+    let tcp = TcpStream::connect(("127.0.0.1", PUSH_TLS_PORT))
+        .await
+        .unwrap();
     let mut tls_stream = connector.connect(domain, tcp).await.unwrap();
-    RtmpHandshake::client_handshake(&mut tls_stream).await.unwrap();
+    RtmpHandshake::client_handshake(&mut tls_stream)
+        .await
+        .unwrap();
 
     let mut play_parser = RtmpMessageParser::new();
     let play_encoder = RtmpMessageEncoder::new();
 
     let connect = RtmpMessage::Amf0Command {
-        stream_id: 0, timestamp: 0,
+        stream_id: 0,
+        timestamp: 0,
         data: AmfEncoder::encode(&[
             AmfValue::String("connect".to_string()),
             AmfValue::Number(1.0),
             AmfValue::Object(vec![
                 ("app".to_string(), AmfValue::String("live".to_string())),
-                ("tcUrl".to_string(), AmfValue::String(format!("rtmps://127.0.0.1:{}/live", PUSH_TLS_PORT))),
+                (
+                    "tcUrl".to_string(),
+                    AmfValue::String(format!("rtmps://127.0.0.1:{}/live", PUSH_TLS_PORT)),
+                ),
             ]),
-        ]).freeze(),
+        ])
+        .freeze(),
     };
-    let msgs = send_and_recv(&mut tls_stream, &mut play_parser, &play_encoder.encode(&connect)).await;
-    assert!(msgs.iter().any(|m| matches!(m, RtmpMessage::WindowAckSize(_))));
-    let chunk_size = msgs.iter().find_map(|m| {
-        if let RtmpMessage::SetChunkSize(sz) = m { Some(*sz) } else { None }
-    }).unwrap_or(128);
+    let msgs = send_and_recv(
+        &mut tls_stream,
+        &mut play_parser,
+        &play_encoder.encode(&connect),
+    )
+    .await;
+    assert!(msgs
+        .iter()
+        .any(|m| matches!(m, RtmpMessage::WindowAckSize(_))));
+    let chunk_size = msgs
+        .iter()
+        .find_map(|m| {
+            if let RtmpMessage::SetChunkSize(sz) = m {
+                Some(*sz)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(128);
     play_parser.set_chunk_size(chunk_size);
     drop(msgs);
 
     let cs = RtmpMessage::Amf0Command {
-        stream_id: 0, timestamp: 0,
+        stream_id: 0,
+        timestamp: 0,
         data: AmfEncoder::encode(&[
             AmfValue::String("createStream".to_string()),
             AmfValue::Number(2.0),
             AmfValue::Null,
-        ]).freeze(),
+        ])
+        .freeze(),
     };
     let msgs = send_and_recv(&mut tls_stream, &mut play_parser, &play_encoder.encode(&cs)).await;
-    let play_stream_id = msgs.iter().find_map(|m| {
-        if let RtmpMessage::Amf0Command { data, .. } = m {
-            let vals = AmfDecoder::decode(data).ok()?;
-            if matches!(vals.first(), Some(AmfValue::String(s)) if s == "_result") {
-                vals.get(3).and_then(|v| match v { AmfValue::Number(n) => Some(*n as u32), _ => None })
-            } else { None }
-        } else { None }
-    }).expect("_result for createStream");
+    let play_stream_id = msgs
+        .iter()
+        .find_map(|m| {
+            if let RtmpMessage::Amf0Command { data, .. } = m {
+                let vals = AmfDecoder::decode(data).ok()?;
+                if matches!(vals.first(), Some(AmfValue::String(s)) if s == "_result") {
+                    vals.get(3).and_then(|v| match v {
+                        AmfValue::Number(n) => Some(*n as u32),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .expect("_result for createStream");
     drop(msgs);
 
     let play_cmd = RtmpMessage::Amf0Command {
-        stream_id: play_stream_id, timestamp: 0,
+        stream_id: play_stream_id,
+        timestamp: 0,
         data: AmfEncoder::encode(&[
             AmfValue::String("play".to_string()),
             AmfValue::Number(3.0),
             AmfValue::Null,
             AmfValue::String("pushtest".to_string()),
-        ]).freeze(),
+        ])
+        .freeze(),
     };
-    tls_stream.write_all(&play_encoder.encode(&play_cmd)).await.unwrap();
+    tls_stream
+        .write_all(&play_encoder.encode(&play_cmd))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let initial = send_and_recv(&mut tls_stream, &mut play_parser, &[]).await;
-    let initial_video = initial.iter().filter(|m| matches!(m, RtmpMessage::Video { .. })).count();
+    let initial_video = initial
+        .iter()
+        .filter(|m| matches!(m, RtmpMessage::Video { .. }))
+        .count();
 
     // Send more live frames from publisher
-    pub_stream.write_all(&encode_video(pub_stream_id, 100, avcc_sample(true))).await.unwrap();
-    pub_stream.write_all(&encode_video(pub_stream_id, 200, avcc_sample(false))).await.unwrap();
+    pub_stream
+        .write_all(&encode_video(pub_stream_id, 100, avcc_sample(true)))
+        .await
+        .unwrap();
+    pub_stream
+        .write_all(&encode_video(pub_stream_id, 200, avcc_sample(false)))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let live = send_and_recv(&mut tls_stream, &mut play_parser, &[]).await;
-    let live_video = live.iter().filter(|m| matches!(m, RtmpMessage::Video { .. })).count();
+    let live_video = live
+        .iter()
+        .filter(|m| matches!(m, RtmpMessage::Video { .. }))
+        .count();
 
     let total = initial_video + live_video;
-    assert!(total >= 2, "player on TLS server should receive at least 2 frames, got {}", total);
+    assert!(
+        total >= 2,
+        "player on TLS server should receive at least 2 frames, got {}",
+        total
+    );
 
     // Cleanup
     stop.notify_waiters();

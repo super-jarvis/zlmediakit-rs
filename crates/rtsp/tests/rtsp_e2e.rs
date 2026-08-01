@@ -95,7 +95,7 @@ async fn rtsp_request(stream: &mut TcpStream, request: &[u8], buf: &mut Vec<u8>)
     let header_end = pos + 4;
     let status_line = s.lines().next().unwrap_or("");
     let code: u16 = status_line
-        .splitn(3, ' ')
+        .split(' ')
         .nth(1)
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);

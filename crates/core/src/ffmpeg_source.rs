@@ -100,7 +100,13 @@ impl FFmpegSourceControl {
             .iter()
             .map(|e| {
                 let (v, a, s) = split_key(e.key());
-                (e.value().src_url.clone(), e.value().dst_url.clone(), v, a, s)
+                (
+                    e.value().src_url.clone(),
+                    e.value().dst_url.clone(),
+                    v,
+                    a,
+                    s,
+                )
             })
             .collect()
     }
@@ -109,7 +115,11 @@ impl FFmpegSourceControl {
 fn split_key(k: &str) -> (String, String, String) {
     let parts: Vec<&str> = k.splitn(3, '/').collect();
     if parts.len() == 3 {
-        (parts[0].to_string(), parts[1].to_string(), parts[2].to_string())
+        (
+            parts[0].to_string(),
+            parts[1].to_string(),
+            parts[2].to_string(),
+        )
     } else {
         (String::new(), String::new(), k.to_string())
     }

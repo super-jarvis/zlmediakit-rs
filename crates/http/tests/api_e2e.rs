@@ -25,7 +25,7 @@ async fn http_get(path: &str, port: u16) -> (u16, Vec<u8>) {
     let pos = s.find("\r\n").unwrap_or(0);
     let status_line = &s[..pos];
     let code = status_line
-        .splitn(3, ' ')
+        .split(' ')
         .nth(1)
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);
@@ -114,7 +114,7 @@ impl TestServer {
 
 #[tokio::test]
 async fn http_api_get_server_config() {
-    let srv = TestServer::new(TEST_PORT + 0).await;
+    let srv = TestServer::new(TEST_PORT).await;
     let (code, body) = srv.get("/index/api/getServerConfig").await;
     assert_eq!(code, 200);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -298,8 +298,9 @@ async fn http_api_set_server_config() {
     assert_eq!(code, 200);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let entries = json["result"]["data"].as_array().unwrap();
-    assert!(entries.iter().any(|e| e["key"] == "general.flowThreshold"
-        && e["value"] == "2048"));
+    assert!(entries
+        .iter()
+        .any(|e| e["key"] == "general.flowThreshold" && e["value"] == "2048"));
 }
 
 #[tokio::test]
@@ -330,11 +331,8 @@ async fn http_api_close_streams_batch() {
     let srv = TestServer::new(TEST_PORT + 15).await;
 
     for name in ["batch_a", "batch_b"] {
-        let source = srv
-            .mgr()
-            .get_or_create("__defaultVhost__", "live", name);
-        let cfg =
-            MediaFrame::new_video(0, CodecId::H264, 0, 0, 0, avcc_config().into(), false);
+        let source = srv.mgr().get_or_create("__defaultVhost__", "live", name);
+        let cfg = MediaFrame::new_video(0, CodecId::H264, 0, 0, 0, avcc_config().into(), false);
         source.publish_and_cache(cfg).await;
     }
 
@@ -367,7 +365,9 @@ async fn http_api_get_all_session_and_kick() {
     assert!(total >= 1);
 
     // kick_sessions with a filter that matches nothing
-    let (code, body) = srv.get("/index/api/kick_sessions?peer_ip=203.0.113.99").await;
+    let (code, body) = srv
+        .get("/index/api/kick_sessions?peer_ip=203.0.113.99")
+        .await;
     assert_eq!(code, 200);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["code"], 0);
@@ -385,18 +385,20 @@ async fn http_api_get_all_session_and_kick() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let sessions = json["data"].as_array().unwrap();
     // The request itself opens a fresh HTTP session, so at most that one remains.
-    let http_count = sessions
-        .iter()
-        .filter(|s| s["typeid"] == "HTTP")
-        .count();
-    assert!(http_count <= 1, "expected at most 1 HTTP session, got {http_count}");
+    let http_count = sessions.iter().filter(|s| s["typeid"] == "HTTP").count();
+    assert!(
+        http_count <= 1,
+        "expected at most 1 HTTP session, got {http_count}"
+    );
 }
 
 #[tokio::test]
 async fn http_api_get_media_player_list() {
     let srv = TestServer::new(TEST_PORT + 17).await;
 
-    let (code, body) = srv.get("/index/api/getMediaPlayerList?stream=missing").await;
+    let (code, body) = srv
+        .get("/index/api/getMediaPlayerList?stream=missing")
+        .await;
     assert_eq!(code, 200);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["code"], -404);
@@ -408,7 +410,9 @@ async fn http_api_get_media_player_list() {
     let cfg = MediaFrame::new_video(0, CodecId::H264, 0, 0, 0, avcc_config().into(), false);
     source.publish_and_cache(cfg).await;
 
-    let (code, body) = srv.get("/index/api/getMediaPlayerList?stream=player_test").await;
+    let (code, body) = srv
+        .get("/index/api/getMediaPlayerList?stream=player_test")
+        .await;
     assert_eq!(code, 200);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["code"], 0);
@@ -420,9 +424,12 @@ async fn http_api_get_media_player_list() {
 #[tokio::test]
 async fn http_api_get_mp4_record_file() {
     let srv = TestServer::new(TEST_PORT + 18).await;
-    srv.get("/index/api/getMp4RecordFile?stream=nonexistent").await;
+    srv.get("/index/api/getMp4RecordFile?stream=nonexistent")
+        .await;
 
-    let (code, body) = srv.get("/index/api/getMp4RecordFile?stream=nonexistent").await;
+    let (code, body) = srv
+        .get("/index/api/getMp4RecordFile?stream=nonexistent")
+        .await;
     assert_eq!(code, 200);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["code"], 0);
@@ -433,7 +440,9 @@ async fn http_api_get_mp4_record_file() {
 async fn http_api_get_record_status() {
     let srv = TestServer::new(TEST_PORT + 19).await;
 
-    let (code, body) = srv.get("/index/api/getRecordStatus?stream=rec_status").await;
+    let (code, body) = srv
+        .get("/index/api/getRecordStatus?stream=rec_status")
+        .await;
     assert_eq!(code, 200);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["code"], 0);

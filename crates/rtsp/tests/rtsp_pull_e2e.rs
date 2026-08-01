@@ -95,7 +95,7 @@ async fn rtsp_request(stream: &mut TcpStream, request: &[u8], buf: &mut Vec<u8>)
     let code = s
         .lines()
         .next()
-        .and_then(|l| l.splitn(3, ' ').nth(1)?.parse().ok())
+        .and_then(|l| l.split(' ').nth(1)?.parse().ok())
         .unwrap_or(0);
     let cl = s[..pos]
         .lines()
@@ -130,7 +130,7 @@ async fn rtsp_request_full(
     let code = s
         .lines()
         .next()
-        .and_then(|l| l.splitn(3, ' ').nth(1)?.parse().ok())
+        .and_then(|l| l.split(' ').nth(1)?.parse().ok())
         .unwrap_or(0);
     let cl = s[..pos]
         .lines()

@@ -57,8 +57,16 @@ impl SrtServer {
 
         // Set socket options
         ffi::set_sockflag_int(sock, ffi::SRT_SOCKOPT_TRANSTYPE, ffi::SRTT_LIVE)?;
-        ffi::set_sockflag_int(sock, ffi::SRT_SOCKOPT_LATENCY, self.config.latency_ms as c_int)?;
-        ffi::set_sockflag_int(sock, ffi::SRT_SOCKOPT_RCVLATENCY, self.config.latency_ms as c_int)?;
+        ffi::set_sockflag_int(
+            sock,
+            ffi::SRT_SOCKOPT_LATENCY,
+            self.config.latency_ms as c_int,
+        )?;
+        ffi::set_sockflag_int(
+            sock,
+            ffi::SRT_SOCKOPT_RCVLATENCY,
+            self.config.latency_ms as c_int,
+        )?;
         ffi::set_sockflag_int(sock, ffi::SRT_SOCKOPT_RCVSYN, 0)?;
         ffi::set_sockflag_int(sock, ffi::SRT_SOCKOPT_RCVBUF, 1024 * 1024)?;
 
@@ -101,7 +109,8 @@ impl SrtServer {
                 break;
             }
 
-            let accept_fd = unsafe { ffi::srt_accept(sock, std::ptr::null_mut(), std::ptr::null_mut()) };
+            let accept_fd =
+                unsafe { ffi::srt_accept(sock, std::ptr::null_mut(), std::ptr::null_mut()) };
 
             if accept_fd < 0 {
                 let state = unsafe { ffi::srt_getsockstate(sock) };
@@ -349,7 +358,8 @@ fn parse_pat(payload: &[u8], ctx: &mut TsContext) {
         return;
     }
     // Store PMT PID for parsing later (encoded into program_map_PID).
-    let pmt_pid = ((payload[program_offset + 2] as u16 & 0x1F) << 8) | payload[program_offset + 3] as u16;
+    let pmt_pid =
+        ((payload[program_offset + 2] as u16 & 0x1F) << 8) | payload[program_offset + 3] as u16;
     ctx.pmt_pid = Some(pmt_pid);
     ctx.video_pid = ctx.video_pid.or(Some(0x0100));
     ctx.audio_pid = ctx.audio_pid.or(Some(PID_DEFAULT_AUDIO));
@@ -373,7 +383,8 @@ fn parse_pmt(payload: &[u8], ctx: &mut TsContext) {
         return;
     }
     // Skip PCR_PID (2) + program_info_length (2) = 4 bytes
-    let info_len = ((payload[pcr_pid_offset + 3] as u16 & 0x0F) << 8) | payload[pcr_pid_offset + 4] as u16;
+    let info_len =
+        ((payload[pcr_pid_offset + 3] as u16 & 0x0F) << 8) | payload[pcr_pid_offset + 4] as u16;
     let es_start = pcr_pid_offset + 5 + info_len as usize;
 
     let mut pos = es_start;
@@ -383,8 +394,8 @@ fn parse_pmt(payload: &[u8], ctx: &mut TsContext) {
         // es_info_length (2)
         let es_info = ((payload[pos + 3] as u16 & 0x0F) << 8) | payload[pos + 4] as u16;
         match stream_type {
-            0x1B | 0x24 => ctx.video_pid = Some(pid),  // H.264 / H.265
-            0x0F | 0x11 => ctx.audio_pid = Some(pid),  // AAC / AAC-latm
+            0x1B | 0x24 => ctx.video_pid = Some(pid), // H.264 / H.265
+            0x0F | 0x11 => ctx.audio_pid = Some(pid), // AAC / AAC-latm
             _ => {}
         }
         pos += 5 + es_info as usize;
@@ -392,7 +403,7 @@ fn parse_pmt(payload: &[u8], ctx: &mut TsContext) {
 }
 
 /// Extracts PES packet payload from a TS packet payload.
-fn extract_pes_payload<'a>(payload: &'a [u8], unit_start: bool) -> Option<&'a [u8]> {
+fn extract_pes_payload(payload: &[u8], unit_start: bool) -> Option<&[u8]> {
     if !unit_start {
         return Some(payload);
     }
@@ -411,7 +422,11 @@ fn extract_pes_payload<'a>(payload: &'a [u8], unit_start: bool) -> Option<&'a [u
 }
 
 /// Publishes accumulated video data as a MediaFrame.
-async fn publish_video(data: &[u8], source: &zlmediakit_core::media_source::MediaSource, timestamp: &mut u32) {
+async fn publish_video(
+    data: &[u8],
+    source: &zlmediakit_core::media_source::MediaSource,
+    timestamp: &mut u32,
+) {
     if data.len() < 4 {
         return;
     }
@@ -430,7 +445,11 @@ async fn publish_video(data: &[u8], source: &zlmediakit_core::media_source::Medi
 }
 
 /// Publishes accumulated audio data as a MediaFrame.
-async fn publish_audio(data: &[u8], source: &zlmediakit_core::media_source::MediaSource, timestamp: &mut u32) {
+async fn publish_audio(
+    data: &[u8],
+    source: &zlmediakit_core::media_source::MediaSource,
+    timestamp: &mut u32,
+) {
     if data.len() < 7 {
         return;
     }
@@ -449,7 +468,11 @@ async fn publish_audio(data: &[u8], source: &zlmediakit_core::media_source::Medi
 }
 
 /// Fallback: publish raw data as a video frame (pre-TS behaviour).
-async fn publish_raw_frame(data: &[u8], source: &zlmediakit_core::media_source::MediaSource, timestamp: &mut u32) {
+async fn publish_raw_frame(
+    data: &[u8],
+    source: &zlmediakit_core::media_source::MediaSource,
+    timestamp: &mut u32,
+) {
     if data.len() >= 5 {
         let codec = detect_codec(data);
         let key_frame = is_keyframe(data, codec);
@@ -499,10 +522,18 @@ fn detect_codec(data: &[u8]) -> CodecId {
             if let Some(&b) = data.get(offset + 3) {
                 let nal6 = (b >> 1) & 0x3F;
                 let nal5 = b & 0x1F;
-                if matches!(nal6, 32..=34) { return CodecId::H265; }
-                if matches!(nal5, 5 | 7 | 8) { return CodecId::H264; }
-                if matches!(nal6, 16..=21) { return CodecId::H265; }
-                if nal5 > 0 { return CodecId::H264; }
+                if matches!(nal6, 32..=34) {
+                    return CodecId::H265;
+                }
+                if matches!(nal5, 5 | 7 | 8) {
+                    return CodecId::H264;
+                }
+                if matches!(nal6, 16..=21) {
+                    return CodecId::H265;
+                }
+                if nal5 > 0 {
+                    return CodecId::H264;
+                }
             }
             return CodecId::H264;
         }
@@ -531,7 +562,7 @@ fn is_keyframe(data: &[u8], codec: CodecId) -> bool {
                 if (w[0] == 0 && w[1] == 0 && w[2] == 1)
                     || (w[0] == 0 && w[1] == 0 && w[2] == 0 && w[3] == 1)
                 {
-                    let b = if w[2] == 1 { w[3] } else { w[3] }; // byte after start code
+                    let b = w[3]; // byte after start code
                     let nal_type = (b >> 1) & 0x3F;
                     return (16..=21).contains(&nal_type);
                 }

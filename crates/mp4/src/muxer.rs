@@ -696,15 +696,11 @@ fn write_stco(buf: &mut BytesMut, chunk_offset: u32) {
 fn parse_avcc_config(data: &[u8]) -> Vec<u8> {
     // data includes the 5-byte FLV video tag header [codec_id, packet_type, comp_time(3)],
     // so the actual AVCDecoderConfigurationRecord starts at offset 5.
-    let inner = if data.len() > 5 { &data[5..] } else { return vec![
-        1,
-        0x42,
-        0,
-        0x1e,
-        0xff,
-        0xe1,
-        0, 25,
-    ]; };
+    let inner = if data.len() > 5 {
+        &data[5..]
+    } else {
+        return vec![1, 0x42, 0, 0x1e, 0xff, 0xe1, 0, 25];
+    };
     if inner.is_empty() {
         return vec![1, 0x42, 0, 0x1e, 0xff, 0xe1, 0, 25];
     }
@@ -741,7 +737,11 @@ fn parse_avcc_config(data: &[u8]) -> Vec<u8> {
 }
 
 fn parse_hvcc_config(data: &[u8]) -> Vec<u8> {
-    let inner = if data.len() > 5 { &data[5..] } else { return vec![1]; };
+    let inner = if data.len() > 5 {
+        &data[5..]
+    } else {
+        return vec![1];
+    };
     if inner.is_empty() {
         return vec![1];
     }
@@ -880,6 +880,43 @@ fn config_to_sample_rate(config: &[u8]) -> u32 {
         }
     } else {
         44100
+    }
+}
+
+fn extract_video_info(codec: &CodecId, data: &[u8]) -> Option<(u32, u32, f64)> {
+    let inner = if data.len() > 5 { &data[5..] } else { data };
+    match codec {
+        CodecId::H264 => {
+            let nals = split_nalus_avcc(inner);
+            for nal in &nals {
+                if nal.len() >= 5 && (nal[0] & 0x1f) == 7 {
+                    let width = ((nal[3] as u32) << 8) | (nal[4] as u32);
+                    let height = if nal.len() > 6 {
+                        ((nal[5] as u32) << 8) | (nal[6] as u32)
+                    } else {
+                        0
+                    };
+                    return Some((width, height, 30.0));
+                }
+            }
+            None
+        }
+        CodecId::H265 => {
+            let nals = split_nalus_avcc(inner);
+            for nal in &nals {
+                if nal.len() >= 6 && (nal[0] >> 1) == 17 {
+                    let width = ((nal[4] as u32) << 8) | (nal[5] as u32);
+                    let height = if nal.len() > 7 {
+                        ((nal[6] as u32) << 8) | (nal[7] as u32)
+                    } else {
+                        0
+                    };
+                    return Some((width, height, 30.0));
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -1044,42 +1081,5 @@ mod tests {
         muxer.finalize();
         assert_eq!(muxer.samples.len(), 3);
         assert_eq!(&muxer.samples[0].data[..], b"\x17\x01\x00\x00\x00\xAA");
-    }
-}
-
-fn extract_video_info(codec: &CodecId, data: &[u8]) -> Option<(u32, u32, f64)> {
-    let inner = if data.len() > 5 { &data[5..] } else { data };
-    match codec {
-        CodecId::H264 => {
-            let nals = split_nalus_avcc(inner);
-            for nal in &nals {
-                if nal.len() >= 5 && (nal[0] & 0x1f) == 7 {
-                    let width = ((nal[3] as u32) << 8) | (nal[4] as u32);
-                    let height = if nal.len() > 6 {
-                        ((nal[5] as u32) << 8) | (nal[6] as u32)
-                    } else {
-                        0
-                    };
-                    return Some((width, height, 30.0));
-                }
-            }
-            None
-        }
-        CodecId::H265 => {
-            let nals = split_nalus_avcc(inner);
-            for nal in &nals {
-                if nal.len() >= 6 && (nal[0] >> 1) == 17 {
-                    let width = ((nal[4] as u32) << 8) | (nal[5] as u32);
-                    let height = if nal.len() > 7 {
-                        ((nal[6] as u32) << 8) | (nal[7] as u32)
-                    } else {
-                        0
-                    };
-                    return Some((width, height, 30.0));
-                }
-            }
-            None
-        }
-        _ => None,
     }
 }

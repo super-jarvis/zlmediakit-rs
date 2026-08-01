@@ -41,7 +41,9 @@ impl XmlNode {
 
     /// Text of the first descendant with the given name, if present.
     pub fn descendant_text(&self, name: &str) -> Option<&str> {
-        self.descendants_named(name).first().map(|n| n.text.as_str())
+        self.descendants_named(name)
+            .first()
+            .map(|n| n.text.as_str())
     }
 
     /// All descendants (including direct children) with the given name.
@@ -90,12 +92,7 @@ fn parse_element(bytes: &[u8], pos: usize) -> Option<(XmlNode, usize)> {
         return None;
     }
     let name_start = p;
-    while p < bytes.len()
-        && !matches!(
-            bytes[p],
-            b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n'
-        )
-    {
+    while p < bytes.len() && !matches!(bytes[p], b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n') {
         p += 1;
     }
     if p >= bytes.len() {
@@ -124,10 +121,7 @@ fn parse_element(bytes: &[u8], pos: usize) -> Option<(XmlNode, usize)> {
         }
         let a_start = p;
         while p < bytes.len()
-            && !matches!(
-                bytes[p],
-                b'=' | b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n'
-            )
+            && !matches!(bytes[p], b'=' | b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n')
         {
             p += 1;
         }
@@ -159,7 +153,14 @@ fn parse_element(bytes: &[u8], pos: usize) -> Option<(XmlNode, usize)> {
     }
 
     if self_closing {
-        return Some((XmlNode { name, attrs, ..Default::default() }, p));
+        return Some((
+            XmlNode {
+                name,
+                attrs,
+                ..Default::default()
+            },
+            p,
+        ));
     }
 
     let mut children = Vec::new();
@@ -181,7 +182,9 @@ fn parse_element(bytes: &[u8], pos: usize) -> Option<(XmlNode, usize)> {
             if q >= bytes.len() {
                 return None;
             }
-            let close = String::from_utf8_lossy(&bytes[lt + 2..q]).trim().to_string();
+            let close = String::from_utf8_lossy(&bytes[lt + 2..q])
+                .trim()
+                .to_string();
             if close != name {
                 return None;
             }
@@ -218,7 +221,10 @@ fn starts_with(bytes: &[u8], pos: usize, pat: &[u8]) -> bool {
 }
 
 fn find_byte(bytes: &[u8], from: usize, needle: u8) -> Option<usize> {
-    bytes[from..].iter().position(|&b| b == needle).map(|i| from + i)
+    bytes[from..]
+        .iter()
+        .position(|&b| b == needle)
+        .map(|i| from + i)
 }
 
 /// Returns the position immediately after the pattern, or `None`.

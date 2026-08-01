@@ -78,7 +78,10 @@ impl ChannelInfo {
         Some(Self {
             channel_id,
             name: item.text_of("Name").unwrap_or("").trim().to_string(),
-            manufacturer: item.text_of("Manufacturer").map(str::trim).map(str::to_string),
+            manufacturer: item
+                .text_of("Manufacturer")
+                .map(str::trim)
+                .map(str::to_string),
             model: item.text_of("Model").map(str::trim).map(str::to_string),
             owner: item.text_of("Owner").map(str::trim).map(str::to_string),
             civil_code: item.text_of("CivilCode").map(str::trim).map(str::to_string),
@@ -123,8 +126,14 @@ impl DeviceInfo {
         let num = |n: &str| root.text_of(n).and_then(|s| s.trim().parse().ok());
         Self {
             device_id: root.text_of("DeviceID").unwrap_or("").trim().to_string(),
-            name: root.text_of("DeviceName").map(str::trim).map(str::to_string),
-            manufacturer: root.text_of("Manufacturer").map(str::trim).map(str::to_string),
+            name: root
+                .text_of("DeviceName")
+                .map(str::trim)
+                .map(str::to_string),
+            manufacturer: root
+                .text_of("Manufacturer")
+                .map(str::trim)
+                .map(str::to_string),
             model: root.text_of("Model").map(str::trim).map(str::to_string),
             firmware: root.text_of("Firmware").map(str::trim).map(str::to_string),
             address: root.text_of("Address").map(str::trim).map(str::to_string),
@@ -457,7 +466,12 @@ impl SipServer {
             sdp
         );
         self.socket.send_to(invite.as_bytes(), device.addr).await?;
-        info!(device = device_id, channel = channel_id, media_port, "gb28181 invite sent");
+        info!(
+            device = device_id,
+            channel = channel_id,
+            media_port,
+            "gb28181 invite sent"
+        );
         self.pending.insert(
             call_id,
             InviteCtx {
@@ -477,9 +491,7 @@ impl SipServer {
         let xml = format!(
             "<?xml version=\"1.0\"?>\n<Query>\n<CmdType>Catalog</CmdType>\n<SN>{sn}</SN>\n<DeviceID>{device_id}</DeviceID>\n</Query>"
         );
-        let root = self
-            .send_query(device_id, &device, &xml, sn)
-            .await?;
+        let root = self.send_query(device_id, &device, &xml, sn).await?;
         let channels = parse_catalog(&root);
         if let Some(mut d) = self.devices.get_mut(device_id) {
             d.channels = channels.clone();
@@ -567,7 +579,13 @@ impl SipServer {
         base.saturating_add(n)
     }
 
-    fn send_response(&self, addr: SocketAddr, status_line: &str, headers: &[(&str, String)], body: &str) {
+    fn send_response(
+        &self,
+        addr: SocketAddr,
+        status_line: &str,
+        headers: &[(&str, String)],
+        body: &str,
+    ) {
         let mut msg = format!("SIP/2.0 {}\r\n", status_line);
         for (k, v) in headers {
             msg.push_str(&format!("{}: {}\r\n", k, v));
@@ -579,7 +597,17 @@ impl SipServer {
         }
     }
 
-    fn ack(&self, addr: SocketAddr, ctx: &InviteCtx, call_id: &str, to: &str, from: &str, via: &str, cseq: &str) {
+    #[allow(clippy::too_many_arguments)]
+    fn ack(
+        &self,
+        addr: SocketAddr,
+        ctx: &InviteCtx,
+        call_id: &str,
+        to: &str,
+        from: &str,
+        via: &str,
+        cseq: &str,
+    ) {
         let ack = format!(
             "ACK sip:{}@{}:{} SIP/2.0\r\n\
              Via: {}\r\n\
@@ -600,7 +628,11 @@ impl SipServer {
         );
         let _ = self.socket.try_send_to(ack.as_bytes(), addr);
         self.active.insert(call_id.to_string(), ctx.clone());
-        info!(channel = ctx.channel_id, media_port = ctx.media_port, "gb28181 stream active");
+        info!(
+            channel = ctx.channel_id,
+            media_port = ctx.media_port,
+            "gb28181 stream active"
+        );
     }
 
     fn handle_register(&self, addr: SocketAddr, msg: &SipMessage) {
@@ -690,7 +722,10 @@ impl SipServer {
 
     /// Deliver a response to a pending query if the SN matches.
     fn forward_query_response(&self, root: &XmlNode) {
-        if let Some(sn) = root.text_of("SN").and_then(|s| s.trim().parse::<u32>().ok()) {
+        if let Some(sn) = root
+            .text_of("SN")
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
             if let Some((_, tx)) = self.pending_queries.remove(&sn) {
                 let _ = tx.send(root.clone());
             }
@@ -848,7 +883,11 @@ impl SipServer {
         let tag = gen_tag();
         if let Some((_, ctx)) = self.active.remove(&call_id) {
             self.rtp.close(ctx.media_port);
-            info!(channel = ctx.channel_id, media_port = ctx.media_port, "gb28181 stream stopped");
+            info!(
+                channel = ctx.channel_id,
+                media_port = ctx.media_port,
+                "gb28181 stream stopped"
+            );
         } else if let Some((_, ctx)) = self.pending.remove(&call_id) {
             self.rtp.close(ctx.media_port);
         }
@@ -941,7 +980,8 @@ impl SipServer {
                 info!("gb28181 sip receive loop exiting");
                 break;
             }
-            match tokio::time::timeout(Duration::from_millis(500), self.socket.recv_from(&mut buf)).await
+            match tokio::time::timeout(Duration::from_millis(500), self.socket.recv_from(&mut buf))
+                .await
             {
                 Ok(Ok((n, addr))) => {
                     if let Some(msg) = parse_sip(&buf[..n]) {
@@ -1083,7 +1123,14 @@ impl SipServer {
 ///
 /// `auth` looks like: `Digest username="...", realm="...", nonce="...",
 /// uri="...", response="..."`.
-fn check_digest(auth: &str, user: &str, password: &str, uri: &str, method: &str, realm: &str) -> bool {
+fn check_digest(
+    auth: &str,
+    user: &str,
+    password: &str,
+    uri: &str,
+    method: &str,
+    realm: &str,
+) -> bool {
     let mut map: HashMap<String, String> = HashMap::new();
     let inner = auth.strip_prefix("Digest").unwrap_or(auth);
     for part in inner.split(',') {
@@ -1097,7 +1144,10 @@ fn check_digest(auth: &str, user: &str, password: &str, uri: &str, method: &str,
         Some(r) => r.to_ascii_lowercase(),
         None => return false,
     };
-    let realm = map.get("realm").cloned().unwrap_or_else(|| realm.to_string());
+    let realm = map
+        .get("realm")
+        .cloned()
+        .unwrap_or_else(|| realm.to_string());
     let nonce = match map.get("nonce") {
         Some(n) => n.clone(),
         None => return false,
@@ -1105,12 +1155,7 @@ fn check_digest(auth: &str, user: &str, password: &str, uri: &str, method: &str,
     let uri = map.get("uri").cloned().unwrap_or_else(|| uri.to_string());
     let a1 = format!("{}:{}:{}", user, realm, password);
     let a2 = format!("{}:{}", method, uri);
-    let expected = md5_hex(&format!(
-        "{}:{}:{}",
-        md5_hex(&a1),
-        nonce,
-        md5_hex(&a2)
-    ));
+    let expected = md5_hex(&format!("{}:{}:{}", md5_hex(&a1), nonce, md5_hex(&a2)));
     expected == response
 }
 
@@ -1178,10 +1223,7 @@ mod tests {
             uri_user("<sip:34020000001320000001@1.2.3.4:5060>"),
             Some("34020000001320000001".to_string())
         );
-        assert_eq!(
-            uri_user("sip:dev@host"),
-            Some("dev".to_string())
-        );
+        assert_eq!(uri_user("sip:dev@host"), Some("dev".to_string()));
     }
 
     #[test]
@@ -1247,12 +1289,7 @@ mod tests {
         let nonce = "abc123";
         let a1 = format!("{user}:{realm}:{password}");
         let a2 = format!("REGISTER:{uri}");
-        let response = md5_hex(&format!(
-            "{}:{}:{}",
-            md5_hex(&a1),
-            nonce,
-            md5_hex(&a2)
-        ));
+        let response = md5_hex(&format!("{}:{}:{}", md5_hex(&a1), nonce, md5_hex(&a2)));
         let auth = format!(
             "Digest username=\"{user}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response}\""
         );
@@ -1315,7 +1352,16 @@ mod tests {
 
         // REGISTER.
         dev.send_to(
-            sip_msg("REGISTER", dev_addr, sip_addr.port(), "dev1@host", 1, "3600", "").as_bytes(),
+            sip_msg(
+                "REGISTER",
+                dev_addr,
+                sip_addr.port(),
+                "dev1@host",
+                1,
+                "3600",
+                "",
+            )
+            .as_bytes(),
             sip_addr,
         )
         .await
@@ -1332,8 +1378,16 @@ mod tests {
         // MESSAGE Keepalive with Interval=30 -> expires becomes 90s.
         let keepalive = "<?xml version=\"1.0\"?><Notify><CmdType>Keepalive</CmdType><SN>1</SN><DeviceID>34020000001320000001</DeviceID><Status>OK</Status><Interval>30</Interval></Notify>";
         dev.send_to(
-            sip_msg("MESSAGE", dev_addr, sip_addr.port(), "dev1@host", 2, "3600", keepalive)
-                .as_bytes(),
+            sip_msg(
+                "MESSAGE",
+                dev_addr,
+                sip_addr.port(),
+                "dev1@host",
+                2,
+                "3600",
+                keepalive,
+            )
+            .as_bytes(),
             sip_addr,
         )
         .await
@@ -1345,8 +1399,16 @@ mod tests {
         // MESSAGE Catalog with a channel, then verify it is cached.
         let catalog = r#"<?xml version="1.0"?><Response><CmdType>Catalog</CmdType><SN>1</SN><DeviceID>34020000001320000001</DeviceID><DeviceList Num="1"><Item><DeviceID>34020000001320000002</DeviceID><Name>Cam</Name><Status>ON</Status></Item></DeviceList></Response>"#;
         dev.send_to(
-            sip_msg("MESSAGE", dev_addr, sip_addr.port(), "dev1@host", 3, "3600", catalog)
-                .as_bytes(),
+            sip_msg(
+                "MESSAGE",
+                dev_addr,
+                sip_addr.port(),
+                "dev1@host",
+                3,
+                "3600",
+                catalog,
+            )
+            .as_bytes(),
             sip_addr,
         )
         .await
@@ -1359,7 +1421,16 @@ mod tests {
 
         // Un-register (Expires: 0).
         dev.send_to(
-            sip_msg("REGISTER", dev_addr, sip_addr.port(), "dev1@host", 4, "0", "").as_bytes(),
+            sip_msg(
+                "REGISTER",
+                dev_addr,
+                sip_addr.port(),
+                "dev1@host",
+                4,
+                "0",
+                "",
+            )
+            .as_bytes(),
             sip_addr,
         )
         .await

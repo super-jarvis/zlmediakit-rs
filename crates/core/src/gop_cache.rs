@@ -135,6 +135,25 @@ impl Default for GopCache {
     }
 }
 
+pub fn is_config_frame(frame: &MediaFrame) -> bool {
+    if frame.frame_type == FrameType::Video && frame.data.len() >= 2 {
+        let codec_id = frame.data[0] & 0x0F;
+        if codec_id == 7 {
+            return (frame.data[1] & 0x0F) == 0;
+        }
+        if codec_id == 12 && frame.data.len() >= 5 {
+            return (frame.data[1] & 0x0F) == 0;
+        }
+    }
+    if frame.frame_type == FrameType::Audio && frame.data.len() >= 2 {
+        let sound_format = (frame.data[0] >> 4) & 0x0F;
+        if sound_format == 10 {
+            return (frame.data[1] & 0x0F) == 0;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,23 +333,4 @@ mod tests {
             }
         }
     }
-}
-
-pub fn is_config_frame(frame: &MediaFrame) -> bool {
-    if frame.frame_type == FrameType::Video && frame.data.len() >= 2 {
-        let codec_id = frame.data[0] & 0x0F;
-        if codec_id == 7 {
-            return (frame.data[1] & 0x0F) == 0;
-        }
-        if codec_id == 12 && frame.data.len() >= 5 {
-            return (frame.data[1] & 0x0F) == 0;
-        }
-    }
-    if frame.frame_type == FrameType::Audio && frame.data.len() >= 2 {
-        let sound_format = (frame.data[0] >> 4) & 0x0F;
-        if sound_format == 10 {
-            return (frame.data[1] & 0x0F) == 0;
-        }
-    }
-    false
 }

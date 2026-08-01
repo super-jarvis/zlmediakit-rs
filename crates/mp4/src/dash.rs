@@ -46,7 +46,10 @@ pub fn build_mpd(
     xml.push_str(r#"profiles="urn:mpeg:dash:profile:isoff-live:2011" "#);
     xml.push_str(r#"type="dynamic" "#);
     if let Some(repr) = representations.first() {
-        xml.push_str(&format!(r#"minBufferTime="PT{}S" "#, repr.segment_duration_secs * 2));
+        xml.push_str(&format!(
+            r#"minBufferTime="PT{}S" "#,
+            repr.segment_duration_secs * 2
+        ));
     }
     xml.push_str(r#"minimumUpdatePeriod="PT2S">"#);
     xml.push('\n');
@@ -104,7 +107,7 @@ fn write_representation(
         xml.push_str(&format!(r#"width="{}" height="{}" "#, r.width, r.height));
     }
     xml.push_str(&format!(r#"bandwidth="{}" "#, r.bandwidth));
-    xml.push_str(&format!(r#"frameRate="30" "#));
+    xml.push_str(r#"frameRate="30" "#);
     xml.push_str(">\n");
 
     xml.push_str(&format!(
@@ -136,10 +139,7 @@ pub fn codec_string(codec: CodecId, config: &[u8]) -> String {
                 return "avc1.64001f".to_string(); // default
             };
             if avcc.len() >= 4 {
-                format!(
-                    "avc1.{:02X}{:02X}{:02X}",
-                    avcc[1], avcc[2], avcc[3]
-                )
+                format!("avc1.{:02X}{:02X}{:02X}", avcc[1], avcc[2], avcc[3])
             } else {
                 "avc1.64001f".to_string()
             }
@@ -176,7 +176,7 @@ pub fn codec_string(codec: CodecId, config: &[u8]) -> String {
                 config
             };
             if aac_cfg.len() >= 2 {
-                let audio_object_type = ((aac_cfg[0] >> 3) & 0x1F) as u8;
+                let audio_object_type = (aac_cfg[0] >> 3) & 0x1F;
                 let _freq_idx = ((aac_cfg[0] & 0x07) << 1) | ((aac_cfg[1] >> 7) & 0x01);
                 format!("mp4a.40.{}", audio_object_type)
             } else {
@@ -210,7 +210,7 @@ pub fn codec_to_video_codec_id(codec: CodecId) -> u8 {
         CodecId::H265 => 12,
         CodecId::VP8 => 8,
         CodecId::VP9 => 9,
-        CodecId::AV1 => 13,  // enhanced RTMP
+        CodecId::AV1 => 13, // enhanced RTMP
         _ => 7,
     }
 }
@@ -232,7 +232,12 @@ mod tests {
             bandwidth: 2000000,
         }];
 
-        let mpd = build_mpd(&reprs, "$RepresentationID$/init.mp4", "$RepresentationID$/seg-$Number$.m4s", 1);
+        let mpd = build_mpd(
+            &reprs,
+            "$RepresentationID$/init.mp4",
+            "$RepresentationID$/seg-$Number$.m4s",
+            1,
+        );
         assert!(mpd.contains("<MPD"));
         assert!(mpd.contains("type=\"dynamic\""));
         assert!(mpd.contains("Representation"));

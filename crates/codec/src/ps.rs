@@ -224,9 +224,8 @@ pub fn parse_one_pes(data: &[u8]) -> Result<Option<(PesPacket, usize)>, PsError>
             _ => {
                 // Should be PES (0xC0-0xEF for audio/video)
                 if sc >= 0xC0 {
-                    return parse_pes_packet(&data[pos..]).map(|opt| {
-                        opt.map(|(pkt, consumed)| (pkt, pos + consumed))
-                    });
+                    return parse_pes_packet(&data[pos..])
+                        .map(|opt| opt.map(|(pkt, consumed)| (pkt, pos + consumed)));
                 }
                 // Unknown start code — skip past it and resync to the next entity
                 pos += 4;
@@ -309,11 +308,25 @@ fn parse_pes_packet(data: &[u8]) -> Result<Option<(PesPacket, usize)>, PsError> 
     };
 
     if pos >= payload_end {
-        return Ok(Some((PesPacket { stream_id, data: Bytes::new(), pts }, payload_end)));
+        return Ok(Some((
+            PesPacket {
+                stream_id,
+                data: Bytes::new(),
+                pts,
+            },
+            payload_end,
+        )));
     }
     let payload = Bytes::copy_from_slice(&data[pos..payload_end]);
 
-    Ok(Some((PesPacket { stream_id, data: payload, pts }, payload_end)))
+    Ok(Some((
+        PesPacket {
+            stream_id,
+            data: payload,
+            pts,
+        },
+        payload_end,
+    )))
 }
 
 /// Extracts H.264/H.265 NAL units from a PES video payload.
@@ -328,7 +341,9 @@ pub fn extract_nalus_from_pes(payload: &[u8]) -> Vec<Bytes> {
         if payload[pos] == 0x00
             && payload[pos + 1] == 0x00
             && (payload[pos + 2] == 0x01
-                || (payload[pos + 2] == 0x00 && pos + 3 < payload.len() && payload[pos + 3] == 0x01))
+                || (payload[pos + 2] == 0x00
+                    && pos + 3 < payload.len()
+                    && payload[pos + 3] == 0x01))
         {
             found_annexb = true;
             let sc_start = pos;
@@ -409,7 +424,7 @@ mod tests {
         data.extend_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
         data.extend_from_slice(&[0x44, 0x00, 0x04, 0x00, 0x04, 0x01]); // SCR fields (6 bytes)
         data.extend_from_slice(&[0x01, 0x02, 0x03, 0xF8]); // mux_rate(3) + stuffing_len=0
-        // PES video
+                                                           // PES video
         let pes_payload = vec![0x00, 0x00, 0x00, 0x01, 0x09, 0x10, 0x20, 0x30];
         let pes_len = 7 + pes_payload.len(); // flags(1) + hdr_len(1) + PTS(5) + payload
         data.push(0x00);
@@ -420,7 +435,7 @@ mod tests {
         // Flags: PTS present, PES header data length = 5
         data.push(0x80); // PTS only
         data.push(0x05); // PES hdr data len = 5
-        // PTS (5 bytes)
+                         // PTS (5 bytes)
         data.extend_from_slice(&[0x21, 0x00, 0x01, 0x00, 0x01]);
         // Payload
         data.extend_from_slice(&pes_payload);
@@ -437,8 +452,7 @@ mod tests {
     #[test]
     fn extract_nalus_annexb() {
         let data = vec![
-            0x00, 0x00, 0x00, 0x01, 0x09, 0x10, 0x11,
-            0x00, 0x00, 0x00, 0x01, 0x21, 0x30, 0x31,
+            0x00, 0x00, 0x00, 0x01, 0x09, 0x10, 0x11, 0x00, 0x00, 0x00, 0x01, 0x21, 0x30, 0x31,
         ];
         let nalus = extract_nalus_from_pes(&data);
         assert_eq!(nalus.len(), 2);
@@ -448,8 +462,7 @@ mod tests {
     fn ps_header_skip() {
         // Just a PS pack header — should return None (incomplete, no PES)
         let data = [
-            0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00,
-            0x04, 0x01, 0x01, 0x02, 0x03, 0xFE,
+            0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x02, 0x03, 0xFE,
         ];
         let result = parse_one_pes(&data);
         assert!(matches!(result, Ok(None)));
@@ -465,7 +478,9 @@ mod tests {
         data
     }
 
-    const PACK_HEADER: [u8; 14] = [0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x02, 0x03, 0xF8];
+    const PACK_HEADER: [u8; 14] = [
+        0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x02, 0x03, 0xF8,
+    ];
 
     #[test]
     fn pes_packet_len_zero() {
@@ -530,7 +545,9 @@ mod tests {
         let payload = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x99, 0xAA];
         let mut data = build_pes(0xE0, 0, &payload);
         // Next pack header marks the PES end.
-        data.extend_from_slice(&[0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x02, 0x03, 0xF8]);
+        data.extend_from_slice(&[
+            0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x02, 0x03, 0xF8,
+        ]);
 
         let mut demuxer = PsDemuxer::new();
         demuxer.push(&data[..10]);

@@ -5,8 +5,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 use zlmediakit_core::auth::StreamAuth;
-use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::event_bus::EventBus;
+use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_rtmp::amf::{AmfEncoder, AmfValue};
 use zlmediakit_rtmp::message::{RtmpMessage, RtmpMessageEncoder, RtmpMessageParser};
@@ -136,9 +136,17 @@ async fn rtmp_e2e_publish_then_wsflv_play() {
     let auth = StreamAuth::new(false, String::new());
 
     let addr = format!("127.0.0.1:{}", TEST_PORT);
-    let srv = RtmpServer::new(&addr, mgr.clone(), event_bus, auth, HookClient::empty(), None, None)
-        .await
-        .expect("RtmpServer should start");
+    let srv = RtmpServer::new(
+        &addr,
+        mgr.clone(),
+        event_bus,
+        auth,
+        HookClient::empty(),
+        None,
+        None,
+    )
+    .await
+    .expect("RtmpServer should start");
 
     tokio::spawn(async move {
         let _ = srv.run().await;
@@ -194,11 +202,9 @@ async fn rtmp_e2e_publish_then_wsflv_play() {
         msgs.iter().any(|m| {
             if let RtmpMessage::Amf0Command { data, .. } = m {
                 let vals = zlmediakit_rtmp::amf::AmfDecoder::decode(data).ok();
-                vals.map_or(false, |v| {
-                    v.first().map_or(
-                        false,
-                        |f| matches!(f, AmfValue::String(s) if s == "_result"),
-                    )
+                vals.is_some_and(|v| {
+                    v.first()
+                        .is_some_and(|f| matches!(f, AmfValue::String(s) if s == "_result"))
                 })
             } else {
                 false
@@ -232,10 +238,10 @@ async fn rtmp_e2e_publish_then_wsflv_play() {
         .find_map(|m| {
             if let RtmpMessage::Amf0Command { data, .. } = m {
                 let vals = zlmediakit_rtmp::amf::AmfDecoder::decode(data).ok()?;
-                if vals.first().map_or(
-                    false,
-                    |v| matches!(v, AmfValue::String(s) if s == "_result"),
-                ) {
+                if vals
+                    .first()
+                    .is_some_and(|v| matches!(v, AmfValue::String(s) if s == "_result"))
+                {
                     vals.get(3).and_then(|v| match v {
                         AmfValue::Number(n) => Some(*n as u32),
                         _ => None,
@@ -269,11 +275,9 @@ async fn rtmp_e2e_publish_then_wsflv_play() {
     let publish_ok = msgs.iter().any(|m| {
         if let RtmpMessage::Amf0Command { data, .. } = m {
             let vals = zlmediakit_rtmp::amf::AmfDecoder::decode(data).ok();
-            vals.map_or(false, |v| {
-                v.first().map_or(
-                    false,
-                    |f| matches!(f, AmfValue::String(s) if s == "onStatus"),
-                )
+            vals.is_some_and(|v| {
+                v.first()
+                    .is_some_and(|f| matches!(f, AmfValue::String(s) if s == "onStatus"))
             })
         } else {
             false

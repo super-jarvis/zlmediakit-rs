@@ -223,7 +223,8 @@ impl RtspSession {
 
         let source = self
             .source_manager
-            .get("__defaultVhost__", &self.app, &self.stream_name);
+            .get_or_pull("__defaultVhost__", &self.app, &self.stream_name)
+            .await;
 
         info!("RTSP DESCRIBE source found: {}", source.is_some());
 
@@ -257,7 +258,13 @@ impl RtspSession {
                         None => (false, 44100, 1),
                     }
                 };
-                let sdp = self.generate_sdp(video_codec, hevc_sprop, has_audio, audio_sample_rate, audio_channels);
+                let sdp = self.generate_sdp(
+                    video_codec,
+                    hevc_sprop,
+                    has_audio,
+                    audio_sample_rate,
+                    audio_channels,
+                );
                 let response = RtspResponse::new(200, "OK")
                     .with_header("CSeq", &self.cseq.to_string())
                     .with_header("Content-Type", "application/sdp")
@@ -371,7 +378,8 @@ impl RtspSession {
         if self.source.is_none() {
             self.source = self
                 .source_manager
-                .get("__defaultVhost__", &self.app, &self.stream_name);
+                .get_or_pull("__defaultVhost__", &self.app, &self.stream_name)
+                .await;
         }
 
         if self.source.is_none() {

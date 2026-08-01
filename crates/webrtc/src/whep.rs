@@ -224,7 +224,14 @@ pub async fn whep_play(
     spawn_pump(source, video_track, audio_track);
 
     info!("webrtc: WHEP session {} negotiated", resource);
-    Ok((answer_sdp, WhepSession { pc, resource, data_tx }))
+    Ok((
+        answer_sdp,
+        WhepSession {
+            pc,
+            resource,
+            data_tx,
+        },
+    ))
 }
 
 #[cfg(not(feature = "transcode"))]

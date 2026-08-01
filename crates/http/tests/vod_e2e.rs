@@ -30,7 +30,7 @@ async fn http_request(request: &str, port: u16) -> (u16, Vec<u8>, String) {
     let s = String::from_utf8_lossy(&buf).to_string();
     let status_line = &s[..s.find("\r\n").unwrap_or(0)];
     let code = status_line
-        .splitn(3, ' ')
+        .split(' ')
         .nth(1)
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);
@@ -367,11 +367,13 @@ async fn mp4_vod_flv_remux_playback() {
     let dir = Path::new(RECORD_BASE).join("mp4vod");
     tokio::fs::create_dir_all(&dir).await.unwrap();
     let mp4 = build_sample_mp4();
-    tokio::fs::write(dir.join("sample.mp4"), &mp4).await.unwrap();
+    tokio::fs::write(dir.join("sample.mp4"), &mp4)
+        .await
+        .unwrap();
 
     // Request the MP4 file remuxed as an HTTP-FLV stream.
     let (code, body, resp) = http_request(
-        &format!("GET /record/mp4vod/sample.mp4.flv HTTP/1.0\r\nHost: localhost\r\n\r\n"),
+        "GET /record/mp4vod/sample.mp4.flv HTTP/1.0\r\nHost: localhost\r\n\r\n",
         port,
     )
     .await;

@@ -26,7 +26,7 @@ async fn http_get(path: &str, port: u16) -> (u16, Vec<u8>) {
     let pos = s.find("\r\n").unwrap_or(0);
     let status_line = &s[..pos];
     let code = status_line
-        .splitn(3, ' ')
+        .split(' ')
         .nth(1)
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);
@@ -248,7 +248,7 @@ async fn recording_api_start_stop_via_http() {
         .filter(|e| e.path().extension().map(|x| x == "flv").unwrap_or(false))
         .collect();
     assert_eq!(flv_files.len(), 1, "should have one FLV file");
-    let data = std::fs::read(&flv_files[0].path()).expect("read flv file");
+    let data = std::fs::read(flv_files[0].path()).expect("read flv file");
     assert_eq!(&data[..3], b"FLV", "should be valid FLV file");
 
     source.close();

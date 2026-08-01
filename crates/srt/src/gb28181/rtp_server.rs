@@ -53,7 +53,7 @@ impl RtpPayloadType {
         }
     }
 
-    pub fn from_str(s: &str) -> RtpPayloadType {
+    pub fn parse(s: &str) -> RtpPayloadType {
         match s.to_ascii_lowercase().as_str() {
             "ps" => RtpPayloadType::Ps,
             "ts" => RtpPayloadType::Ts,
@@ -68,9 +68,10 @@ impl RtpPayloadType {
 
     fn clock_rate(&self) -> u32 {
         match self {
-            RtpPayloadType::Ps | RtpPayloadType::Ts | RtpPayloadType::H264 | RtpPayloadType::H265 => {
-                90_000
-            }
+            RtpPayloadType::Ps
+            | RtpPayloadType::Ts
+            | RtpPayloadType::H264
+            | RtpPayloadType::H265 => 90_000,
             RtpPayloadType::Aac => 48_000,
             RtpPayloadType::G711A | RtpPayloadType::G711U => 8_000,
             RtpPayloadType::Raw => 90_000,
@@ -158,12 +159,12 @@ impl RtpStreamReceiver {
         let h264_type = nalu[4] & 0x1F;
         let h265_type = (nalu[4] >> 1) & 0x3F;
         // Disambiguate H.264 vs H.265 from SPS/PPS / slice types.
-        if h264_type == 7 || h264_type == 8 || (h264_type >= 1 && h264_type <= 5) {
+        if h264_type == 7 || h264_type == 8 || (1..=5).contains(&h264_type) {
             *video_codec = CodecId::H264;
         } else if h265_type == 32 || h265_type == 33 || h265_type == 34 {
             *video_codec = CodecId::H265;
         }
-        let key = h264_type == 5 || (h265_type >= 19 && h265_type <= 21);
+        let key = h264_type == 5 || (19..=21).contains(&h265_type);
         let frame = MediaFrame::new_video(
             0,
             *video_codec,
@@ -177,14 +178,7 @@ impl RtpStreamReceiver {
     }
 
     async fn publish_audio(&self, data: Bytes, pts_ms: u64) {
-        let frame = MediaFrame::new_audio(
-            1,
-            self.audio_codec,
-            pts_ms as u32,
-            pts_ms,
-            pts_ms,
-            data,
-        );
+        let frame = MediaFrame::new_audio(1, self.audio_codec, pts_ms as u32, pts_ms, pts_ms, data);
         self.publish(frame).await;
     }
 
@@ -367,7 +361,8 @@ impl RtpStreamReceiver {
             if self.shutdown.load(Ordering::SeqCst) {
                 break;
             }
-            match tokio::time::timeout(Duration::from_millis(500), self.socket.recv_from(&mut buf)).await
+            match tokio::time::timeout(Duration::from_millis(500), self.socket.recv_from(&mut buf))
+                .await
             {
                 Ok(Ok((n, _addr))) => {
                     self.stats.bytes.fetch_add(n as u64, Ordering::SeqCst);
@@ -377,7 +372,10 @@ impl RtpStreamReceiver {
                         .await;
                 }
                 Ok(Err(e)) => {
-                    error!(port = self.socket.local_addr().map(|a| a.port()).unwrap_or(0), "rtp recv error: {e}");
+                    error!(
+                        port = self.socket.local_addr().map(|a| a.port()).unwrap_or(0),
+                        "rtp recv error: {e}"
+                    );
                     break;
                 }
                 Err(_) => continue,
@@ -527,10 +525,10 @@ mod tests {
 
     #[test]
     fn test_payload_type_roundtrip() {
-        assert_eq!(RtpPayloadType::from_str("ps"), RtpPayloadType::Ps);
-        assert_eq!(RtpPayloadType::from_str("h265"), RtpPayloadType::H265);
-        assert_eq!(RtpPayloadType::from_str("g711a"), RtpPayloadType::G711A);
-        assert_eq!(RtpPayloadType::from_str("raw").as_str(), "raw");
+        assert_eq!(RtpPayloadType::parse("ps"), RtpPayloadType::Ps);
+        assert_eq!(RtpPayloadType::parse("h265"), RtpPayloadType::H265);
+        assert_eq!(RtpPayloadType::parse("g711a"), RtpPayloadType::G711A);
+        assert_eq!(RtpPayloadType::parse("raw").as_str(), "raw");
     }
 
     #[tokio::test]
@@ -538,14 +536,23 @@ mod tests {
         let mgr = std::sync::Arc::new(MediaSourceManager::new(None));
         let rtp = RtpServerManager::new(mgr.clone(), 30000);
         let port = rtp
-            .open(0, "__defaultVhost__", "rtp", "h264u", RtpPayloadType::H264, None)
+            .open(
+                0,
+                "__defaultVhost__",
+                "rtp",
+                "h264u",
+                RtpPayloadType::H264,
+                None,
+            )
             .await
             .unwrap();
         let src = mgr.get_or_create("__defaultVhost__", "rtp", "h264u");
         let mut rx = src.subscribe();
 
         // RTP header: v2, marker=1, pt=96, seq=1, ts=0, ssrc
-        let mut pkt = vec![0x80, 0xE0, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78];
+        let mut pkt = vec![
+            0x80, 0xE0, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78,
+        ];
         // H.264 IDR single NALU: nal_header type 5 (0x65) + payload
         pkt.extend_from_slice(&[0x65, 0x01, 0x02, 0x03, 0x04]);
 
@@ -566,7 +573,14 @@ mod tests {
         let mgr = std::sync::Arc::new(MediaSourceManager::new(None));
         let rtp = RtpServerManager::new(mgr.clone(), 31000);
         let p = rtp
-            .open(31010, "__defaultVhost__", "rtp", "c1", RtpPayloadType::Ps, None)
+            .open(
+                31010,
+                "__defaultVhost__",
+                "rtp",
+                "c1",
+                RtpPayloadType::Ps,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(p, 31010);
@@ -583,7 +597,14 @@ mod tests {
         let mgr = std::sync::Arc::new(MediaSourceManager::new(None));
         let rtp = RtpServerManager::new(mgr.clone(), 32000);
         let port = rtp
-            .open(32020, "__defaultVhost__", "rtp", "psu", RtpPayloadType::Ps, None)
+            .open(
+                32020,
+                "__defaultVhost__",
+                "rtp",
+                "psu",
+                RtpPayloadType::Ps,
+                None,
+            )
             .await
             .unwrap();
         let src = mgr.get_or_create("__defaultVhost__", "rtp", "psu");
@@ -592,18 +613,26 @@ mod tests {
         // Build a PS stream: pack header + video PES (length == 0) + pack header
         // terminator. The payload is an H.264 IDR NAL (Annex-B).
         let mut ps = Vec::new();
-        ps.extend_from_slice(&[0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x02, 0x03, 0xF8]);
+        ps.extend_from_slice(&[
+            0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x02, 0x03, 0xF8,
+        ]);
         let nalu = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x01, 0x02, 0x03, 0x04];
         // PES header: 00 00 01 E0, length 0, PTS-only flags, 5-byte PTS (9000
         // ticks @90kHz = 100ms: 0x21 0x00 0x01 0x46 0x51).
-        ps.extend_from_slice(&[0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x05, 0x21, 0x00, 0x01, 0x46, 0x51]);
+        ps.extend_from_slice(&[
+            0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x05, 0x21, 0x00, 0x01, 0x46, 0x51,
+        ]);
         ps.extend_from_slice(&nalu);
-        ps.extend_from_slice(&[0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x02, 0x03, 0xF8]);
+        ps.extend_from_slice(&[
+            0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x02, 0x03, 0xF8,
+        ]);
 
         // Split into three RTP packets. Marker bit is ALWAYS 0.
         let sock = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         for (i, chunk) in ps.chunks(ps.len() / 3 + 1).enumerate() {
-            let mut pkt = vec![0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78];
+            let mut pkt = vec![
+                0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78,
+            ];
             pkt.extend_from_slice(chunk);
             sock.send_to(&pkt, ("127.0.0.1", port)).unwrap();
             let _ = i;

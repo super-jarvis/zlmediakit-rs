@@ -140,7 +140,14 @@ pub async fn whip_publish(
     let answer_sdp = local.sdp.clone();
 
     info!("webrtc: WHIP session {} negotiated", resource);
-    Ok((answer_sdp, WhipSession { pc, resource, data_tx }))
+    Ok((
+        answer_sdp,
+        WhipSession {
+            pc,
+            resource,
+            data_tx,
+        },
+    ))
 }
 
 async fn receive_video(track: Arc<TrackRemote>, source: Arc<MediaSource>) {
@@ -174,7 +181,15 @@ async fn receive_video(track: Arc<TrackRemote>, source: Arc<MediaSource>) {
             // SPS/PPS only: emit the AVCC decoder config once both are known.
             if sps.is_some() && pps.is_some() {
                 if let Some(cfg) = build_avcc_config(sps.as_deref(), pps.as_deref()) {
-                    let mut f = MediaFrame::new_video(0, CodecId::H264, ts_ms as u32, ts_ms, ts_ms, cfg, true);
+                    let mut f = MediaFrame::new_video(
+                        0,
+                        CodecId::H264,
+                        ts_ms as u32,
+                        ts_ms,
+                        ts_ms,
+                        cfg,
+                        true,
+                    );
                     f.config_frame = true;
                     source.publish_and_cache(f).await;
                     config_sent = true;
@@ -184,7 +199,15 @@ async fn receive_video(track: Arc<TrackRemote>, source: Arc<MediaSource>) {
             // VCL frame: ensure the decoder config was sent first.
             if !config_sent {
                 if let Some(cfg) = build_avcc_config(sps.as_deref(), pps.as_deref()) {
-                    let mut f = MediaFrame::new_video(0, CodecId::H264, ts_ms as u32, ts_ms, ts_ms, cfg, true);
+                    let mut f = MediaFrame::new_video(
+                        0,
+                        CodecId::H264,
+                        ts_ms as u32,
+                        ts_ms,
+                        ts_ms,
+                        cfg,
+                        true,
+                    );
                     f.config_frame = true;
                     source.publish_and_cache(f).await;
                     config_sent = true;

@@ -38,8 +38,9 @@ pub static CMAF_SEGMENTS: once_cell::sync::Lazy<
     DashMap<String, Arc<RwLock<VecDeque<zlmediakit_hls::HlsSegment>>>>,
 > = once_cell::sync::Lazy::new(DashMap::new);
 
-/// CMAF HLS init segment cache. Key = stream URL.
-pub static CMAF_INIT_CACHE: once_cell::sync::Lazy<DashMap<String, Arc<RwLock<Option<Vec<u8>>>>>> =
+/// CMAF init segment cache. Key = stream URL.
+type CmafInitCache = DashMap<String, Arc<RwLock<Option<Vec<u8>>>>>;
+pub static CMAF_INIT_CACHE: once_cell::sync::Lazy<CmafInitCache> =
     once_cell::sync::Lazy::new(DashMap::new);
 
 pub struct HttpSession {
@@ -62,6 +63,7 @@ pub struct HttpSession {
 }
 
 impl HttpSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         stream: TransportStream,
         peer_addr: String,
@@ -261,7 +263,8 @@ impl HttpSession {
 
         let source = self
             .source_manager
-            .get("__defaultVhost__", &app, &stream_name);
+            .get_or_pull("__defaultVhost__", &app, &stream_name)
+            .await;
 
         match source {
             Some(source) => {
@@ -347,7 +350,8 @@ impl HttpSession {
 
         let source = self
             .source_manager
-            .get("__defaultVhost__", &app, &stream_name);
+            .get_or_pull("__defaultVhost__", &app, &stream_name)
+            .await;
 
         match source {
             Some(source) => {
@@ -428,16 +432,14 @@ impl HttpSession {
             .auth
             .check("__defaultVhost__", &app, &stream_name, "play", &sign)
         {
-            warn!(
-                "HTTP-fMP4 play rejected (auth): {}/{}",
-                app, stream_name
-            );
+            warn!("HTTP-fMP4 play rejected (auth): {}/{}", app, stream_name);
             return self.send_401().await;
         }
 
         let source = self
             .source_manager
-            .get("__defaultVhost__", &app, &stream_name);
+            .get_or_pull("__defaultVhost__", &app, &stream_name)
+            .await;
 
         match source {
             Some(source) => {
@@ -494,8 +496,7 @@ impl HttpSession {
                                 continue;
                             }
                             muxer.push_frame(&frame);
-                            if frame.frame_type
-                                == zlmediakit_core::media_frame::FrameType::Video
+                            if frame.frame_type == zlmediakit_core::media_frame::FrameType::Video
                                 && frame.key_frame
                             {
                                 if let Some(seg) = muxer.flush_segment() {
@@ -555,7 +556,8 @@ impl HttpSession {
 
         let source = self
             .source_manager
-            .get("__defaultVhost__", &app, &stream_name);
+            .get_or_pull("__defaultVhost__", &app, &stream_name)
+            .await;
 
         if let Some(source) = source {
             let key = source.url();
@@ -717,7 +719,8 @@ impl HttpSession {
 
         let source = self
             .source_manager
-            .get("__defaultVhost__", &app, &stream_name);
+            .get_or_pull("__defaultVhost__", &app, &stream_name)
+            .await;
         let source = match source {
             Some(s) => s,
             None => return self.send_404().await,
@@ -785,7 +788,8 @@ impl HttpSession {
 
         let source = self
             .source_manager
-            .get("__defaultVhost__", &app, &stream_name);
+            .get_or_pull("__defaultVhost__", &app, &stream_name)
+            .await;
         let source = match source {
             Some(s) => s,
             None => return self.send_404().await,
@@ -1870,10 +1874,7 @@ impl HttpSession {
                     .await?;
                     return Ok(());
                 }
-                let base = self
-                    .record_root
-                    .join(&app)
-                    .join(&stream);
+                let base = self.record_root.join(&app).join(&stream);
                 let files = list_record_files(&base, &period, &vhost, &app, &stream);
                 self.send_json(&serde_json::json!({
                     "code": 0,
@@ -2402,7 +2403,7 @@ impl HttpSession {
                         .unwrap_or_else(|| format!("rtp_{port}"));
                     let payload = q
                         .get("type")
-                        .map(|s| RtpPayloadType::from_str(s))
+                        .map(|s| RtpPayloadType::parse(s))
                         .unwrap_or(RtpPayloadType::Ps);
                     let vhost = q
                         .get("vhost")
@@ -2589,7 +2590,9 @@ impl HttpSession {
                     let q = Self::parse_query(path);
                     let device_id = q.get("device_id").cloned().unwrap_or_default();
                     let _ = self
-                        .send_json(&serde_json::json!({"code": 0, "result": sip.get_device(&device_id)}))
+                        .send_json(
+                            &serde_json::json!({"code": 0, "result": sip.get_device(&device_id)}),
+                        )
                         .await;
                 } else {
                     let _ = self
@@ -3153,7 +3156,10 @@ impl HttpSession {
 
         let tmp = std::env::temp_dir().join(format!(
             "zlm_snap_{}_{}_{}_{}.h264",
-            vhost, app, stream, std::process::id()
+            vhost,
+            app,
+            stream,
+            std::process::id()
         ));
         tokio::fs::write(&tmp, &annexb).await?;
 
@@ -3209,7 +3215,7 @@ impl HttpSession {
 /// (start-code prefixed). If the data already starts with a start code, it is
 /// returned unchanged.
 fn h264_to_annexb(data: &[u8]) -> Vec<u8> {
-    if data.len() >= 4 && &data[0..4] == [0, 0, 0, 1] {
+    if data.len() >= 4 && data[0..4] == [0, 0, 0, 1] {
         return data.to_vec();
     }
     let mut out: Vec<u8> = Vec::with_capacity(data.len() + 16);
@@ -3314,7 +3320,11 @@ fn parse_record_start(name: &str) -> i64 {
         (
             ts[0..2].parse().unwrap_or(0),
             ts[2..4].parse().unwrap_or(0),
-            if ts.len() >= 6 { ts[4..6].parse().unwrap_or(0) } else { 0 },
+            if ts.len() >= 6 {
+                ts[4..6].parse().unwrap_or(0)
+            } else {
+                0
+            },
         )
     };
     use chrono::TimeZone;

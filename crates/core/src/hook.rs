@@ -70,31 +70,22 @@ impl HookClient {
             Some(u) => u,
             None => return HookResult::Allow,
         };
-        self.call_hook(url, vhost, app, stream, &[("params", params)]).await
+        self.call_hook(url, vhost, app, stream, &[("params", params)])
+            .await
     }
 
     /// Called before a player starts consuming a stream.
-    pub async fn on_play(
-        &self,
-        vhost: &str,
-        app: &str,
-        stream: &str,
-        params: &str,
-    ) -> HookResult {
+    pub async fn on_play(&self, vhost: &str, app: &str, stream: &str, params: &str) -> HookResult {
         let url = match &self.config.on_play {
             Some(u) => u,
             None => return HookResult::Allow,
         };
-        self.call_hook(url, vhost, app, stream, &[("params", params)]).await
+        self.call_hook(url, vhost, app, stream, &[("params", params)])
+            .await
     }
 
     /// Called when a player requests a stream that does not exist.
-    pub async fn on_stream_not_found(
-        &self,
-        vhost: &str,
-        app: &str,
-        stream: &str,
-    ) -> HookResult {
+    pub async fn on_stream_not_found(&self, vhost: &str, app: &str, stream: &str) -> HookResult {
         let url = match &self.config.on_stream_not_found {
             Some(u) => u,
             None => return HookResult::Allow,
@@ -282,7 +273,10 @@ impl HookClient {
              Connection: close\r\n\
              \r\n\
              {}",
-            parsed.path, parsed.host, body.len(), body
+            parsed.path,
+            parsed.host,
+            body.len(),
+            body
         );
 
         let dur = Duration::from_secs(self.config.timeout_sec);
@@ -309,10 +303,7 @@ impl HookClient {
         }
 
         // Extract body after the first empty line
-        let body_start = response_str
-            .find("\r\n\r\n")
-            .map(|i| i + 4)
-            .unwrap_or(0);
+        let body_start = response_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
         let json_body = response_str[body_start..].trim();
 
         #[derive(Deserialize)]
@@ -331,11 +322,7 @@ impl HookClient {
                 }
             }
             Err(e) => {
-                tracing::warn!(
-                    "Hook response parse error: {} — body = {:?}",
-                    e,
-                    json_body
-                );
+                tracing::warn!("Hook response parse error: {} — body = {:?}", e, json_body);
                 // Unparseable response → fail-open.
                 Ok(HookResult::Allow)
             }
@@ -368,7 +355,10 @@ impl HookClient {
              Connection: close\r\n\
              \r\n\
              {}",
-            parsed.path, parsed.host, body.len(), body
+            parsed.path,
+            parsed.host,
+            body.len(),
+            body
         );
         let dur = Duration::from_secs(self.config.timeout_sec);
         let mut stream = timeout(dur, TcpStream::connect(parsed.addr.as_str())).await??;

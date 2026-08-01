@@ -80,7 +80,7 @@ impl TsLiveMuxer {
                     if let Some(ref cfg) = self.video_config_data {
                         let pes = build_config_pes(0xE0, cfg);
                         self.writer
-                            .write_pes(&mut out, VIDEO_PID, &pes, true, frame.dts as u64);
+                            .write_pes(&mut out, VIDEO_PID, &pes, true, frame.dts);
                         self.video_config_sent = true;
                     }
                 }
@@ -93,7 +93,7 @@ impl TsLiveMuxer {
                             VIDEO_PID,
                             &pes,
                             frame.key_frame,
-                            frame.dts as u64,
+                            frame.dts,
                         );
                     }
                 }
@@ -103,7 +103,7 @@ impl TsLiveMuxer {
                     if let Some(ref cfg) = self.audio_config_data {
                         let pes = build_config_pes(0xC0, cfg);
                         self.writer
-                            .write_pes(&mut out, AUDIO_PID, &pes, true, frame.dts as u64);
+                            .write_pes(&mut out, AUDIO_PID, &pes, true, frame.dts);
                         self.audio_config_sent = true;
                     }
                 }
@@ -115,13 +115,8 @@ impl TsLiveMuxer {
                     };
                     if !audio.is_empty() {
                         let pes = build_data_pes_raw(0xC0, &audio, frame.timestamp);
-                        self.writer.write_pes(
-                            &mut out,
-                            AUDIO_PID,
-                            &pes,
-                            false,
-                            frame.dts as u64,
-                        );
+                        self.writer
+                            .write_pes(&mut out, AUDIO_PID, &pes, false, frame.dts);
                     }
                 }
             }
@@ -158,23 +153,39 @@ mod tests {
     }
 
     fn video_frame(ts: u32, key: bool) -> MediaFrame {
-        let nalu = [0x00, 0x00, 0x00, 0x01, if key { 0x65 } else { 0x41 }, 0x88, 0x84];
+        let nalu = [
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            if key { 0x65 } else { 0x41 },
+            0x88,
+            0x84,
+        ];
         let mut data = vec![if key { 0x17 } else { 0x27 }, 0x01, 0, 0, 0];
         data.extend_from_slice(&(nalu.len() as u32).to_be_bytes());
         data.extend_from_slice(&nalu);
-        MediaFrame::new_video(0, CodecId::H264, ts, ts as u64, ts as u64, Bytes::from(data), key)
+        MediaFrame::new_video(
+            0,
+            CodecId::H264,
+            ts,
+            ts as u64,
+            ts as u64,
+            Bytes::from(data),
+            key,
+        )
     }
 
     fn aac_config_frame() -> MediaFrame {
         // AAC-HE LC, 44.1kHz, stereo ASC in FLV config layout.
-        let mut data = vec![0xAF, 0x00, 0x00, 0x00, 0x00, 0x12, 0x10];
+        let data = vec![0xAF, 0x00, 0x00, 0x00, 0x00, 0x12, 0x10];
         let mut f = MediaFrame::new_audio(0, CodecId::AAC, 0, 0, 0, Bytes::from(data));
         f.config_frame = true;
         f
     }
 
     fn aac_frame(ts: u32) -> MediaFrame {
-        let mut data = vec![0xAF, 0x01, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04];
+        let data = vec![0xAF, 0x01, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04];
         MediaFrame::new_audio(0, CodecId::AAC, ts, ts as u64, ts as u64, Bytes::from(data))
     }
 

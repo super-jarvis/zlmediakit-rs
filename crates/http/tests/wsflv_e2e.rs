@@ -76,7 +76,7 @@ async fn http_raw(stream: &mut TcpStream, request: &[u8]) -> Vec<u8> {
         }
         buf.push(tmp[0]);
         // End of headers.
-        if buf.len() >= 4 && buf[buf.len() - 4..] == [b'\r', b'\n', b'\r', b'\n'] {
+        if buf.len() >= 4 && buf[buf.len() - 4..] == *b"\r\n\r\n" {
             break;
         }
     }
@@ -88,7 +88,7 @@ async fn wsflv_e2e_receives_flv_over_websocket() {
     let (recorder, _recv) = RecorderControl::new();
     let (proxy, _table, _proxy_rx) = StreamProxyControl::new();
     let auth = StreamAuth::new(false, String::new());
-    let hook = HookClient::empty();
+    let _hook = HookClient::empty();
     let mgr = Arc::new(MediaSourceManager::new(None));
 
     let hook = HookClient::empty();

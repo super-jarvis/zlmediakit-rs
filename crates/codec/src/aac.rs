@@ -81,6 +81,12 @@ impl AacParser {
     }
 }
 
+impl Default for AacParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,11 +222,5 @@ mod tests {
             assert!(header[0] == 0xFF);
             assert!(AacParser::parse_adts_header(&header).is_some());
         }
-    }
-}
-
-impl Default for AacParser {
-    fn default() -> Self {
-        Self::new()
     }
 }

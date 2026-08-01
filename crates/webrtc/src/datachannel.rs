@@ -149,10 +149,7 @@ mod tests {
             })
         }));
 
-        let dc = pc_offer
-            .create_data_channel("relay", None)
-            .await
-            .unwrap();
+        let dc = pc_offer.create_data_channel("relay", None).await.unwrap();
 
         let (open_tx, open_rx) = tokio::sync::oneshot::channel::<()>();
         let mut open_tx = Some(open_tx);
@@ -180,13 +177,10 @@ mod tests {
 
         // A -> B text.
         dc.send_text("hello from offer".to_string()).await.unwrap();
-        let (label, data, is_string) = tokio::time::timeout(
-            Duration::from_secs(5),
-            msg_rx.recv(),
-        )
-        .await
-        .expect("offer->answer message timeout")
-        .unwrap();
+        let (label, data, is_string) = tokio::time::timeout(Duration::from_secs(5), msg_rx.recv())
+            .await
+            .expect("offer->answer message timeout")
+            .unwrap();
         assert_eq!(label, "relay");
         assert!(is_string);
         assert_eq!(String::from_utf8_lossy(&data), "hello from offer");

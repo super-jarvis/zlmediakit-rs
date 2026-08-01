@@ -184,7 +184,10 @@ pub async fn start(
         .find_map(|m| {
             if let RtmpMessage::Amf0Command { data, .. } = m {
                 let vals = AmfDecoder::decode(data).ok()?;
-                if vals.first().map_or(false, |v| matches!(v, AmfValue::String(s) if s == "_result")) {
+                if vals
+                    .first()
+                    .is_some_and(|v| matches!(v, AmfValue::String(s) if s == "_result"))
+                {
                     vals.get(3).and_then(|v| match v {
                         AmfValue::Number(n) => Some(*n as u32),
                         _ => None,
@@ -238,32 +241,68 @@ pub async fn start(
         for msg in msgs {
             match msg {
                 RtmpMessage::SetChunkSize(sz) => parser.set_chunk_size(sz),
-                RtmpMessage::Video { timestamp, data: raw_data, .. } => {
-                    let data = crate::session::normalize_enhanced_video(&raw_data).unwrap_or(raw_data);
+                RtmpMessage::Video {
+                    timestamp,
+                    data: raw_data,
+                    ..
+                } => {
+                    let data =
+                        crate::session::normalize_enhanced_video(&raw_data).unwrap_or(raw_data);
                     let (codec, key_frame, is_config) = parse_video_rtmp_packet(&data);
                     if is_config && !has_video {
                         has_video = true;
-                        source.info.write().await.tracks.push(TrackInfo::Video(VideoInfo {
-                            codec, width: 640, height: 480, fps: 25.0, key_frame: false,
-                        }));
+                        source
+                            .info
+                            .write()
+                            .await
+                            .tracks
+                            .push(TrackInfo::Video(VideoInfo {
+                                codec,
+                                width: 640,
+                                height: 480,
+                                fps: 25.0,
+                                key_frame: false,
+                            }));
                     }
                     let mut frame = MediaFrame::new_video(
-                        0, codec, timestamp, timestamp as u64, timestamp as u64, data, key_frame,
+                        0,
+                        codec,
+                        timestamp,
+                        timestamp as u64,
+                        timestamp as u64,
+                        data,
+                        key_frame,
                     );
                     frame.config_frame = is_config;
                     source.publish_and_cache(frame).await;
                 }
-                RtmpMessage::Audio { timestamp, data, .. } => {
+                RtmpMessage::Audio {
+                    timestamp, data, ..
+                } => {
                     let codec = parse_audio_rtmp_packet(&data);
-                    let is_config = data.len() >= 2 && (data[0] >> 4) & 0x0F == 10 && data[1] == 0x00;
+                    let is_config =
+                        data.len() >= 2 && (data[0] >> 4) & 0x0F == 10 && data[1] == 0x00;
                     if is_config && !has_audio {
                         has_audio = true;
-                        source.info.write().await.tracks.push(TrackInfo::Audio(AudioInfo {
-                            codec, sample_rate: 44100, channels: 2, bits_per_sample: 16,
-                        }));
+                        source
+                            .info
+                            .write()
+                            .await
+                            .tracks
+                            .push(TrackInfo::Audio(AudioInfo {
+                                codec,
+                                sample_rate: 44100,
+                                channels: 2,
+                                bits_per_sample: 16,
+                            }));
                     }
                     let mut frame = MediaFrame::new_audio(
-                        1, codec, timestamp, timestamp as u64, timestamp as u64, data,
+                        1,
+                        codec,
+                        timestamp,
+                        timestamp as u64,
+                        timestamp as u64,
+                        data,
                     );
                     frame.config_frame = is_config;
                     source.publish_and_cache(frame).await;
@@ -312,11 +351,17 @@ async fn read_until_result(
         for m in &msgs {
             if let RtmpMessage::Amf0Command { data, .. } = m {
                 if let Ok(vals) = AmfDecoder::decode(data) {
-                    if vals.first().map_or(false, |v| matches!(v, AmfValue::String(s) if s == "_result")) {
-                        let got = vals.get(1).and_then(|v| match v {
-                            AmfValue::Number(n) => Some(*n),
-                            _ => None,
-                        }).unwrap_or(0.0);
+                    if vals
+                        .first()
+                        .is_some_and(|v| matches!(v, AmfValue::String(s) if s == "_result"))
+                    {
+                        let got = vals
+                            .get(1)
+                            .and_then(|v| match v {
+                                AmfValue::Number(n) => Some(*n),
+                                _ => None,
+                            })
+                            .unwrap_or(0.0);
                         if (got - txn_id).abs() < 0.001 {
                             all.push(m.clone());
                             return Ok(all);

@@ -79,6 +79,12 @@ impl EventBus {
     }
 }
 
+impl Default for EventBus {
+    fn default() -> Self {
+        Self::new(1024)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,11 +181,5 @@ mod tests {
         assert_sync::<EventBus>();
         assert_send::<Event>();
         assert_sync::<Event>();
-    }
-}
-
-impl Default for EventBus {
-    fn default() -> Self {
-        Self::new(1024)
     }
 }

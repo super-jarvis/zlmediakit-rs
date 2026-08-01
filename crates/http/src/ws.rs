@@ -507,17 +507,13 @@ impl WsSession {
             if frame.frame_type == FrameType::Video && frame.key_frame {
                 if let Some(seg) = muxer.flush_segment() {
                     let ws_frame = WsFrame::binary(seg.data.to_vec());
-                    self.stream
-                        .write_all(&ws_frame.encode_server())
-                        .await?;
+                    self.stream.write_all(&ws_frame.encode_server()).await?;
                 }
             }
         }
         if let Some(seg) = muxer.flush_segment() {
             let ws_frame = WsFrame::binary(seg.data.to_vec());
-            self.stream
-                .write_all(&ws_frame.encode_server())
-                .await?;
+            self.stream.write_all(&ws_frame.encode_server()).await?;
         }
 
         let mut rx = source.subscribe();
@@ -698,7 +694,7 @@ mod tests {
         let mask = [0x37, 0xfa, 0x21, 0x3d];
         data.extend_from_slice(&mask);
         // payload = [0x01, 0x02, 0x03] XOR mask
-        let masked: Vec<u8> = vec![0x01, 0x02, 0x03]
+        let masked: Vec<u8> = [0x01, 0x02, 0x03]
             .iter()
             .enumerate()
             .map(|(i, &b)| b ^ mask[i % 4])

@@ -44,7 +44,7 @@ pub struct Fmp4Muxer {
     base_timestamp: Option<u32>,
     segment_seq: u64,
     segment_start_time: u64,
-    total_duration: u64,           // in timescale units
+    total_duration: u64, // in timescale units
     largest_video_sample: usize,
     largest_audio_sample: usize,
 }
@@ -54,7 +54,7 @@ struct Fmp4Sample {
     data: Bytes,
     #[allow(dead_code)]
     timestamp: u32,
-    duration: u32,        // in timescale units
+    duration: u32, // in timescale units
     is_sync: bool,
 }
 
@@ -103,7 +103,9 @@ impl Fmp4Muxer {
             return;
         }
 
-        let rel_ts = frame.timestamp.saturating_sub(self.base_timestamp.unwrap_or(0));
+        let rel_ts = frame
+            .timestamp
+            .saturating_sub(self.base_timestamp.unwrap_or(0));
         let duration = self.video_timescale / 25; // default 25fps fallback
 
         let sample = Fmp4Sample {
@@ -251,7 +253,10 @@ impl Fmp4Muxer {
                     self.width,
                     self.height,
                     self.video_timescale,
-                    self.video_samples.iter().map(|s| s.data.len() as u32).collect(),
+                    self.video_samples
+                        .iter()
+                        .map(|s| s.data.len() as u32)
+                        .collect(),
                 );
             }
         }
@@ -267,7 +272,10 @@ impl Fmp4Muxer {
                     0,
                     0,
                     self.audio_sample_rate,
-                    self.audio_samples.iter().map(|s| s.data.len() as u32).collect(),
+                    self.audio_samples
+                        .iter()
+                        .map(|s| s.data.len() as u32)
+                        .collect(),
                 );
             }
         }
@@ -275,6 +283,7 @@ impl Fmp4Muxer {
         buf.extend_from_slice(&make_box(b"moov", &moov_data));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_trak(
         &self,
         buf: &mut BytesMut,
@@ -308,13 +317,19 @@ impl Fmp4Muxer {
                 tkhd.put_u16(0x0100);
             }
             tkhd.put_u16(0); // reserved
-            // identity matrix (9 fixed-point 16.16 values = 36 bytes):
-            // [ 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0 ]
-            tkhd.put_u32(0x00010000); tkhd.put_u32(0); tkhd.put_u32(0);
-            tkhd.put_u32(0); tkhd.put_u32(0x00010000); tkhd.put_u32(0);
-            tkhd.put_u32(0); tkhd.put_u32(0); tkhd.put_u32(0x40000000);
-            tkhd.put_u32((width as u32) << 16); // width fixed-point
-            tkhd.put_u32((height as u32) << 16); // height fixed-point
+                             // identity matrix (9 fixed-point 16.16 values = 36 bytes):
+                             // [ 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0 ]
+            tkhd.put_u32(0x00010000);
+            tkhd.put_u32(0);
+            tkhd.put_u32(0);
+            tkhd.put_u32(0);
+            tkhd.put_u32(0x00010000);
+            tkhd.put_u32(0);
+            tkhd.put_u32(0);
+            tkhd.put_u32(0);
+            tkhd.put_u32(0x40000000);
+            tkhd.put_u32(width << 16); // width fixed-point
+            tkhd.put_u32(height << 16); // height fixed-point
             trak.extend_from_slice(&make_box(b"tkhd", &tkhd));
         }
 
@@ -398,7 +413,8 @@ impl Fmp4Muxer {
                                 stsd.extend_from_slice(&entry);
                             }
                             CodecId::AAC => {
-                                let entry = build_mp4a_entry(config, timescale, self.audio_channels as u32);
+                                let entry =
+                                    build_mp4a_entry(config, timescale, self.audio_channels);
                                 stsd.extend_from_slice(&entry);
                             }
                             CodecId::VP8 | CodecId::VP9 | CodecId::AV1 => {
@@ -422,7 +438,7 @@ impl Fmp4Muxer {
                     stbl.extend_from_slice(&make_box(b"stsc", &0u32.to_be_bytes()));
                     // stsz (empty)
                     stbl.extend_from_slice(&make_box(b"stsz", &[0u8; 8])); // sample_size=0 + count=0
-                    // stco (empty)
+                                                                           // stco (empty)
                     stbl.extend_from_slice(&make_box(b"stco", &0u32.to_be_bytes()));
 
                     minf.extend_from_slice(&make_box(b"stbl", &stbl));
@@ -548,7 +564,11 @@ impl Fmp4Muxer {
             for s in samples {
                 trun.put_u32(s.duration);
                 trun.put_u32(s.data.len() as u32);
-                let flags = if s.is_sync { 0x02000000u32 } else { 0x01010000u32 };
+                let flags = if s.is_sync {
+                    0x02000000u32
+                } else {
+                    0x01010000u32
+                };
                 trun.put_u32(flags);
                 *accum_offset += s.data.len() as u32;
             }
@@ -559,11 +579,7 @@ impl Fmp4Muxer {
         make_box(b"traf", &traf)
     }
 
-    fn build_mdat(
-        &self,
-        video: &[&Fmp4Sample],
-        audio: &[&Fmp4Sample],
-    ) -> BytesMut {
+    fn build_mdat(&self, video: &[&Fmp4Sample], audio: &[&Fmp4Sample]) -> BytesMut {
         let mut mdat = BytesMut::new();
         for s in video {
             mdat.extend_from_slice(&s.data);
@@ -612,7 +628,7 @@ fn build_avc1_entry(config: &[u8], width: u32, height: u32) -> BytesMut {
     entry.extend_from_slice(b"AVC Coding\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
     entry.put_u16(24); // depth
     entry.put_i16(-1); // pre-defined
-    // avcC box
+                       // avcC box
     entry.extend_from_slice(&make_box(b"avcC", avcc));
 
     let size = 8 + entry.len() as u32;
@@ -624,7 +640,11 @@ fn build_avc1_entry(config: &[u8], width: u32, height: u32) -> BytesMut {
 }
 
 fn build_hvc1_entry(config: &[u8], width: u32, height: u32) -> BytesMut {
-    let hvcc = if config.len() >= 5 { &config[5..] } else { config };
+    let hvcc = if config.len() >= 5 {
+        &config[5..]
+    } else {
+        config
+    };
 
     let mut entry = BytesMut::new();
     entry.extend_from_slice(&[0u8; 6]);
@@ -652,7 +672,11 @@ fn build_hvc1_entry(config: &[u8], width: u32, height: u32) -> BytesMut {
 fn build_mp4a_entry(config: &[u8], sample_rate: u32, channels: u32) -> BytesMut {
     let aac_cfg = if config.len() >= 2 && config[0] == 0xAF {
         // FLV audio config: [0xAF, 0x00, AudioSpecificConfig...]
-        if config.len() > 2 { &config[2..] } else { config }
+        if config.len() > 2 {
+            &config[2..]
+        } else {
+            config
+        }
     } else {
         config
     };
@@ -660,12 +684,12 @@ fn build_mp4a_entry(config: &[u8], sample_rate: u32, channels: u32) -> BytesMut 
     // Build ESDS box
     let mut esds_data = BytesMut::new();
     esds_data.put_u32(0); // version+flags
-    // ES_Descriptor
+                          // ES_Descriptor
     esds_data.put_u8(0x03); // tag
     esds_data.put_u8(0x19); // length (placeholder)
     esds_data.put_u16(1); // ES_ID
     esds_data.put_u8(0x00); // flags
-    // DecoderConfigDescriptor
+                            // DecoderConfigDescriptor
     esds_data.put_u8(0x04);
     esds_data.put_u8(0x11); // length
     esds_data.put_u8(0x40); // object type = AAC
@@ -673,7 +697,7 @@ fn build_mp4a_entry(config: &[u8], sample_rate: u32, channels: u32) -> BytesMut 
     esds_data.extend_from_slice(&[0u8; 3]); // buffer size
     esds_data.put_u32(0x0001F400); // max bitrate
     esds_data.put_u32(0x0001F400); // avg bitrate
-    // DecoderSpecificInfo
+                                   // DecoderSpecificInfo
     esds_data.put_u8(0x05);
     esds_data.put_u8(aac_cfg.len() as u8);
     esds_data.extend_from_slice(aac_cfg);
@@ -721,7 +745,7 @@ fn build_vp_entry(fourcc: &[u8; 4], config: &[u8], width: u32, height: u32) -> B
     entry.extend_from_slice(b"VP Coding\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
     entry.put_u16(24); // depth
     entry.put_i16(-1); // color table
-    // vpcC box (VP Codec Configuration)
+                       // vpcC box (VP Codec Configuration)
     entry.extend_from_slice(&make_box(b"vpcC", vpcc));
 
     let size = 8 + entry.len() as u32;
@@ -745,9 +769,8 @@ mod tests {
         // Feed config frames
         let h264_config = vec![
             0x17, 0x00, 0x00, 0x00, 0x00, // FLV header
-            0x01, 0x64, 0x00, 0x0a, 0xFF, 0xE1, 0x00, 0x04,
-            0x67, 0x64, 0x00, 0x0a, 0x01, 0x00, 0x04,
-            0x68, 0xee, 0x3c, 0x80,
+            0x01, 0x64, 0x00, 0x0a, 0xFF, 0xE1, 0x00, 0x04, 0x67, 0x64, 0x00, 0x0a, 0x01, 0x00,
+            0x04, 0x68, 0xee, 0x3c, 0x80,
         ];
         let frame = make_config_frame(CodecId::H264, &h264_config, true);
         muxer.push_frame(&frame);
@@ -777,22 +800,31 @@ mod tests {
         muxer.push_frame(&cfg);
 
         // Video samples
-        let sample = make_media_frame(CodecId::H264, &[0x00, 0x00, 0x00, 0x01, 0x21, 0x01], 100, true);
+        let sample = make_media_frame(
+            CodecId::H264,
+            &[0x00, 0x00, 0x00, 0x01, 0x21, 0x01],
+            100,
+            true,
+        );
         muxer.push_frame(&sample);
 
         let seg = muxer.flush_segment().unwrap();
         assert!(!seg.is_init);
-        assert!(seg.data.windows(4).any(|w| w == b"moof"), "segment must have moof");
-        assert!(seg.data.windows(4).any(|w| w == b"mdat"), "segment must have mdat");
+        assert!(
+            seg.data.windows(4).any(|w| w == b"moof"),
+            "segment must have moof"
+        );
+        assert!(
+            seg.data.windows(4).any(|w| w == b"mdat"),
+            "segment must have mdat"
+        );
         assert!(seg.duration > 0);
     }
 
     fn h264_config_bytes() -> Vec<u8> {
         vec![
-            0x17, 0x00, 0x00, 0x00, 0x00,
-            0x01, 0x64, 0x00, 0x0a, 0xFF, 0xE1, 0x00, 0x04,
-            0x67, 0x64, 0x00, 0x0a, 0x01, 0x00, 0x04,
-            0x68, 0xee, 0x3c, 0x80,
+            0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64, 0x00, 0x0a, 0xFF, 0xE1, 0x00, 0x04, 0x67,
+            0x64, 0x00, 0x0a, 0x01, 0x00, 0x04, 0x68, 0xee, 0x3c, 0x80,
         ]
     }
 
@@ -807,6 +839,14 @@ mod tests {
     }
 
     fn make_media_frame(codec: CodecId, data: &[u8], timestamp: u32, key: bool) -> MediaFrame {
-        MediaFrame::new_video(0, codec, timestamp, timestamp as u64, timestamp as u64, Bytes::copy_from_slice(data), key)
+        MediaFrame::new_video(
+            0,
+            codec,
+            timestamp,
+            timestamp as u64,
+            timestamp as u64,
+            Bytes::copy_from_slice(data),
+            key,
+        )
     }
 }

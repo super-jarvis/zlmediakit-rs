@@ -60,13 +60,8 @@ extern "C" {
     pub fn srt_recv(u: c_int, buf: *mut c_void, len: c_int) -> c_int;
 
     /// Receive with message flags. Returns bytes or SRT_ERROR.
-    pub fn srt_recvmsg(
-        u: c_int,
-        buf: *mut c_void,
-        len: c_int,
-        ttl: c_int,
-        inorder: c_int,
-    ) -> c_int;
+    pub fn srt_recvmsg(u: c_int, buf: *mut c_void, len: c_int, ttl: c_int, inorder: c_int)
+        -> c_int;
 
     /// Close a socket.
     pub fn srt_close(u: c_int) -> c_int;
@@ -81,12 +76,8 @@ extern "C" {
     ) -> c_int;
 
     /// Set a socket flag (preferred newer API). Takes value-pointer pair.
-    pub fn srt_setsockflag(
-        u: c_int,
-        optname: c_int,
-        optval: *const c_void,
-        optlen: c_int,
-    ) -> c_int;
+    pub fn srt_setsockflag(u: c_int, optname: c_int, optval: *const c_void, optlen: c_int)
+        -> c_int;
 
     /// Get socket state.
     pub fn srt_getsockstate(u: c_int) -> c_int;
@@ -123,7 +114,12 @@ pub fn last_error() -> String {
 /// Sets an integer socket option via `srt_setsockflag`.
 pub fn set_sockflag_int(sock: c_int, opt: c_int, val: c_int) -> anyhow::Result<()> {
     let ret = unsafe {
-        srt_setsockflag(sock, opt, &val as *const c_int as *const c_void, std::mem::size_of::<c_int>() as c_int)
+        srt_setsockflag(
+            sock,
+            opt,
+            &val as *const c_int as *const c_void,
+            std::mem::size_of::<c_int>() as c_int,
+        )
     };
     if ret != SRT_SUCCESS {
         anyhow::bail!("srt_setsockflag({}) failed: {}", opt, last_error());
@@ -135,7 +131,12 @@ pub fn set_sockflag_int(sock: c_int, opt: c_int, val: c_int) -> anyhow::Result<(
 pub fn set_sockflag_str(sock: c_int, opt: c_int, val: &str) -> anyhow::Result<()> {
     let bytes = val.as_bytes();
     let ret = unsafe {
-        srt_setsockflag(sock, opt, bytes.as_ptr() as *const c_void, bytes.len() as c_int)
+        srt_setsockflag(
+            sock,
+            opt,
+            bytes.as_ptr() as *const c_void,
+            bytes.len() as c_int,
+        )
     };
     if ret != SRT_SUCCESS {
         anyhow::bail!("srt_setsockflag({}) failed: {}", opt, last_error());
@@ -144,7 +145,9 @@ pub fn set_sockflag_str(sock: c_int, opt: c_int, val: &str) -> anyhow::Result<()
 }
 
 /// Converts a `SocketAddr` to a libc sockaddr_in for SRT bind.
-pub fn socket_addr_to_sockaddr(addr: &SocketAddr) -> anyhow::Result<(libc::sockaddr_in, libc::socklen_t)> {
+pub fn socket_addr_to_sockaddr(
+    addr: &SocketAddr,
+) -> anyhow::Result<(libc::sockaddr_in, libc::socklen_t)> {
     match addr {
         SocketAddr::V4(v4) => {
             let octets = v4.ip().octets();
@@ -156,7 +159,10 @@ pub fn socket_addr_to_sockaddr(addr: &SocketAddr) -> anyhow::Result<(libc::socka
                 },
                 sin_zero: [0u8; 8],
             };
-            Ok((sin, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t))
+            Ok((
+                sin,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            ))
         }
         _ => anyhow::bail!("SRT only supports IPv4 in this implementation"),
     }
@@ -215,7 +221,10 @@ pub fn parse_streamid(streamid: &str) -> (String, String) {
     // Try parsing as URL path
     if streamid.contains('/') {
         let parts: Vec<&str> = streamid.splitn(2, '/').collect();
-        return (parts[0].to_string(), parts.get(1).map_or("stream", |v| *v).to_string());
+        return (
+            parts[0].to_string(),
+            parts.get(1).map_or("stream", |v| *v).to_string(),
+        );
     }
     ("live".to_string(), streamid.to_string())
 }

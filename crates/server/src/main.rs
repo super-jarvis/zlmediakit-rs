@@ -117,6 +117,21 @@ async fn main() -> Result<()> {
     let (proxy_control, proxy_active, proxy_cmd_rx) = StreamProxyControl::new();
     let proxy_control = Arc::new(proxy_control);
 
+    // Enable edge auto-pull when an origin URL is configured. A play request
+    // for a stream that is not available locally will transparently pull it
+    // from the origin server.
+    if let Some(origin_url) = &config.cluster.origin_url {
+        if !origin_url.is_empty() {
+            source_manager.set_origin_pull(
+                proxy_control.clone(),
+                origin_url.clone(),
+                config.cluster.origin_vhost.clone(),
+                config.cluster.origin_app.clone(),
+            );
+            info!("edge auto-pull enabled, origin={}", origin_url);
+        }
+    }
+
     let (pusher_control, pusher_active, pusher_cmd_rx) = StreamPusherControl::new();
     let pusher_control = Arc::new(pusher_control);
 

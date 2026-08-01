@@ -107,6 +107,12 @@ impl H264Parser {
     }
 }
 
+impl Default for H264Parser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,11 +226,5 @@ mod tests {
     #[test]
     fn extract_config_empty() {
         assert!(H264Parser::extract_config(b"").is_none());
-    }
-}
-
-impl Default for H264Parser {
-    fn default() -> Self {
-        Self::new()
     }
 }

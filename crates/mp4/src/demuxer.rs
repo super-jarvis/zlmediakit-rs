@@ -178,14 +178,9 @@ impl Mp4Demuxer {
                 Bytes::from(cfg_data),
                 true,
             ),
-            TrackKind::Audio => MediaFrame::new_audio(
-                track.track_id,
-                track.codec,
-                0,
-                0,
-                0,
-                Bytes::from(cfg_data),
-            ),
+            TrackKind::Audio => {
+                MediaFrame::new_audio(track.track_id, track.codec, 0, 0, 0, Bytes::from(cfg_data))
+            }
             TrackKind::Other => return None,
         };
         frame.config_frame = true;
@@ -464,11 +459,7 @@ fn parse_trak(trak: &[u8], mdat: &[u8]) -> Result<Option<(DemuxedTrack, Vec<Demu
 
 /// Derives display parameters (video size / fps, audio sample rate) from the
 /// decoder configuration record.
-fn derive_track_params(
-    handler: TrackKind,
-    codec: CodecId,
-    config: &[u8],
-) -> (u32, u32, f64, u32) {
+fn derive_track_params(handler: TrackKind, codec: CodecId, config: &[u8]) -> (u32, u32, f64, u32) {
     match handler {
         TrackKind::Video => {
             if codec == CodecId::H264 || codec == CodecId::H265 {
@@ -544,9 +535,7 @@ fn read_mdhd_duration(mdhd: &[u8]) -> u64 {
     // body = version/flags(4) + creation(4) + modification(4) + timescale(4)
     //        + duration(4)
     if mdhd.len() >= 20 {
-        u64::from_be_bytes([
-            0, 0, 0, 0, mdhd[16], mdhd[17], mdhd[18], mdhd[19],
-        ])
+        u64::from_be_bytes([0, 0, 0, 0, mdhd[16], mdhd[17], mdhd[18], mdhd[19]])
     } else {
         0
     }
@@ -594,18 +583,18 @@ fn parse_stsd(stsd: &[u8], handler: TrackKind) -> Result<(CodecId, Vec<u8>)> {
     match handler {
         TrackKind::Video => match fourcc {
             b"avc1" | b"avc3" => {
-                let cfg = extract_avcc(&sample_entry);
+                let cfg = extract_avcc(sample_entry);
                 Ok((CodecId::H264, cfg))
             }
             b"hvc1" | b"hev1" => {
-                let cfg = extract_hvcc(&sample_entry);
+                let cfg = extract_hvcc(sample_entry);
                 Ok((CodecId::H265, cfg))
             }
             _ => bail!("unsupported video codec fourcc {:?}", fourcc),
         },
         TrackKind::Audio => match fourcc {
             b"mp4a" => {
-                let cfg = extract_aac_config(&sample_entry);
+                let cfg = extract_aac_config(sample_entry);
                 Ok((CodecId::AAC, cfg))
             }
             _ => bail!("unsupported audio codec fourcc {:?}", fourcc),
@@ -711,8 +700,8 @@ fn read_ber_len(data: &[u8]) -> Option<(usize, usize)> {
             return None;
         }
         let mut len = 0usize;
-        for k in 1..=num {
-            len = (len << 8) | data[k] as usize;
+        for &byte in &data[1..num + 1] {
+            len = (len << 8) | byte as usize;
         }
         Some((len, 1 + num))
     }
@@ -731,12 +720,8 @@ fn parse_stts(stts: &[u8]) -> Result<Vec<u32>> {
             break;
         }
         let count = u32::from_be_bytes([stts[pos], stts[pos + 1], stts[pos + 2], stts[pos + 3]]);
-        let delta = u32::from_be_bytes([
-            stts[pos + 4],
-            stts[pos + 5],
-            stts[pos + 6],
-            stts[pos + 7],
-        ]);
+        let delta =
+            u32::from_be_bytes([stts[pos + 4], stts[pos + 5], stts[pos + 6], stts[pos + 7]]);
         for _ in 0..count {
             out.push(delta);
         }
@@ -762,18 +747,11 @@ fn parse_stsc(stsc: &[u8]) -> Result<(Vec<usize>, Vec<u32>)> {
         }
         let _first_chunk =
             u32::from_be_bytes([stsc[pos], stsc[pos + 1], stsc[pos + 2], stsc[pos + 3]]);
-        let samples_per_chunk = u32::from_be_bytes([
-            stsc[pos + 4],
-            stsc[pos + 5],
-            stsc[pos + 6],
-            stsc[pos + 7],
-        ]) as usize;
-        let sample_desc = u32::from_be_bytes([
-            stsc[pos + 8],
-            stsc[pos + 9],
-            stsc[pos + 10],
-            stsc[pos + 11],
-        ]);
+        let samples_per_chunk =
+            u32::from_be_bytes([stsc[pos + 4], stsc[pos + 5], stsc[pos + 6], stsc[pos + 7]])
+                as usize;
+        let sample_desc =
+            u32::from_be_bytes([stsc[pos + 8], stsc[pos + 9], stsc[pos + 10], stsc[pos + 11]]);
         counts.push(samples_per_chunk);
         desc.push(sample_desc);
         pos += 12;
@@ -800,8 +778,8 @@ fn parse_stsz(stsz: &[u8]) -> Result<Vec<usize>> {
         if pos + 4 > stsz.len() {
             break;
         }
-        let s = u32::from_be_bytes([stsz[pos], stsz[pos + 1], stsz[pos + 2], stsz[pos + 3]])
-            as usize;
+        let s =
+            u32::from_be_bytes([stsz[pos], stsz[pos + 1], stsz[pos + 2], stsz[pos + 3]]) as usize;
         out.push(s);
         pos += 4;
     }
@@ -820,8 +798,7 @@ fn parse_stco(stco: &[u8]) -> Result<Vec<u64>> {
         if pos + 4 > stco.len() {
             break;
         }
-        let o =
-            u32::from_be_bytes([stco[pos], stco[pos + 1], stco[pos + 2], stco[pos + 3]]) as u64;
+        let o = u32::from_be_bytes([stco[pos], stco[pos + 1], stco[pos + 2], stco[pos + 3]]) as u64;
         out.push(o);
         pos += 4;
     }
@@ -868,8 +845,7 @@ fn parse_stss(stss: &[u8]) -> Result<Vec<u32>> {
         if pos + 4 > stss.len() {
             break;
         }
-        let n =
-            u32::from_be_bytes([stss[pos], stss[pos + 1], stss[pos + 2], stss[pos + 3]]);
+        let n = u32::from_be_bytes([stss[pos], stss[pos + 1], stss[pos + 2], stss[pos + 3]]);
         out.push(n);
         pos += 4;
     }
@@ -997,8 +973,8 @@ mod tests {
             );
             muxer.push_frame(&f);
         }
-        let bytes = muxer.finalize().to_vec();
-        bytes
+
+        muxer.finalize().to_vec()
     }
 
     #[test]
@@ -1009,13 +985,19 @@ mod tests {
         let tracks = demuxer.tracks();
         assert_eq!(tracks.len(), 2, "expected video + audio tracks");
 
-        let video = tracks.iter().find(|t| t.handler == TrackKind::Video).unwrap();
+        let video = tracks
+            .iter()
+            .find(|t| t.handler == TrackKind::Video)
+            .unwrap();
         assert_eq!(video.codec, CodecId::H264);
         assert_eq!(video.sample_count, 3);
         // config record present
         assert!(!video.config.is_empty());
 
-        let audio = tracks.iter().find(|t| t.handler == TrackKind::Audio).unwrap();
+        let audio = tracks
+            .iter()
+            .find(|t| t.handler == TrackKind::Audio)
+            .unwrap();
         assert_eq!(audio.codec, CodecId::AAC);
         assert_eq!(audio.sample_count, 2);
 
@@ -1034,10 +1016,12 @@ mod tests {
         let frames = demuxer.to_media_frames();
         // 1 video config + 3 video + 1 audio config + 2 audio = 7
         assert_eq!(frames.len(), 7);
-        assert!(frames.iter().any(|f| f.config_frame
-            && f.frame_type == FrameType::Video));
-        assert!(frames.iter().any(|f| f.config_frame
-            && f.frame_type == FrameType::Audio));
+        assert!(frames
+            .iter()
+            .any(|f| f.config_frame && f.frame_type == FrameType::Video));
+        assert!(frames
+            .iter()
+            .any(|f| f.config_frame && f.frame_type == FrameType::Audio));
         // First video data frame uses FLV key-frame tag 0x17.
         let first_video = frames
             .iter()
@@ -1065,7 +1049,10 @@ mod tests {
             .collect();
         let mut sorted = data_pts.clone();
         sorted.sort();
-        assert_eq!(data_pts, sorted, "data frames must be in playback (pts) order");
+        assert_eq!(
+            data_pts, sorted,
+            "data frames must be in playback (pts) order"
+        );
 
         // Audio track params should be derived from the decoder config.
         let tracks = demuxer.tracks();
@@ -1076,5 +1063,3 @@ mod tests {
         assert!(audio.sample_rate > 0, "audio sample rate should be parsed");
     }
 }
-
-

@@ -59,7 +59,7 @@ async fn http_get(path: &str) -> (u16, Vec<u8>) {
     let pos = s.find("\r\n").unwrap_or(0);
     let status_line = &s[..pos];
     let code = status_line
-        .splitn(3, ' ')
+        .split(' ')
         .nth(1)
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);

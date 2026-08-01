@@ -25,7 +25,9 @@ use webrtc::api::interceptor_registry::{
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
 use webrtc::interceptor::registry::Registry;
-use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType};
+use webrtc::rtp_transceiver::rtp_codec::{
+    RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
+};
 
 const H264_CAP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
 const OPUS_CAP: &str = "minptime=10;useinbandfec=1";

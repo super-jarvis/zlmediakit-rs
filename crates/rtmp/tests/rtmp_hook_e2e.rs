@@ -57,7 +57,11 @@ async fn hook_allow_code_zero() {
 
     let result = hook.on_publish("vhost", "live", "test", "").await;
     assert_eq!(result, HookResult::Allow);
-    assert_eq!(call_count.load(Ordering::SeqCst), 1, "hook should be called once");
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        1,
+        "hook should be called once"
+    );
 }
 
 #[tokio::test]
@@ -80,7 +84,11 @@ async fn hook_deny_code_nonzero() {
         "expected Deny, got {:?}",
         result
     );
-    assert_eq!(call_count.load(Ordering::SeqCst), 1, "hook should be called once");
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        1,
+        "hook should be called once"
+    );
 }
 
 #[tokio::test]
@@ -121,7 +129,11 @@ async fn hook_timeout_fallthrough_allow() {
     });
 
     let result = hook.on_publish("vhost", "live", "test", "").await;
-    assert_eq!(result, HookResult::Allow, "timeout should fallback to Allow");
+    assert_eq!(
+        result,
+        HookResult::Allow,
+        "timeout should fallback to Allow"
+    );
 }
 
 #[tokio::test]
@@ -163,7 +175,11 @@ async fn hook_selects_correct_url() {
     let result = hook.on_play("vhost", "live", "test", "").await;
     assert_eq!(result, HookResult::Allow);
     // on_play URL is not configured, so the server should NOT be called
-    assert_eq!(call_count.load(Ordering::SeqCst), 0, "play hook should not call server when not configured");
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        0,
+        "play hook should not call server when not configured"
+    );
 }
 
 #[tokio::test]
@@ -175,7 +191,8 @@ async fn hook_unparseable_response_defaults_allow() {
     tokio::spawn(async move {
         if let Ok((mut stream, _)) = listener.accept().await {
             // Send malformed response (not JSON)
-            let response = "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nnot json";
+            let response =
+                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nnot json";
             let _ = stream.write_all(response.as_bytes()).await;
         }
     });
@@ -206,8 +223,7 @@ async fn hook_http_error_status_defaults_allow() {
         if let Ok((mut stream, _)) = listener.accept().await {
             let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf).await;
-            let response =
-                "HTTP/1.0 500 Internal Server Error\r\nConnection: close\r\n\r\n";
+            let response = "HTTP/1.0 500 Internal Server Error\r\nConnection: close\r\n\r\n";
             let _ = stream.write_all(response.as_bytes()).await;
         }
     });

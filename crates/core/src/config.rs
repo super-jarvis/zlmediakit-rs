@@ -11,7 +11,10 @@ static RUNTIME_CONFIG: LazyLock<RwLock<HashMap<String, String>>> = LazyLock::new
     let mut m = HashMap::new();
     m.insert("api.apiDebug".to_string(), "0".to_string());
     m.insert("api.secret".to_string(), d.secret.clone());
-    m.insert("general.mediaServerId".to_string(), "zlmediakit-rs".to_string());
+    m.insert(
+        "general.mediaServerId".to_string(),
+        "zlmediakit-rs".to_string(),
+    );
     m.insert(
         "general.flowThreshold".to_string(),
         d.general.flow_threshold.to_string(),
@@ -30,7 +33,10 @@ static RUNTIME_CONFIG: LazyLock<RwLock<HashMap<String, String>>> = LazyLock::new
     m.insert("record.mp4".to_string(), bool_to_str(d.record.mp4));
     m.insert("record.flv".to_string(), bool_to_str(d.record.flv));
     m.insert("srt.port".to_string(), d.srt.port.to_string());
-    m.insert("gb28181.sip_port".to_string(), d.gb28181.sip_port.to_string());
+    m.insert(
+        "gb28181.sip_port".to_string(),
+        d.gb28181.sip_port.to_string(),
+    );
     m.insert(
         "gb28181.media_port".to_string(),
         d.gb28181.media_port.to_string(),
@@ -40,7 +46,11 @@ static RUNTIME_CONFIG: LazyLock<RwLock<HashMap<String, String>>> = LazyLock::new
 });
 
 fn bool_to_str(v: bool) -> String {
-    if v { "1".to_string() } else { "0".to_string() }
+    if v {
+        "1".to_string()
+    } else {
+        "0".to_string()
+    }
 }
 
 /// Snapshot of the current runtime config (dotted keys -> string values).
@@ -220,7 +230,7 @@ pub struct ProxyEntryConfig {
     pub stream: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProxyConfig {
     /// Whether to auto-start proxy entries from this config section.
     #[serde(default)]
@@ -365,7 +375,7 @@ pub struct ClusterPeerConfig {
     pub app: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClusterConfig {
     /// Whether cluster push relay is enabled.
     #[serde(default)]
@@ -373,15 +383,19 @@ pub struct ClusterConfig {
     /// List of remote peers to push streams to.
     #[serde(default)]
     pub push_to: Vec<ClusterPeerConfig>,
-}
-
-impl Default for ClusterConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            push_to: Vec::new(),
-        }
-    }
+    /// Origin server base URL used for edge auto-pull (origin redirection).
+    /// When set, a play request for a stream that is not currently available
+    /// locally causes the edge node to automatically pull it from this origin
+    /// (e.g. `rtmp://origin:1935` or `rtsp://origin:554`). Leave empty to
+    /// disable edge pull.
+    #[serde(default)]
+    pub origin_url: Option<String>,
+    /// Local vhost used when pulling from the origin.
+    #[serde(default = "default_vhost")]
+    pub origin_vhost: String,
+    /// Local app used when pulling from the origin.
+    #[serde(default = "default_proxy_app")]
+    pub origin_app: String,
 }
 
 impl Default for Gb28181Config {
@@ -550,15 +564,6 @@ impl Default for ProxyEntryConfig {
     }
 }
 
-impl Default for ProxyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            pulls: vec![],
-        }
-    }
-}
-
 impl Default for RecordConfig {
     fn default() -> Self {
         Self {
@@ -605,6 +610,14 @@ impl Default for ServerConfig {
             webrtc: WebRtcConfig::default(),
             webrtc_port: default_webrtc_port(),
         }
+    }
+}
+
+impl ServerConfig {
+    pub fn load(path: &str) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let config: Self = toml::from_str(&content)?;
+        Ok(config)
     }
 }
 
@@ -728,13 +741,5 @@ dir_root = false
         assert!(cfg.on_rtsp_realm.is_none());
         assert_eq!(cfg.timeout_sec, 5);
         assert_eq!(cfg.retry, 1);
-    }
-}
-
-impl ServerConfig {
-    pub fn load(path: &str) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&content)?;
-        Ok(config)
     }
 }

@@ -2,6 +2,7 @@ use crate::event_bus::{Event, EventBus};
 use crate::gop_cache::GopCache;
 use crate::media_frame::{MediaFrame, MediaInfo};
 use crate::session::SessionId;
+use crate::stream_proxy::StreamProxyControl;
 use crate::Result;
 #[cfg(test)]
 use bytes::Bytes;
@@ -38,7 +39,7 @@ mod tests {
                     i as u32,
                     i as u64,
                     i as u64,
-                    Bytes::from(vec![0x17, if is_key { 1 } else { 1 }, 0x00, 0x00, 0x00]),
+                    Bytes::from(vec![0x17, 1, 0x00, 0x00, 0x00]),
                     is_key,
                 );
                 source_clone.publish_and_cache(frame).await;
@@ -144,7 +145,10 @@ impl MediaSource {
 
     pub async fn add_subscriber(&self, session_id: SessionId) {
         let was_empty = self.subscribers.read().await.is_empty();
-        self.subscribers.write().await.insert(session_id.clone(), ());
+        self.subscribers
+            .write()
+            .await
+            .insert(session_id.clone(), ());
         if was_empty {
             // First subscriber → stream changed (regist=true).
             if let Some(eb) = &self.event_bus {
@@ -259,6 +263,16 @@ impl MediaSource {
 pub struct MediaSourceManager {
     sources: DashMap<SourceId, Arc<MediaSource>>,
     event_bus: Option<Arc<EventBus>>,
+    /// Stream proxy control used for edge auto-pull. When set together with an
+    /// origin URL (configured at runtime via `set_origin`), a play request for
+    /// a missing stream triggers an automatic pull from the origin server.
+    proxy: std::sync::RwLock<Option<Arc<StreamProxyControl>>>,
+    /// Origin server base URL for edge auto-pull (e.g. `rtmp://origin:1935`).
+    origin: std::sync::RwLock<Option<String>>,
+    /// Local vhost used when pulling from the origin.
+    origin_vhost: std::sync::RwLock<String>,
+    /// Local app used when pulling from the origin.
+    origin_app: std::sync::RwLock<String>,
 }
 
 impl MediaSourceManager {
@@ -266,7 +280,26 @@ impl MediaSourceManager {
         Self {
             sources: DashMap::new(),
             event_bus,
+            proxy: std::sync::RwLock::new(None),
+            origin: std::sync::RwLock::new(None),
+            origin_vhost: std::sync::RwLock::new("__defaultVhost__".to_string()),
+            origin_app: std::sync::RwLock::new("live".to_string()),
         }
+    }
+
+    /// Enables edge auto-pull: play requests for unknown streams will be
+    /// satisfied by pulling them from `origin_url` (e.g. `rtmp://origin:1935`).
+    pub fn set_origin_pull(
+        &self,
+        proxy: Arc<StreamProxyControl>,
+        origin_url: String,
+        vhost: String,
+        app: String,
+    ) {
+        *self.proxy.write().unwrap() = Some(proxy);
+        *self.origin.write().unwrap() = Some(origin_url);
+        *self.origin_vhost.write().unwrap() = vhost;
+        *self.origin_app.write().unwrap() = app;
     }
 
     pub fn get_or_create(&self, vhost: &str, app: &str, stream: &str) -> Arc<MediaSource> {
@@ -285,6 +318,79 @@ impl MediaSourceManager {
                 ))
             })
             .clone()
+    }
+
+    /// Like [`get`](Self::get) but, when origin-pull is configured and the
+    /// stream is not currently available locally, automatically starts pulling
+    /// it from the origin server and waits (up to `timeout`) for it to appear.
+    ///
+    /// This is the entry point used by player sessions so that an edge node can
+    /// transparently serve streams that only exist on the origin.
+    pub async fn get_or_pull(
+        &self,
+        vhost: &str,
+        app: &str,
+        stream: &str,
+    ) -> Option<Arc<MediaSource>> {
+        if let Some(s) = self.get(vhost, app, stream) {
+            return Some(s);
+        }
+        let (proxy, origin, vh, ap) = {
+            let guard = self.proxy.read().unwrap();
+            let p = match guard.as_ref() {
+                Some(p) => p.clone(),
+                None => return None,
+            };
+            let o = self.origin.read().unwrap().clone();
+            let vh = self.origin_vhost.read().unwrap().clone();
+            let ap = self.origin_app.read().unwrap().clone();
+            (p, o, vh, ap)
+        };
+        let origin = match origin {
+            Some(o) => o,
+            None => return None,
+        };
+        // Already pulling? don't start a second pull.
+        if proxy.is_active(vhost, app, stream) {
+            return self
+                .wait_for_source(vhost, app, stream, std::time::Duration::from_secs(5))
+                .await;
+        }
+        // Build the origin URL: <origin_url>/<origin_app>/<stream>
+        let origin_stream = stream;
+        let url = format!("{}/{}/{}", origin.trim_end_matches('/'), ap, origin_stream);
+        info!(
+            "edge auto-pull: {} -> {}",
+            url,
+            format!("{}/{}/{}", vhost, app, stream)
+        );
+        if !proxy.add(&url, &vh, app, stream) {
+            return None;
+        }
+        self.wait_for_source(vhost, app, stream, std::time::Duration::from_secs(5))
+            .await
+    }
+
+    async fn wait_for_source(
+        &self,
+        vhost: &str,
+        app: &str,
+        stream: &str,
+        timeout: std::time::Duration,
+    ) -> Option<Arc<MediaSource>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(s) = self.get(vhost, app, stream) {
+                // Wait until at least one frame is cached so the player can start.
+                if !s.get_latest_gop_frames().await.is_empty() {
+                    return Some(s);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return self.get(vhost, app, stream);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     pub fn get(&self, vhost: &str, app: &str, stream: &str) -> Option<Arc<MediaSource>> {

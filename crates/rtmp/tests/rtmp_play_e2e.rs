@@ -5,8 +5,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 use zlmediakit_core::auth::StreamAuth;
-use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::event_bus::EventBus;
+use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_rtmp::amf::{AmfDecoder, AmfEncoder, AmfValue};
 use zlmediakit_rtmp::message::{RtmpMessage, RtmpMessageEncoder, RtmpMessageParser};
@@ -188,11 +188,9 @@ async fn rtmp_play_receives_video() {
         .any(|m| matches!(m, RtmpMessage::WindowAckSize(_))));
     assert!(msgs.iter().any(|m| {
         if let RtmpMessage::Amf0Command { data, .. } = m {
-            AmfDecoder::decode(data).ok().map_or(false, |v| {
-                v.first().map_or(
-                    false,
-                    |f| matches!(f, AmfValue::String(s) if s == "_result"),
-                )
+            AmfDecoder::decode(data).ok().is_some_and(|v| {
+                v.first()
+                    .is_some_and(|f| matches!(f, AmfValue::String(s) if s == "_result"))
             })
         } else {
             false
@@ -224,10 +222,10 @@ async fn rtmp_play_receives_video() {
         .find_map(|m| {
             if let RtmpMessage::Amf0Command { data, .. } = m {
                 let vals = AmfDecoder::decode(data).ok()?;
-                if vals.first().map_or(
-                    false,
-                    |v| matches!(v, AmfValue::String(s) if s == "_result"),
-                ) {
+                if vals
+                    .first()
+                    .is_some_and(|v| matches!(v, AmfValue::String(s) if s == "_result"))
+                {
                     vals.get(3).and_then(|v| match v {
                         AmfValue::Number(n) => Some(*n as u32),
                         _ => None,
@@ -264,11 +262,9 @@ async fn rtmp_play_receives_video() {
     .await;
     assert!(msgs.iter().any(|m| {
         if let RtmpMessage::Amf0Command { data, .. } = m {
-            AmfDecoder::decode(data).ok().map_or(false, |v| {
-                v.first().map_or(
-                    false,
-                    |f| matches!(f, AmfValue::String(s) if s == "onStatus"),
-                )
+            AmfDecoder::decode(data).ok().is_some_and(|v| {
+                v.first()
+                    .is_some_and(|f| matches!(f, AmfValue::String(s) if s == "onStatus"))
             })
         } else {
             false
@@ -320,11 +316,9 @@ async fn rtmp_play_receives_video() {
     play_parser.set_chunk_size(chunk_size);
     assert!(msgs.iter().any(|m| {
         if let RtmpMessage::Amf0Command { data, .. } = m {
-            AmfDecoder::decode(data).ok().map_or(false, |v| {
-                v.first().map_or(
-                    false,
-                    |f| matches!(f, AmfValue::String(s) if s == "_result"),
-                )
+            AmfDecoder::decode(data).ok().is_some_and(|v| {
+                v.first()
+                    .is_some_and(|f| matches!(f, AmfValue::String(s) if s == "_result"))
             })
         } else {
             false
@@ -344,10 +338,10 @@ async fn rtmp_play_receives_video() {
         .find_map(|m| {
             if let RtmpMessage::Amf0Command { data, .. } = m {
                 let vals = AmfDecoder::decode(data).ok()?;
-                if vals.first().map_or(
-                    false,
-                    |v| matches!(v, AmfValue::String(s) if s == "_result"),
-                ) {
+                if vals
+                    .first()
+                    .is_some_and(|v| matches!(v, AmfValue::String(s) if s == "_result"))
+                {
                     vals.get(3).and_then(|v| match v {
                         AmfValue::Number(n) => Some(*n as u32),
                         _ => None,

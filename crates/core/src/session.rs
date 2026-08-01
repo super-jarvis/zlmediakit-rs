@@ -124,9 +124,8 @@ impl SessionManager {
             .iter()
             .filter_map(|entry| {
                 let info = entry.value();
-                let peer_ip_ok = peer_ip.is_none_or(|ip| {
-                    info.peer_addr.split(':').next().unwrap_or("") == ip
-                });
+                let peer_ip_ok =
+                    peer_ip.is_none_or(|ip| info.peer_addr.split(':').next().unwrap_or("") == ip);
                 let local_port_ok = local_port.is_none_or(|p| {
                     info.local_addr
                         .split(':')

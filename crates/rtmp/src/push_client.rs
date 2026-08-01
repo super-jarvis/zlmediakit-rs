@@ -186,7 +186,10 @@ pub async fn start(
         .find_map(|m| {
             if let RtmpMessage::Amf0Command { data, .. } = m {
                 let vals = AmfDecoder::decode(data).ok()?;
-                if vals.first().map_or(false, |v| matches!(v, AmfValue::String(s) if s == "_result")) {
+                if vals
+                    .first()
+                    .is_some_and(|v| matches!(v, AmfValue::String(s) if s == "_result"))
+                {
                     vals.get(3).and_then(|v| match v {
                         AmfValue::Number(n) => Some(*n as u32),
                         _ => None,
@@ -222,9 +225,14 @@ pub async fn start(
     info!("RTMP push publish ok for {}", url);
 
     // --- Subscribe to local source and forward frames ---
-    let source = source_manager
-        .get(vhost, app, stream_name)
-        .ok_or_else(|| anyhow::anyhow!("RTMP push: local stream {}/{}/{} not found", vhost, app, stream_name))?;
+    let source = source_manager.get(vhost, app, stream_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "RTMP push: local stream {}/{}/{} not found",
+            vhost,
+            app,
+            stream_name
+        )
+    })?;
     let mut rx = source.subscribe();
 
     loop {
@@ -287,11 +295,17 @@ async fn read_until_result(
         for m in &msgs {
             if let RtmpMessage::Amf0Command { data, .. } = m {
                 if let Ok(vals) = AmfDecoder::decode(data) {
-                    if vals.first().map_or(false, |v| matches!(v, AmfValue::String(s) if s == "_result")) {
-                        let got = vals.get(1).and_then(|v| match v {
-                            AmfValue::Number(n) => Some(*n),
-                            _ => None,
-                        }).unwrap_or(0.0);
+                    if vals
+                        .first()
+                        .is_some_and(|v| matches!(v, AmfValue::String(s) if s == "_result"))
+                    {
+                        let got = vals
+                            .get(1)
+                            .and_then(|v| match v {
+                                AmfValue::Number(n) => Some(*n),
+                                _ => None,
+                            })
+                            .unwrap_or(0.0);
                         if (got - txn_id).abs() < 0.001 {
                             all.push(m.clone());
                             return Ok(all);
@@ -319,7 +333,10 @@ async fn read_until_status(
         for m in &msgs {
             if let RtmpMessage::Amf0Command { data, .. } = m {
                 if let Ok(vals) = AmfDecoder::decode(data) {
-                    if vals.first().map_or(false, |v| matches!(v, AmfValue::String(s) if s == "onStatus")) {
+                    if vals
+                        .first()
+                        .is_some_and(|v| matches!(v, AmfValue::String(s) if s == "onStatus"))
+                    {
                         all.push(m.clone());
                         return Ok(all);
                     }

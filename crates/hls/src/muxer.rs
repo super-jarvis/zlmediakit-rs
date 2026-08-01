@@ -84,7 +84,14 @@ impl TsWriter {
         write_ts_packet(out, PMT_PID, &pmt_payload, true, &mut self.continuity_pmt);
     }
 
-    pub(crate) fn write_pes(&mut self, out: &mut Vec<u8>, pid: u16, pes: &[u8], rand_access: bool, dts_ms: u64) {
+    pub(crate) fn write_pes(
+        &mut self,
+        out: &mut Vec<u8>,
+        pid: u16,
+        pes: &[u8],
+        rand_access: bool,
+        dts_ms: u64,
+    ) {
         self.pcr = dts_ms * 27000;
         let pcr = self.pcr;
         write_pes_to_ts(out, pid, pes, rand_access, self.continuity_for(pid), pcr);
@@ -228,7 +235,8 @@ impl HlsMuxer {
             if let Some(ref config) = self.video_config_data {
                 info!("Writing video config PES: {} bytes", config.len());
                 let pes = build_config_pes(0xE0, config);
-                self.writer.write_pes(&mut out, VIDEO_PID, &pes, true, self.writer.pcr / 90);
+                self.writer
+                    .write_pes(&mut out, VIDEO_PID, &pes, true, self.writer.pcr / 90);
                 self.video_config_sent = true;
             } else {
                 info!("No video config data available");
@@ -238,7 +246,8 @@ impl HlsMuxer {
         if !self.audio_config_sent {
             if let Some(ref config) = self.audio_config_data {
                 let pes = build_config_pes(0xC0, config);
-                self.writer.write_pes(&mut out, AUDIO_PID, &pes, true, self.writer.pcr / 90);
+                self.writer
+                    .write_pes(&mut out, AUDIO_PID, &pes, true, self.writer.pcr / 90);
                 self.audio_config_sent = true;
             }
         }
@@ -255,7 +264,13 @@ impl HlsMuxer {
                                 &annex_b[..annex_b.len().min(12)]
                             );
                             let pes = build_data_pes_raw(0xE0, &annex_b, frame.timestamp);
-                            self.writer.write_pes(&mut out, VIDEO_PID, &pes, true, frame.timestamp as u64);
+                            self.writer.write_pes(
+                                &mut out,
+                                VIDEO_PID,
+                                &pes,
+                                true,
+                                frame.timestamp as u64,
+                            );
                         } else {
                             info!(
                                 "  -> annex_b EMPTY for frame data[:5]={:02x?}",
@@ -272,7 +287,13 @@ impl HlsMuxer {
                     };
                     if !audio_data.is_empty() {
                         let pes = build_data_pes_raw(0xC0, &audio_data, frame.timestamp);
-                        self.writer.write_pes(&mut out, AUDIO_PID, &pes, false, frame.timestamp as u64);
+                        self.writer.write_pes(
+                            &mut out,
+                            AUDIO_PID,
+                            &pes,
+                            false,
+                            frame.timestamp as u64,
+                        );
                     }
                 }
                 _ => {}
@@ -819,7 +840,7 @@ mod tests {
         // program-info descriptors (0xF000) preceding the stream type.
         let pattern = [0xE1, 0x00, 0xF0, 0x00, 0x24];
         assert!(
-            seg.windows(5).any(|w| w == &pattern),
+            seg.windows(5).any(|w| w == pattern),
             "PMT should advertise HEVC stream type 0x24"
         );
     }

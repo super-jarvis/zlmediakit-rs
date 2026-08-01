@@ -156,14 +156,9 @@ async fn whep_e2e_receives_media() {
                 let received = received.clone();
                 Box::pin(async move {
                     let mut buf = vec![0u8; 1500];
-                    loop {
-                        match track.read(&mut buf).await {
-                            Ok(_) => {
-                                let mut c = received.lock().await;
-                                *c += 1;
-                            }
-                            Err(_) => break,
-                        }
+                    while track.read(&mut buf).await.is_ok() {
+                        let mut c = received.lock().await;
+                        *c += 1;
                     }
                 })
             },
@@ -219,8 +214,8 @@ async fn whep_e2e_receives_media() {
                     i,
                     i as u64,
                     i as u64,
-                    avcc_sample(i % 10 == 0, i),
-                    i % 10 == 0,
+                    avcc_sample(i.is_multiple_of(10), i),
+                    i.is_multiple_of(10),
                 ))
                 .await;
             i += 1;
@@ -416,14 +411,9 @@ async fn whep_http_e2e_receives_media() {
                 let received = received.clone();
                 Box::pin(async move {
                     let mut buf = vec![0u8; 1500];
-                    loop {
-                        match track.read(&mut buf).await {
-                            Ok(_) => {
-                                let mut c = received.lock().await;
-                                *c += 1;
-                            }
-                            Err(_) => break,
-                        }
+                    while track.read(&mut buf).await.is_ok() {
+                        let mut c = received.lock().await;
+                        *c += 1;
                     }
                 })
             },
@@ -483,8 +473,8 @@ async fn whep_http_e2e_receives_media() {
                     i,
                     i as u64,
                     i as u64,
-                    avcc_sample(i % 10 == 0, i),
-                    i % 10 == 0,
+                    avcc_sample(i.is_multiple_of(10), i),
+                    i.is_multiple_of(10),
                 ))
                 .await;
             i += 1;
@@ -649,7 +639,7 @@ async fn whip_e2e_publish_then_play() {
     tokio::spawn(async move {
         let mut i = 0u32;
         loop {
-            let nalu = if i % 10 == 0 { 5u8 } else { 1u8 };
+            let nalu = if i.is_multiple_of(10) { 5u8 } else { 1u8 };
             let sample = Sample {
                 data: annexb_frame(nalu, &[0xAA; 2000]),
                 timestamp: SystemTime::now(),
@@ -695,14 +685,9 @@ async fn whip_e2e_publish_then_play() {
                 let received = received.clone();
                 Box::pin(async move {
                     let mut buf = vec![0u8; 2000];
-                    loop {
-                        match track.read(&mut buf).await {
-                            Ok(_) => {
-                                let mut c = received.lock().await;
-                                *c += 1;
-                            }
-                            Err(_) => break,
-                        }
+                    while track.read(&mut buf).await.is_ok() {
+                        let mut c = received.lock().await;
+                        *c += 1;
                     }
                 })
             },

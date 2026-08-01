@@ -82,6 +82,12 @@ impl G711Parser {
     }
 }
 
+impl Default for G711Parser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,11 +183,5 @@ mod tests {
         let input = [0xFFu8, 0x00, 0x7F];
         let pcm = G711Parser::ulaw_to_pcm(&input);
         assert_eq!(pcm.len(), 3);
-    }
-}
-
-impl Default for G711Parser {
-    fn default() -> Self {
-        Self::new()
     }
 }

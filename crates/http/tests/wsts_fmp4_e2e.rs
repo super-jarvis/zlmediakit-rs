@@ -129,10 +129,7 @@ async fn start_server(port: u16) -> Fixture {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    Fixture {
-        mgr,
-        port,
-    }
+    Fixture { mgr, port }
 }
 
 async fn publish_stream(
@@ -299,7 +296,11 @@ async fn ws_fmp4_receives_init_segment_and_media_segments() {
         frames.len()
     );
     // First frame is the initialization segment: starts with ftyp.
-    assert_eq!(&frames[0][4..8], b"ftyp", "init segment must start with ftyp");
+    assert_eq!(
+        &frames[0][4..8],
+        b"ftyp",
+        "init segment must start with ftyp"
+    );
     // Media segments begin with styp (CMAF) or moof.
     let media = &frames[1];
     let brand = &media[4..8];
