@@ -109,3 +109,33 @@ fn digest_with_qop_auth_passes() {
     );
     assert!(a.check_digest(realm, "PLAY", uri, &hdr));
 }
+
+/// Per-user password table: a user authenticates with their own password, not
+/// the shared secret.
+#[test]
+fn digest_uses_per_user_password() {
+    use std::collections::HashMap;
+    let realm = "zlmediakit";
+    let nonce = "n";
+    let uri = "rtsp://x/live/s";
+    let mut users = HashMap::new();
+    users.insert("alice".to_string(), "alice-pass".to_string());
+    users.insert("bob".to_string(), "bob-pass".to_string());
+    let a = StreamAuth::new_with_realm(true, "shared-secret".to_string(), Some(realm.to_string()), users);
+
+    // Alice with her own password -> passes.
+    let hdr_alice = digest_header("alice", realm, "alice-pass", "DESCRIBE", uri, nonce);
+    assert!(a.check_digest(realm, "DESCRIBE", uri, &hdr_alice));
+
+    // Bob with his own password -> passes.
+    let hdr_bob = digest_header("bob", realm, "bob-pass", "DESCRIBE", uri, nonce);
+    assert!(a.check_digest(realm, "DESCRIBE", uri, &hdr_bob));
+
+    // Alice using the shared secret instead of her password -> fails.
+    let hdr_wrong = digest_header("alice", realm, "shared-secret", "DESCRIBE", uri, nonce);
+    assert!(!a.check_digest(realm, "DESCRIBE", uri, &hdr_wrong));
+
+    // Unknown user falls back to the shared secret as password.
+    let hdr_fallback = digest_header("carol", realm, "shared-secret", "DESCRIBE", uri, nonce);
+    assert!(a.check_digest(realm, "DESCRIBE", uri, &hdr_fallback));
+}
