@@ -190,6 +190,36 @@ impl HttpSession {
         // receive the full `path` so they can extract `?sign=` and other params.
         let route = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
 
+        // Unified HTTP access-control hook (`on_http_access`). Applied to all
+        // stream-playback routes so an external service can deny playback
+        // (and other requests) before any stream/auth logic runs. Fail-open:
+        // when no hook is configured this is a no-op.
+        if Self::is_play_route(route) {
+            let (app, resource, params) = Self::parse_path_sign(path);
+            let stream_name = resource.to_string();
+            let peer_ip = self.peer_addr.split(':').next().unwrap_or(&self.peer_addr);
+            if let HookResult::Deny(msg) = self
+                .hook
+                .on_http_access(
+                    "__defaultVhost__",
+                    &app,
+                    &stream_name,
+                    peer_ip,
+                    &params,
+                    route,
+                    true,
+                    path,
+                )
+                .await
+            {
+                warn!(
+                    "HTTP access denied by hook (on_http_access): {}/{} - {}",
+                    app, stream_name, msg
+                );
+                return self.send_401().await;
+            }
+        }
+
         let www_root = self.www_root.clone();
         if route.starts_with("/index/api/") {
             self.handle_api(path).await?;
@@ -1604,9 +1634,38 @@ impl HttpSession {
                 }))
                 .await?;
             }
+            "updateConfig" => {
+                // Alias of setServerConfig: apply runtime-config updates and
+                // report how many keys changed.
+                let q = Self::parse_query(path);
+                let mut changed = 0usize;
+                for (k, v) in q {
+                    if k == "secret" || k.is_empty() {
+                        continue;
+                    }
+                    if zlmediakit_core::config::set_runtime_config(&k, &v) {
+                        changed += 1;
+                    }
+                }
+                self.send_json(&serde_json::json!({ "code": 0, "changed": changed }))
+                    .await?;
+            }
+            "restartServer" => {
+                // Respond first so the client sees success, then request a
+                // graceful shutdown (a supervisor normally restarts the
+                // process). The response is flushed before shutdown begins.
+                self.send_json(&serde_json::json!({ "code": 0 })).await?;
+                let _ = self.stream.flush().await;
+                tokio::spawn(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    zlmediakit_core::signal::request_shutdown();
+                });
+            }
             "getApiList" => {
                 const APIS: &[&str] = &[
                     "getApiList",
+                    "updateConfig",
+                    "restartServer",
                     "getThreadsLoad",
                     "getWorkThreadsLoad",
                     "getServerConfig",
@@ -2729,6 +2788,20 @@ impl HttpSession {
         let app = parts.first().map_or("live", |v| v).to_string();
         let resource = parts.get(1).map_or("", |v| v).to_string();
         (app, resource, sign)
+    }
+
+    /// Returns `true` for request paths that map to a live stream playback
+    /// route (HTTP-FLV / HTTP-TS / HTTP-fMP4 / HLS / CMAF / DASH). Static
+    /// files, the API and the web root are not considered playback routes.
+    fn is_play_route(route: &str) -> bool {
+        route.ends_with(".flv")
+            || route.ends_with(".live.ts")
+            || route.ends_with(".live.mp4")
+            || route.ends_with(".m3u8")
+            || route.ends_with(".cmav.m3u8")
+            || route.ends_with(".mpd")
+            || route.ends_with(".m4s")
+            || route.ends_with(".ts")
     }
 
     fn parse_query(path: &str) -> HashMap<String, String> {

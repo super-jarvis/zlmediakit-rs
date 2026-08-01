@@ -92,6 +92,16 @@ pub struct ServerConfig {
     #[serde(default)]
     pub auth_enabled: bool,
 
+    /// RTSP Digest user table (`username = "password"`). When set, Digest auth
+    /// validates each user against their own password; unknown users fall back
+    /// to `secret`. Example:
+    /// ```toml
+    /// [auth.users]
+    /// admin = "admin123"
+    /// ```
+    #[serde(default)]
+    pub auth_users: HashMap<String, String>,
+
     #[serde(default)]
     pub hook: HookConfig,
 
@@ -127,6 +137,18 @@ pub struct ServerConfig {
 
     #[serde(default = "default_webrtc_port")]
     pub webrtc_port: u16,
+
+    /// Stable identifier reported to hooks (e.g. `on_server_started`,
+    /// `on_flow_report`). Defaults to the machine hostname when empty.
+    #[serde(default = "default_media_server_id")]
+    pub media_server_id: String,
+}
+
+fn default_media_server_id() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "zlmediakit-rs".to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +191,13 @@ pub struct RtspConfig {
     pub ssl_port: Option<u16>,
     #[serde(default = "default_true")]
     pub tcp_mode: bool,
+    /// Static RTSP Digest authentication realm used as a fallback when no
+    /// `hook.on_rtsp_realm` is configured (or it returns nothing). Empty means
+    /// no static realm — a Digest challenge is only issued when a realm is
+    /// available from the hook. Defaults to `"zlmediakit"` to mirror upstream
+    /// behavior so Digest auth works out-of-the-box.
+    #[serde(default = "default_rtsp_realm")]
+    pub realm: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +312,33 @@ pub struct HookConfig {
     #[serde(default)]
     pub on_rtsp_realm: Option<String>,
 
+    /// Called once after the media server has finished starting up.
+    /// POST params: mediaServerId
+    #[serde(default)]
+    pub on_server_started: Option<String>,
+
+    /// Called once just before the media server process exits.
+    /// POST params: mediaServerId
+    #[serde(default)]
+    pub on_server_exited: Option<String>,
+
+    /// Per-request HTTP access control hook. Called before serving any HTTP
+    /// request (including HTTP-FLV / HLS playback and static files).
+    /// POST params: vhost, app, stream, ip, params, path, is_play, url
+    /// Returning `{code:1}` denies the request; `{code:0}` allows it.
+    #[serde(default)]
+    pub on_http_access: Option<String>,
+
+    /// Periodic traffic/bandwidth report hook. Called every
+    /// `flow_report_interval_sec` seconds. POST params: mediaServerId, bytes_in,
+    /// bytes_out, total_readable, total_writable
+    #[serde(default)]
+    pub on_flow_report: Option<String>,
+
+    /// Interval in seconds between `on_flow_report` callbacks (default 30).
+    #[serde(default = "default_flow_interval")]
+    pub flow_report_interval_sec: u64,
+
     /// Timeout in seconds for each HTTP hook call (default 5).
     #[serde(default = "default_hook_timeout")]
     pub timeout_sec: u64,
@@ -299,6 +355,9 @@ fn default_hook_timeout() -> u64 {
 fn default_hook_retry() -> u32 {
     1
 }
+fn default_flow_interval() -> u64 {
+    30
+}
 
 impl Default for HookConfig {
     fn default() -> Self {
@@ -310,6 +369,11 @@ impl Default for HookConfig {
             on_stream_changed: None,
             on_record_mp4: None,
             on_rtsp_realm: None,
+            on_server_started: None,
+            on_server_exited: None,
+            on_http_access: None,
+            on_flow_report: None,
+            flow_report_interval_sec: default_flow_interval(),
             timeout_sec: default_hook_timeout(),
             retry: default_hook_retry(),
         }
@@ -489,6 +553,9 @@ fn default_stream_none_reader_delay() -> u64 {
 fn default_true() -> bool {
     true
 }
+fn default_rtsp_realm() -> String {
+    "zlmediakit".to_string()
+}
 
 fn default_proxy_app() -> String {
     "live".to_string()
@@ -530,6 +597,7 @@ impl Default for RtspConfig {
             ssl_key: None,
             ssl_port: None,
             tcp_mode: true,
+            realm: default_rtsp_realm(),
         }
     }
 }
@@ -597,6 +665,7 @@ impl Default for ServerConfig {
             default_vhost: default_vhost(),
             secret: default_secret(),
             auth_enabled: default_auth_enabled(),
+            auth_users: HashMap::new(),
             hook: HookConfig::default(),
             general: GeneralConfig::default(),
             rtmp: RtmpConfig::default(),
@@ -609,6 +678,7 @@ impl Default for ServerConfig {
             cluster: ClusterConfig::default(),
             webrtc: WebRtcConfig::default(),
             webrtc_port: default_webrtc_port(),
+            media_server_id: default_media_server_id(),
         }
     }
 }

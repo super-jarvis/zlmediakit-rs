@@ -52,6 +52,10 @@ impl HookClient {
             && self.config.on_stream_changed.is_none()
             && self.config.on_record_mp4.is_none()
             && self.config.on_rtsp_realm.is_none()
+            && self.config.on_server_started.is_none()
+            && self.config.on_server_exited.is_none()
+            && self.config.on_http_access.is_none()
+            && self.config.on_flow_report.is_none()
     }
 
     // ── public hook entry-points ──────────────────────────────────────
@@ -207,6 +211,93 @@ impl HookClient {
             }
         }
         None
+    }
+
+    /// Called once after the media server finishes starting up.
+    /// `server_id` is the configured `media_server_id` (defaults to hostname).
+    pub async fn on_server_started(&self, server_id: &str) {
+        if let Some(url) = &self.config.on_server_started {
+            let _ = self
+                .call_hook(url, "__defaultVhost__", "", "", &[("mediaServerId", server_id)])
+                .await;
+        }
+    }
+
+    /// Called once just before the media server process exits.
+    pub async fn on_server_exited(&self, server_id: &str) {
+        if let Some(url) = &self.config.on_server_exited {
+            let _ = self
+                .call_hook(url, "__defaultVhost__", "", "", &[("mediaServerId", server_id)])
+                .await;
+        }
+    }
+
+    /// Per-request HTTP access control. Returns `Deny(reason)` when the hook
+    /// responds with `{code:1}`, otherwise `Allow`. Fail-open on hook errors.
+    /// `is_play` indicates a playback (FLV/HLS) request vs. a static/file
+    /// request.
+    pub async fn on_http_access(
+        &self,
+        vhost: &str,
+        app: &str,
+        stream: &str,
+        ip: &str,
+        params: &str,
+        path: &str,
+        is_play: bool,
+        url: &str,
+    ) -> HookResult {
+        let hook_url = match &self.config.on_http_access {
+            Some(u) => u,
+            None => return HookResult::Allow,
+        };
+        // `call_hook` treats `code != 0` as deny, so a `{code:1}` response
+        // denies the request. Pass an explicit `code` expectation via extra
+        // params is not needed — the server simply checks the returned code.
+        self.call_hook(
+            hook_url,
+            vhost,
+            app,
+            stream,
+            &[
+                ("ip", ip),
+                ("params", params),
+                ("path", path),
+                ("is_play", if is_play { "1" } else { "0" }),
+                ("url", url),
+            ],
+        )
+        .await
+    }
+
+    /// Periodic traffic report. `bytes_in` / `bytes_out` are totals since the
+    /// server started; `readable` / `writable` are current source/player
+    /// counts.
+    pub async fn on_flow_report(
+        &self,
+        server_id: &str,
+        bytes_in: u64,
+        bytes_out: u64,
+        readable: usize,
+        writable: usize,
+    ) {
+        if let Some(url) = &self.config.on_flow_report {
+            let _ = self
+                .call_hook(
+                    url,
+                    "__defaultVhost__",
+                    "",
+                    "",
+                    &[
+                        ("mediaServerId", server_id),
+                        ("bytes_in", &bytes_in.to_string()),
+                        ("bytes_out", &bytes_out.to_string()),
+                        ("total_readable", &readable.to_string()),
+                        ("total_writable", &writable.to_string()),
+                    ],
+                )
+                .await;
+        }
     }
 
     // ── internal helpers ───────────────────────────────────────────────

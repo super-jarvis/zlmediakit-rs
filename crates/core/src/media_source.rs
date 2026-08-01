@@ -101,6 +101,10 @@ pub struct MediaSource {
     pub subscribers: Arc<RwLock<HashMap<SessionId, ()>>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub event_bus: Option<Arc<EventBus>>,
+    /// Per-source traffic counters (bytes). Shared so the manager can read them
+    /// when summarizing total traffic for the `on_flow_report` hook.
+    pub bytes_in: Arc<std::sync::atomic::AtomicU64>,
+    pub bytes_out: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MediaSource {
@@ -127,6 +131,8 @@ impl MediaSource {
             subscribers: Arc::new(RwLock::new(HashMap::new())),
             created_at: chrono::Utc::now(),
             event_bus,
+            bytes_in: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            bytes_out: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -227,6 +233,8 @@ impl MediaSource {
     }
 
     pub async fn publish_and_cache(&self, frame: MediaFrame) {
+        let payload_len = frame.data.len() as u64;
+        self.bytes_in.fetch_add(payload_len, std::sync::atomic::Ordering::Relaxed);
         {
             let mut cache = self.gop_cache.write().await;
             cache.cache_frame(&frame);
@@ -238,6 +246,11 @@ impl MediaSource {
                 None => (0, Ok(0)),
             }
         };
+        // Traffic delivered to players (one copy per live subscriber).
+        if receivers > 0 {
+            self.bytes_out
+                .fetch_add(payload_len * receivers as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         debug!(
             "publish_and_cache: type={:?} key={} receivers={} send_result={:?}",
             frame.frame_type,
@@ -318,6 +331,23 @@ impl MediaSourceManager {
                 ))
             })
             .clone()
+    }
+
+    /// Summarizes total bytes in/out across all live sources. Used for the
+    /// `on_flow_report` hook.
+    pub fn total_traffic(&self) -> (u64, u64) {
+        let mut in_sum = 0u64;
+        let mut out_sum = 0u64;
+        for src in self.sources.iter() {
+            in_sum += src.value().bytes_in.load(std::sync::atomic::Ordering::Relaxed);
+            out_sum += src.value().bytes_out.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        (in_sum, out_sum)
+    }
+
+    /// Number of currently live (published) sources.
+    pub fn source_count(&self) -> usize {
+        self.sources.len()
     }
 
     /// Like [`get`](Self::get) but, when origin-pull is configured and the

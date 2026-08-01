@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -109,7 +110,12 @@ async fn main() -> Result<()> {
 
     let event_bus = Arc::new(EventBus::new(1024));
     let source_manager = Arc::new(MediaSourceManager::new(Some(event_bus.clone())));
-    let auth = StreamAuth::new(config.auth_enabled, config.secret.clone());
+    let auth = StreamAuth::new_with_realm(
+        config.auth_enabled,
+        config.secret.clone(),
+        Some(config.rtsp.realm.clone()),
+        config.auth_users.clone(),
+    );
     let hook = HookClient::new(config.hook.clone());
     let (recorder_control, recorder_cmd_rx) = RecorderControl::new();
     let recorder_control = Arc::new(recorder_control);
@@ -506,8 +512,45 @@ async fn main() -> Result<()> {
 
     info!("All servers started. Press Ctrl+C to stop.");
 
-    tokio::signal::ctrl_c().await?;
+    // Notify lifecycle hook (fail-open: ignored if no hook or on error).
+    let server_id = config.media_server_id.clone();
+    hook.on_server_started(&server_id).await;
+
+    // Periodic traffic report hook (fail-open). Runs until the process exits.
+    if config.hook.on_flow_report.is_some() {
+        let flow_hook = hook.clone();
+        let flow_sid = server_id.clone();
+        let flow_sm = source_manager.clone();
+        let flow_sessions = session_mgr.clone();
+        let interval = config.hook.flow_report_interval_sec.max(1);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+                let (bytes_in, bytes_out) = flow_sm.total_traffic();
+                let readable = flow_sm.source_count();
+                let writable = flow_sessions
+                    .as_ref()
+                    .map(|s| s.count())
+                    .unwrap_or(0);
+                flow_hook
+                    .on_flow_report(&flow_sid, bytes_in, bytes_out, readable, writable)
+                    .await;
+            }
+        });
+    }
+
+    // Wait for either Ctrl+C or a programmatic restart request (e.g. the
+    // `restartServer` HTTP API), whichever comes first.
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = zlmediakit_core::signal::shutdown_signal().notified() => {
+            info!("Restart requested via API");
+        }
+    }
     info!("Shutting down...");
+
+    // Notify exit hook before tearing down tasks/sockets.
+    hook.on_server_exited(&server_id).await;
 
     // Signal blocking servers (e.g. SRT) to stop.
     for sig in &stop_signals {

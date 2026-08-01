@@ -8,11 +8,50 @@ use std::sync::Arc;
 pub struct StreamAuth {
     pub enabled: bool,
     pub secret: String,
+    /// Optional static realm used as a fallback when no `on_rtsp_realm` hook
+    /// is configured (or it returns nothing). When set, RTSP Digest auth can
+    /// always issue a `WWW-Authenticate: Digest` challenge even without a hook.
+    pub default_realm: Option<String>,
+    /// Optional RTSP Digest user table (`username -> password`). When present,
+    /// a Digest response is validated against the password of the claimed
+    /// `username`; if the username is unknown the shared `secret` is used as a
+    /// fallback password (so single-secret deployments keep working).
+    pub users: HashMap<String, String>,
 }
 
 impl StreamAuth {
     pub fn new(enabled: bool, secret: String) -> Arc<Self> {
-        Arc::new(Self { enabled, secret })
+        Arc::new(Self {
+            enabled,
+            secret,
+            default_realm: None,
+            users: HashMap::new(),
+        })
+    }
+
+    /// Like [`StreamAuth::new`] but with a static default realm for RTSP Digest
+    /// auth fallback.
+    pub fn new_with_realm(
+        enabled: bool,
+        secret: String,
+        default_realm: Option<String>,
+        users: HashMap<String, String>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            enabled,
+            secret,
+            default_realm,
+            users,
+        })
+    }
+
+    /// Resolves the Digest password for a claimed `username`: the per-user
+    /// password when configured, otherwise the shared `secret`.
+    fn digest_password(&self, username: &str) -> String {
+        self.users
+            .get(username)
+            .cloned()
+            .unwrap_or_else(|| self.secret.clone())
     }
 
     /// Validates a `sign` query/parameter for a publish or play request.
@@ -77,12 +116,9 @@ impl StreamAuth {
             None => return false,
         };
 
-        let ha1 = md5_hex(&format!(
-            "{}:{}:{}",
-            fields.get("username").unwrap_or(&String::new()),
-            realm,
-            self.secret
-        ));
+        let username = fields.get("username").cloned().unwrap_or_default();
+        let password = self.digest_password(&username);
+        let ha1 = md5_hex(&format!("{}:{}:{}", username, realm, password));
         let ha2 = md5_hex(&format!("{}:{}", method, uri));
         let expected = md5_hex(&format!("{}:{}:{}", ha1, nonce, ha2));
 

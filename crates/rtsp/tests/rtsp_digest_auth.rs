@@ -239,3 +239,59 @@ async fn rtsp_digest_rejects_wrong_response() {
     .await;
     assert_eq!(code2, 401, "wrong Digest response must be rejected with 401");
 }
+
+/// When no `on_rtsp_realm` hook is configured, the configured static realm
+/// must still let the server issue a `WWW-Authenticate: Digest` challenge so
+/// RTSP Digest auth works out-of-the-box.
+#[tokio::test]
+async fn rtsp_digest_fallback_default_realm() {
+    let realm = "zlmediakit";
+    let secret = "fallback-secret";
+    let rtsp_port = 19151u16;
+
+    let mgr = Arc::new(MediaSourceManager::new(None));
+    let event_bus = Arc::new(EventBus::new(1024));
+    let auth = StreamAuth::new_with_realm(true, secret.to_string(), Some(realm.to_string()));
+    // No hook configured.
+    let hook: Option<Arc<HookClient>> = None;
+
+    let addr = format!("127.0.0.1:{}", rtsp_port);
+    let srv = RtspServer::new(&addr, mgr.clone(), event_bus, auth, hook, None, None)
+        .await
+        .expect("RtspServer should start");
+    tokio::spawn(async move {
+        let _ = srv.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let uri = format!("rtsp://127.0.0.1:{}/live/test", rtsp_port);
+    let mut sock = TcpStream::connect(("127.0.0.1", rtsp_port)).await.unwrap();
+    sock.set_nodelay(true).unwrap();
+    let mut buf = Vec::new();
+    let (code1, resp1) = rtsp_request(
+        &mut sock,
+        format!("DESCRIBE {} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n", uri).as_bytes(),
+        &mut buf,
+    )
+    .await;
+    assert_eq!(code1, 401, "anonymous DESCRIBE must be rejected with 401");
+    let www = header_value(&resp1, "WWW-Authenticate").expect("must carry a Digest challenge");
+    assert!(www.starts_with("Digest"), "must be a Digest challenge: {}", www);
+    let (chal_realm, nonce) = extract_digest(&resp1);
+    assert_eq!(chal_realm, realm, "fallback realm must be used");
+
+    // Correct secret -> passes the auth gate (still 404 since no stream exists).
+    let authorization = make_digest_auth("test", &chal_realm, secret, "DESCRIBE", &uri, &nonce);
+    let (code2, _) = rtsp_request(
+        &mut sock,
+        format!(
+            "DESCRIBE {} RTSP/1.0\r\nCSeq: 2\r\nAccept: application/sdp\r\nAuthorization: {}\r\n\r\n",
+            uri, authorization
+        )
+        .as_bytes(),
+        &mut buf,
+    )
+    .await;
+    assert_ne!(code2, 401, "valid Digest credentials must pass the auth gate");
+    assert!(code2 == 404 || code2 == 200, "expected 404 (no such stream) but got {}", code2);
+}

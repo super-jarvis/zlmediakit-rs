@@ -544,6 +544,15 @@ impl RtspSession {
                     }
                 }
             }
+            // Fall back to a configured static realm so a Digest challenge can
+            // still be issued when no hook (or an empty hook response) is used.
+            if self.realm.is_none() {
+                if let Some(realm) = &self.auth.default_realm {
+                    if !realm.is_empty() {
+                        self.realm = Some(realm.clone());
+                    }
+                }
+            }
         }
 
         let mut response =
