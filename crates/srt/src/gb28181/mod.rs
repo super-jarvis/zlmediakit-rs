@@ -8,9 +8,10 @@
 
 pub mod rtp_server;
 pub mod sip;
+pub mod xml;
 
 pub use rtp_server::{RtpPayloadType, RtpServerInfo, RtpServerManager, RtpStreamReceiver};
-pub use sip::{SipServer, SipServerConfig};
+pub use sip::{ChannelInfo, DeviceInfo, SipInfo, SipServer, SipServerConfig};
 
 use std::sync::Arc;
 

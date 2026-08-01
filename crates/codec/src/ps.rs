@@ -4,7 +4,7 @@
 //! containing PES-packaged H.264/H.265 video and audio streams.
 //! This module demuxes PS data to extract raw NAL units.
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 
 /// Demuxed PES packet content.
 #[derive(Debug, Clone)]
@@ -15,6 +15,157 @@ pub struct PesPacket {
     pub data: Bytes,
     /// PTS in 90kHz ticks (if present in PES header).
     pub pts: Option<u64>,
+}
+
+/// Incremental MPEG-PS demuxer.
+///
+/// GB28181 cameras do not reliably set the RTP marker bit, and a single PES
+/// packet can be spread across several RTP packets. This demuxer accumulates
+/// raw PS bytes and yields complete [`PesPacket`]s as they become available,
+/// so the caller no longer has to wait for a marker before parsing.
+pub struct PsDemuxer {
+    buf: BytesMut,
+    /// Max buffer size before we assume the stream is malformed and resync.
+    max_buf: usize,
+}
+
+impl PsDemuxer {
+    pub fn new() -> Self {
+        Self {
+            buf: BytesMut::new(),
+            max_buf: 4 * 1024 * 1024,
+        }
+    }
+
+    /// Appends RTP payload bytes to the internal buffer.
+    pub fn push(&mut self, data: &[u8]) {
+        if self.buf.len() + data.len() > self.max_buf {
+            // Drop a bounded prefix to avoid unbounded growth; keep the
+            // newest bytes since the tail of the buffer is most likely part
+            // of the PES being accumulated.
+            let drop = self.buf.len() + data.len() - self.max_buf;
+            let drop = drop.min(self.buf.len());
+            self.buf.advance(drop);
+        }
+        self.buf.extend_from_slice(data);
+    }
+
+    /// Attempts to extract the next complete PES packet. Returns `None` when
+    /// more data is required or the buffer is malformed (in which case it
+    /// resyncs to the next start code).
+    pub fn next_pes(&mut self) -> Option<PesPacket> {
+        loop {
+            match parse_one_pes(&self.buf) {
+                Ok(Some((pes, consumed))) => {
+                    self.buf.advance(consumed);
+                    return Some(pes);
+                }
+                Ok(None) => {
+                    // No complete PES yet. Drop leading bytes that already form
+                    // complete PS headers (pack/system/map), so a header-only
+                    // buffer does not grow without bound between PES packets.
+                    let mut pos = 0;
+                    while let Some(n) = leading_header_len(&self.buf[pos..]) {
+                        pos += n;
+                    }
+                    if pos > 0 {
+                        self.buf.advance(pos);
+                        continue;
+                    }
+                    return None;
+                }
+                Err(_) => {
+                    // Resync: drop bytes up to the next entity start code.
+                    match find_start_code(&self.buf, 0) {
+                        Some(sc) => self.buf.advance(sc.max(1)),
+                        None => {
+                            self.buf.clear();
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn pending(&self) -> usize {
+        self.buf.len()
+    }
+}
+
+impl Default for PsDemuxer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Finds the offset of the next start code that begins a new PS entity
+/// (pack header, system header, PSM or a PES packet) at or after `from`.
+///
+/// The scan is entity-aware: NAL start codes (e.g. `00 00 00 01 09` for
+/// H.264) inside a PES payload are skipped, since their 4th byte is below
+/// `0xB9`, while every PS entity start code has an id >= `0xB9`.
+fn find_start_code(data: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + 4 <= data.len() {
+        // 3-byte start code: 00 00 01 <id>
+        if data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01 {
+            if is_ps_entity(data[i + 3]) {
+                return Some(i);
+            }
+            i += 4;
+            continue;
+        }
+        // 4-byte start code: 00 00 00 01 <id>
+        if i + 5 <= data.len()
+            && data[i] == 0x00
+            && data[i + 1] == 0x00
+            && data[i + 2] == 0x00
+            && data[i + 3] == 0x01
+            && is_ps_entity(data[i + 4])
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether a start-code id identifies a PS entity rather than ES (NAL) data.
+fn is_ps_entity(id: u8) -> bool {
+    id >= 0xB9
+}
+
+/// Returns the byte length of a complete leading PS pack/system/map header,
+/// or `None` if `data` does not begin with one (or it is incomplete).
+fn leading_header_len(data: &[u8]) -> Option<usize> {
+    if data.len() < 4 || data[0] != 0x00 || data[1] != 0x00 || data[2] != 0x01 {
+        return None;
+    }
+    let n = match data[3] {
+        0xBA => {
+            if data.len() < 14 {
+                return None;
+            }
+            let stuff = (data[13] & 0x07) as usize;
+            if data.len() < 14 + stuff {
+                return None;
+            }
+            14 + stuff
+        }
+        0xBB | 0xBC => {
+            if data.len() < 6 {
+                return None;
+            }
+            let len = u16::from_be_bytes([data[4], data[5]]) as usize;
+            if data.len() < 6 + len {
+                return None;
+            }
+            6 + len
+        }
+        _ => return None,
+    };
+    Some(n)
 }
 
 /// Error from PS parsing.
@@ -77,17 +228,11 @@ pub fn parse_one_pes(data: &[u8]) -> Result<Option<(PesPacket, usize)>, PsError>
                         opt.map(|(pkt, consumed)| (pkt, pos + consumed))
                     });
                 }
-                // Unknown start code — skip past it
+                // Unknown start code — skip past it and resync to the next entity
                 pos += 4;
-                // Scan to next start code
-                while pos + 4 <= data.len() {
-                    if data[pos] == 0x00
-                        && data[pos + 1] == 0x00
-                        && data[pos + 2] == 0x01
-                    {
-                        break;
-                    }
-                    pos += 1;
+                match find_start_code(data, pos) {
+                    Some(sc) => pos = sc,
+                    None => return Ok(None),
                 }
             }
         }
@@ -104,7 +249,7 @@ fn parse_pes_packet(data: &[u8]) -> Result<Option<(PesPacket, usize)>, PsError> 
     let stream_id = data[3];
     let pes_packet_len = u16::from_be_bytes([data[4], data[5]]) as usize;
 
-    if data.len() < 6 + pes_packet_len {
+    if pes_packet_len != 0 && data.len() < 6 + pes_packet_len {
         return Ok(None);
     }
 
@@ -116,7 +261,7 @@ fn parse_pes_packet(data: &[u8]) -> Result<Option<(PesPacket, usize)>, PsError> 
     } else {
         0
     };
-    let pes_hdr_data_len = if pos < data.len() {
+    let pes_hdr_data_len = if pos + 1 < data.len() {
         data[pos + 1] as usize
     } else {
         0
@@ -125,9 +270,12 @@ fn parse_pes_packet(data: &[u8]) -> Result<Option<(PesPacket, usize)>, PsError> 
     // Skip flags + PES header data length byte
     pos += 2;
     let hdr_end = pos + pes_hdr_data_len;
+    if hdr_end > data.len() {
+        return Ok(None);
+    }
 
     let mut pts = None;
-    if pts_dts_flags >= 2 && pos + 5 <= data.len() && hdr_end <= data.len() {
+    if pts_dts_flags >= 2 && pos + 5 <= data.len() {
         // PTS present (33 bits)
         let b0 = data[pos] as u64;
         let b1 = data[pos + 1] as u64;
@@ -145,10 +293,23 @@ fn parse_pes_packet(data: &[u8]) -> Result<Option<(PesPacket, usize)>, PsError> 
 
     pos = hdr_end;
 
-    // PES payload follows
-    let payload_end = 6 + pes_packet_len;
-    if payload_end > data.len() {
-        return Ok(None);
+    // PES payload follows. When pes_packet_len == 0 (common for GB28181 video),
+    // the length is unspecified and the payload runs until the next start code.
+    let payload_end = if pes_packet_len == 0 {
+        match find_start_code(data, pos) {
+            Some(sc) if sc > pos => sc,
+            _ => return Ok(None), // no complete payload yet
+        }
+    } else {
+        let end = 6 + pes_packet_len;
+        if end > data.len() {
+            return Ok(None);
+        }
+        end
+    };
+
+    if pos >= payload_end {
+        return Ok(Some((PesPacket { stream_id, data: Bytes::new(), pts }, payload_end)));
     }
     let payload = Bytes::copy_from_slice(&data[pos..payload_end]);
 
@@ -250,7 +411,7 @@ mod tests {
         data.extend_from_slice(&[0x01, 0x02, 0x03, 0xF8]); // mux_rate(3) + stuffing_len=0
         // PES video
         let pes_payload = vec![0x00, 0x00, 0x00, 0x01, 0x09, 0x10, 0x20, 0x30];
-        let pes_len = pes_payload.len() + 3; // +3 for PTS_DTS flags + hdr_len + flags
+        let pes_len = 7 + pes_payload.len(); // flags(1) + hdr_len(1) + PTS(5) + payload
         data.push(0x00);
         data.push(0x00);
         data.push(0x01);
@@ -292,5 +453,134 @@ mod tests {
         ];
         let result = parse_one_pes(&data);
         assert!(matches!(result, Ok(None)));
+    }
+
+    fn build_pes(stream_id: u8, pes_packet_len: u16, payload: &[u8]) -> Vec<u8> {
+        let mut data = vec![0x00, 0x00, 0x01, stream_id];
+        data.extend_from_slice(&pes_packet_len.to_be_bytes());
+        data.push(0x80); // PTS only
+        data.push(0x05); // PES hdr data len = 5
+        data.extend_from_slice(&[0x21, 0x00, 0x01, 0x00, 0x01]); // PTS
+        data.extend_from_slice(payload);
+        data
+    }
+
+    const PACK_HEADER: [u8; 14] = [0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x02, 0x03, 0xF8];
+
+    #[test]
+    fn pes_packet_len_zero() {
+        // pes_packet_len == 0 is common for GB28181 video: the payload runs
+        // until the next start code.
+        let payload1 = vec![0x00, 0x00, 0x00, 0x01, 0x09, 0x11, 0x22];
+        let payload2 = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x99];
+        let mut data = build_pes(0xE0, 0, &payload1);
+        data.extend_from_slice(&build_pes(0xE0, 0, &payload2));
+        // Terminate the last unterminated PES with a pack header.
+        data.extend_from_slice(&PACK_HEADER);
+
+        let (pkt1, consumed) = parse_one_pes(&data).unwrap().unwrap();
+        assert_eq!(pkt1.stream_id, 0xE0);
+        assert_eq!(pkt1.data.as_ref(), payload1.as_slice());
+
+        let (pkt2, consumed2) = parse_one_pes(&data[consumed..]).unwrap().unwrap();
+        assert_eq!(pkt2.data.as_ref(), payload2.as_slice());
+        assert_eq!(consumed + consumed2, data.len() - PACK_HEADER.len());
+        assert!(pkt1.pts.is_some());
+    }
+
+    #[test]
+    fn pes_packet_len_zero_incomplete() {
+        // Only part of an unterminated PES: must return None (keep buffering)
+        // rather than emit a truncated payload.
+        let payload = vec![0x00, 0x00, 0x00, 0x01, 0x09, 0x11, 0x22];
+        let mut data = build_pes(0xE0, 0, &payload);
+        data.push(0x00);
+        data.push(0x00);
+        let result = parse_one_pes(&data);
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn ps_demuxer_incremental() {
+        // Feed the buffer byte-by-byte (simulating RTP chunks with no marker
+        // bit) and verify all PES packets are recovered in order.
+        let mut data = Vec::new();
+        data.extend_from_slice(&PACK_HEADER);
+        let payload = vec![0x00, 0x00, 0x00, 0x01, 0x09, 0x10, 0x20, 0x30, 0x40];
+        data.extend_from_slice(&build_pes(0xE0, (7 + payload.len()) as u16, &payload));
+
+        let mut demuxer = PsDemuxer::new();
+        let mut out = Vec::new();
+        for b in data {
+            demuxer.push(&[b]);
+            while let Some(pes) = demuxer.next_pes() {
+                out.push(pes);
+            }
+        }
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].stream_id, 0xE0);
+        assert_eq!(out[0].data.as_ref(), payload.as_slice());
+        assert_eq!(demuxer.pending(), 0);
+    }
+
+    #[test]
+    fn ps_demuxer_len_zero_terminated_by_pack() {
+        // A GB28181 camera may send video PES with length == 0; the payload
+        // is only complete once the next PS pack header arrives.
+        let payload = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x99, 0xAA];
+        let mut data = build_pes(0xE0, 0, &payload);
+        // Next pack header marks the PES end.
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x02, 0x03, 0xF8]);
+
+        let mut demuxer = PsDemuxer::new();
+        demuxer.push(&data[..10]);
+        assert!(demuxer.next_pes().is_none());
+        demuxer.push(&data[10..]);
+        let pes = demuxer.next_pes().unwrap();
+        assert_eq!(pes.data.as_ref(), payload.as_slice());
+        assert!(pes.pts.is_some());
+        // Drain again so complete trailing headers are consumed.
+        assert!(demuxer.next_pes().is_none());
+        assert_eq!(demuxer.pending(), 0);
+    }
+
+    #[test]
+    fn ps_demuxer_two_packets() {
+        let payload1 = vec![0x00, 0x00, 0x00, 0x01, 0x09, 0x11];
+        let payload2 = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x22];
+        let mut data = build_pes(0xE0, 0, &payload1);
+        data.extend_from_slice(&build_pes(0xE0, 0, &payload2));
+        data.extend_from_slice(&PACK_HEADER);
+
+        let mut demuxer = PsDemuxer::new();
+        demuxer.push(&data[..7]);
+        assert!(demuxer.next_pes().is_none());
+        demuxer.push(&data[7..]);
+        let mut out = Vec::new();
+        while let Some(pes) = demuxer.next_pes() {
+            out.push(pes);
+        }
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].data.as_ref(), payload1.as_slice());
+        assert_eq!(out[1].data.as_ref(), payload2.as_slice());
+    }
+
+    #[test]
+    fn ps_demuxer_resync() {
+        // Garbage prefix before valid PS data should be skipped.
+        let mut data = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x01, 0x09, 0xFF];
+        data.extend_from_slice(&PACK_HEADER);
+        let payload = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x01, 0x02];
+        data.extend_from_slice(&build_pes(0xE0, (7 + payload.len()) as u16, &payload));
+        data.extend_from_slice(&PACK_HEADER);
+
+        let mut demuxer = PsDemuxer::new();
+        demuxer.push(&data);
+        let mut out = Vec::new();
+        while let Some(pes) = demuxer.next_pes() {
+            out.push(pes);
+        }
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].data.as_ref(), payload.as_slice());
     }
 }

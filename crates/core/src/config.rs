@@ -1,4 +1,60 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{LazyLock, RwLock};
+
+/// Runtime server configuration store, addressable by dotted keys
+/// (`api.secret`, `rtmp.port`, ...) exactly like the original ZLMediaKit.
+/// Seeded from `ServerConfig::default()`; `setServerConfig` mutates it at
+/// runtime and `getServerConfig` reports its current snapshot.
+static RUNTIME_CONFIG: LazyLock<RwLock<HashMap<String, String>>> = LazyLock::new(|| {
+    let d = ServerConfig::default();
+    let mut m = HashMap::new();
+    m.insert("api.apiDebug".to_string(), "0".to_string());
+    m.insert("api.secret".to_string(), d.secret.clone());
+    m.insert("general.mediaServerId".to_string(), "zlmediakit-rs".to_string());
+    m.insert(
+        "general.flowThreshold".to_string(),
+        d.general.flow_threshold.to_string(),
+    );
+    m.insert(
+        "general.streamNoneReaderDelayMS".to_string(),
+        d.general.stream_none_reader_delay.to_string(),
+    );
+    m.insert("rtmp.port".to_string(), d.rtmp_port.to_string());
+    m.insert("rtsp.port".to_string(), d.rtsp_port.to_string());
+    m.insert("http.port".to_string(), d.http_port.to_string());
+    m.insert("api.port".to_string(), d.api_port.to_string());
+    m.insert("record.path".to_string(), d.record.path.clone());
+    m.insert("record.app".to_string(), d.record.app.clone());
+    m.insert("record.hls".to_string(), bool_to_str(d.record.hls));
+    m.insert("record.mp4".to_string(), bool_to_str(d.record.mp4));
+    m.insert("record.flv".to_string(), bool_to_str(d.record.flv));
+    m.insert("srt.port".to_string(), d.srt.port.to_string());
+    m.insert("gb28181.sip_port".to_string(), d.gb28181.sip_port.to_string());
+    m.insert(
+        "gb28181.media_port".to_string(),
+        d.gb28181.media_port.to_string(),
+    );
+    m.insert("webrtc.port".to_string(), d.webrtc_port.to_string());
+    RwLock::new(m)
+});
+
+fn bool_to_str(v: bool) -> String {
+    if v { "1".to_string() } else { "0".to_string() }
+}
+
+/// Snapshot of the current runtime config (dotted keys -> string values).
+pub fn runtime_config_snapshot() -> HashMap<String, String> {
+    RUNTIME_CONFIG.read().unwrap().clone()
+}
+
+/// Sets a runtime config key, returning `true` if the value changed.
+pub fn set_runtime_config(key: &str, value: &str) -> bool {
+    let mut g = RUNTIME_CONFIG.write().unwrap();
+    let changed = g.get(key).map(|v| v.as_str()) != Some(value);
+    g.insert(key.to_string(), value.to_string());
+    changed
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {

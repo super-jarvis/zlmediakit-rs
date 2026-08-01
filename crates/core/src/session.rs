@@ -8,6 +8,8 @@ pub type SessionId = String;
 pub struct SessionInfo {
     pub id: SessionId,
     pub peer_addr: String,
+    /// Local socket address (ip:port) this session is attached to.
+    pub local_addr: String,
     pub protocol: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Optional stream binding (vhost, app, stream) recorded when this
@@ -30,6 +32,15 @@ impl SessionManager {
     }
 
     pub fn create(&self, peer_addr: String, protocol: String) -> SessionId {
+        self.create_with_local(peer_addr, String::new(), protocol)
+    }
+
+    pub fn create_with_local(
+        &self,
+        peer_addr: String,
+        local_addr: String,
+        protocol: String,
+    ) -> SessionId {
         let id = format!(
             "{}-{}",
             protocol.to_uppercase(),
@@ -38,6 +49,7 @@ impl SessionManager {
         let info = SessionInfo {
             id: id.clone(),
             peer_addr: peer_addr.clone(),
+            local_addr,
             protocol,
             created_at: chrono::Utc::now(),
             stream: None,
@@ -95,6 +107,46 @@ impl SessionManager {
 
     pub fn get(&self, id: &SessionId) -> Option<SessionInfo> {
         self.sessions.get(id).map(|s| s.clone())
+    }
+
+    /// Kicks every session matching the given filters (all optional).
+    /// `peer_ip` and `local_port` filter on the respective socket parts;
+    /// `protocol` filters on the session type (e.g. `HTTP`).
+    /// Returns the number of sessions kicked.
+    pub fn kick_by_filter(
+        &self,
+        peer_ip: Option<&str>,
+        local_port: Option<u16>,
+        protocol: Option<&str>,
+    ) -> usize {
+        let ids: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter_map(|entry| {
+                let info = entry.value();
+                let peer_ip_ok = peer_ip.is_none_or(|ip| {
+                    info.peer_addr.split(':').next().unwrap_or("") == ip
+                });
+                let local_port_ok = local_port.is_none_or(|p| {
+                    info.local_addr
+                        .split(':')
+                        .next_back()
+                        .and_then(|s| s.parse::<u16>().ok())
+                        == Some(p)
+                });
+                let protocol_ok = protocol.is_none_or(|p| info.protocol == p);
+                if peer_ip_ok && local_port_ok && protocol_ok {
+                    Some(info.id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let n = ids.len();
+        for id in &ids {
+            self.remove(id);
+        }
+        n
     }
 
     /// Returns a snapshot of all live sessions.

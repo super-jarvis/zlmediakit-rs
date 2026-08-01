@@ -176,6 +176,11 @@ impl MediaSource {
         self.subscribers.read().await.len()
     }
 
+    /// Snapshot of the session ids currently playing this source.
+    pub async fn subscriber_ids(&self) -> Vec<SessionId> {
+        self.subscribers.read().await.keys().cloned().collect()
+    }
+
     /// Non-async variant of [`subscriber_count`], safe to call from a synchronous
     /// context (e.g. an event-bus handler) since the inner lock is an
     /// `RwLock` with a non-blocking read path.
@@ -306,6 +311,27 @@ impl MediaSourceManager {
 
     pub fn list(&self) -> Vec<Arc<MediaSource>> {
         self.sources.iter().map(|s| s.clone()).collect()
+    }
+
+    /// Returns streams whose fields match the given (optional) filters. An
+    /// `Option` filter is only applied when `Some`; empty/`__defaultVhost__`
+    /// special-casing mirrors the API defaulting.
+    pub fn list_filtered(
+        &self,
+        vhost: Option<&str>,
+        app: Option<&str>,
+        stream: Option<&str>,
+    ) -> Vec<Arc<MediaSource>> {
+        self.sources
+            .iter()
+            .map(|s| s.clone())
+            .filter(|s| {
+                let vh_ok = vhost.is_none_or(|v| s.vhost == v || v == "__defaultVhost__");
+                let app_ok = app.is_none_or(|a| s.app == a);
+                let st_ok = stream.is_none_or(|st| s.stream == st);
+                vh_ok && app_ok && st_ok
+            })
+            .collect()
     }
 
     pub fn count(&self) -> usize {

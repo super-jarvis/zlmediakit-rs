@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::{error, info};
-use zlmediakit_codec::ps::{extract_nalus_from_pes, parse_one_pes};
+use zlmediakit_codec::ps::{extract_nalus_from_pes, PesPacket, PsDemuxer};
 use zlmediakit_core::{media_frame::CodecId, MediaFrame, MediaSourceManager};
 
 /// Payload type carried inside the RTP packets.
@@ -151,7 +151,7 @@ impl RtpStreamReceiver {
         });
     }
 
-    async fn publish_video(&self, nalu: &[u8], rtp_ts: u32, video_codec: &mut CodecId) {
+    async fn publish_video(&self, nalu: &[u8], pts_ms: u64, video_codec: &mut CodecId) {
         if nalu.len() < 5 {
             return;
         }
@@ -164,8 +164,6 @@ impl RtpStreamReceiver {
             *video_codec = CodecId::H265;
         }
         let key = h264_type == 5 || (h265_type >= 19 && h265_type <= 21);
-        let clock = self.payload.clock_rate();
-        let pts_ms = (rtp_ts as u64) * 1000 / clock as u64;
         let frame = MediaFrame::new_video(
             0,
             *video_codec,
@@ -178,9 +176,7 @@ impl RtpStreamReceiver {
         self.publish(frame).await;
     }
 
-    async fn publish_audio(&self, data: Bytes, rtp_ts: u32) {
-        let clock = self.payload.clock_rate();
-        let pts_ms = (rtp_ts as u64) * 1000 / clock as u64;
+    async fn publish_audio(&self, data: Bytes, pts_ms: u64) {
         let frame = MediaFrame::new_audio(
             1,
             self.audio_codec,
@@ -190,6 +186,11 @@ impl RtpStreamReceiver {
             data,
         );
         self.publish(frame).await;
+    }
+
+    fn rtp_ts_to_ms(&self, rtp_ts: u32) -> u64 {
+        let clock = self.payload.clock_rate();
+        (rtp_ts as u64) * 1000 / clock as u64
     }
 
     async fn publish(&self, frame: MediaFrame) {
@@ -202,7 +203,7 @@ impl RtpStreamReceiver {
     async fn handle_rtp(
         &self,
         pkt: &[u8],
-        ps_buf: &mut BytesMut,
+        ps_demuxer: &mut PsDemuxer,
         fu_buf: &mut BytesMut,
         video_codec: &mut CodecId,
     ) {
@@ -252,10 +253,13 @@ impl RtpStreamReceiver {
 
         match self.payload {
             RtpPayloadType::Ps => {
-                ps_buf.extend_from_slice(payload);
-                if marker {
-                    self.process_ps(ps_buf, rtp_ts, video_codec).await;
-                    ps_buf.clear();
+                // GB28181 cameras frequently omit the RTP marker bit, so the
+                // PES payload is accumulated and parsed incrementally. Any
+                // PES packets that are split across RTP packets (length == 0
+                // video PES) are completed as soon as the next entity arrives.
+                ps_demuxer.push(payload);
+                while let Some(pes) = ps_demuxer.next_pes() {
+                    self.process_pes(&pes, rtp_ts, video_codec).await;
                 }
             }
             RtpPayloadType::Ts => {
@@ -267,10 +271,12 @@ impl RtpStreamReceiver {
                 self.handle_h26x(payload, rtp_ts, fu_buf, video_codec).await;
             }
             RtpPayloadType::Aac => {
-                self.publish_audio(Bytes::copy_from_slice(payload), rtp_ts).await;
+                self.publish_audio(Bytes::copy_from_slice(payload), self.rtp_ts_to_ms(rtp_ts))
+                    .await;
             }
             RtpPayloadType::G711A | RtpPayloadType::G711U => {
-                self.publish_audio(Bytes::copy_from_slice(payload), rtp_ts).await;
+                self.publish_audio(Bytes::copy_from_slice(payload), self.rtp_ts_to_ms(rtp_ts))
+                    .await;
             }
         }
     }
@@ -304,11 +310,13 @@ impl RtpStreamReceiver {
             fu_buf.extend_from_slice(&payload[2..]);
             if end {
                 let data = fu_buf.split().freeze();
-                self.publish_video(&data, rtp_ts, video_codec).await;
+                let pts_ms = self.rtp_ts_to_ms(rtp_ts);
+                self.publish_video(&data, pts_ms, video_codec).await;
             }
         } else if nal_type == 24 {
             // STAP-A aggregation.
             let mut p = 1;
+            let pts_ms = self.rtp_ts_to_ms(rtp_ts);
             while p + 2 <= payload.len() {
                 let len = u16::from_be_bytes([payload[p], payload[p + 1]]) as usize;
                 p += 2;
@@ -318,49 +326,41 @@ impl RtpStreamReceiver {
                 let mut nalu = Vec::with_capacity(len + 4);
                 nalu.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
                 nalu.extend_from_slice(&payload[p..p + len]);
-                self.publish_video(&nalu, rtp_ts, video_codec).await;
+                self.publish_video(&nalu, pts_ms, video_codec).await;
                 p += len;
             }
         } else {
             let mut nalu = Vec::with_capacity(payload.len() + 4);
             nalu.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
             nalu.extend_from_slice(payload);
-            self.publish_video(&nalu, rtp_ts, video_codec).await;
+            let pts_ms = self.rtp_ts_to_ms(rtp_ts);
+            self.publish_video(&nalu, pts_ms, video_codec).await;
         }
     }
 
-    async fn process_ps(&self, ps: &[u8], rtp_ts: u32, video_codec: &mut CodecId) {
-        let mut data = ps;
-        while !data.is_empty() {
-            match parse_one_pes(data) {
-                Ok(Some((pes, consumed))) => {
-                    if pes.stream_id == 0xE0 || (pes.stream_id & 0xF0) == 0xE0 {
-                        // Video ES.
-                        let pts = pes.pts.unwrap_or((rtp_ts as u64) * 1000 / 90);
-                        let _ = pts;
-                        for nalu in extract_nalus_from_pes(&pes.data) {
-                            self.publish_video(&nalu, rtp_ts, video_codec).await;
-                        }
-                    } else if pes.stream_id == 0xC0 || (pes.stream_id & 0xF0) == 0xC0 {
-                        // Audio ES.
-                        self.publish_audio(pes.data.clone(), rtp_ts).await;
-                    } else if pes.stream_id == 0xBD {
-                        // Private stream (often audio in PS).
-                        self.publish_audio(pes.data.clone(), rtp_ts).await;
-                    }
-                    if consumed == 0 {
-                        break;
-                    }
-                    data = &data[consumed..];
-                }
-                Ok(None) | Err(_) => break,
+    async fn process_pes(&self, pes: &PesPacket, rtp_ts: u32, video_codec: &mut CodecId) {
+        // Prefer the PES PTS (90kHz); fall back to the RTP timestamp.
+        let pts_ms = match pes.pts {
+            Some(pts) => pts * 1000 / 90_000,
+            None => self.rtp_ts_to_ms(rtp_ts),
+        };
+        if pes.stream_id == 0xE0 || (pes.stream_id & 0xF0) == 0xE0 {
+            // Video ES.
+            for nalu in extract_nalus_from_pes(&pes.data) {
+                self.publish_video(&nalu, pts_ms, video_codec).await;
             }
+        } else if pes.stream_id == 0xC0 || (pes.stream_id & 0xF0) == 0xC0 {
+            // Audio ES.
+            self.publish_audio(pes.data.clone(), pts_ms).await;
+        } else if pes.stream_id == 0xBD {
+            // Private stream (often audio in PS).
+            self.publish_audio(pes.data.clone(), pts_ms).await;
         }
     }
 
     async fn run(self: Arc<Self>) {
         let mut buf = vec![0u8; 2048];
-        let mut ps_buf = BytesMut::new();
+        let mut ps_demuxer = PsDemuxer::new();
         let mut fu_buf = BytesMut::new();
         let mut video_codec = CodecId::H264;
         loop {
@@ -373,7 +373,7 @@ impl RtpStreamReceiver {
                     self.stats.bytes.fetch_add(n as u64, Ordering::SeqCst);
                     self.stats.packets.fetch_add(1, Ordering::SeqCst);
                     self.mark_alive();
-                    self.handle_rtp(&buf[..n], &mut ps_buf, &mut fu_buf, &mut video_codec)
+                    self.handle_rtp(&buf[..n], &mut ps_demuxer, &mut fu_buf, &mut video_codec)
                         .await;
                 }
                 Ok(Err(e)) => {
@@ -573,5 +573,49 @@ mod tests {
         assert!(rtp.get_info(31010).is_some());
         rtp.close(31010);
         assert!(rtp.get_info(31010).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_rtp_ps_split_across_packets_no_marker() {
+        // GB28181 cameras may spread one PES across several RTP packets and
+        // omit the marker bit entirely. The incremental PsDemuxer must still
+        // recover the video frames.
+        let mgr = std::sync::Arc::new(MediaSourceManager::new(None));
+        let rtp = RtpServerManager::new(mgr.clone(), 32000);
+        let port = rtp
+            .open(32020, "__defaultVhost__", "rtp", "psu", RtpPayloadType::Ps, None)
+            .await
+            .unwrap();
+        let src = mgr.get_or_create("__defaultVhost__", "rtp", "psu");
+        let mut rx = src.subscribe();
+
+        // Build a PS stream: pack header + video PES (length == 0) + pack header
+        // terminator. The payload is an H.264 IDR NAL (Annex-B).
+        let mut ps = Vec::new();
+        ps.extend_from_slice(&[0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x02, 0x03, 0xF8]);
+        let nalu = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x01, 0x02, 0x03, 0x04];
+        // PES header: 00 00 01 E0, length 0, PTS-only flags, 5-byte PTS (9000
+        // ticks @90kHz = 100ms: 0x21 0x00 0x01 0x46 0x51).
+        ps.extend_from_slice(&[0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x05, 0x21, 0x00, 0x01, 0x46, 0x51]);
+        ps.extend_from_slice(&nalu);
+        ps.extend_from_slice(&[0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x02, 0x03, 0xF8]);
+
+        // Split into three RTP packets. Marker bit is ALWAYS 0.
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        for (i, chunk) in ps.chunks(ps.len() / 3 + 1).enumerate() {
+            let mut pkt = vec![0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78];
+            pkt.extend_from_slice(chunk);
+            sock.send_to(&pkt, ("127.0.0.1", port)).unwrap();
+            let _ = i;
+        }
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for frame")
+            .expect("no frame received");
+        assert_eq!(frame.codec, CodecId::H264);
+        assert!(frame.key_frame);
+        assert_eq!(frame.pts, 100, "PES PTS should be propagated");
+        rtp.close(port);
     }
 }

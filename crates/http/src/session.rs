@@ -115,7 +115,12 @@ impl HttpSession {
             }
         }
         let _guard = self.session_manager.as_ref().map(|m| {
-            let id = m.create(self.peer_addr.clone(), "HTTP".to_string());
+            let local_addr = self
+                .stream
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            let id = m.create_with_local(self.peer_addr.clone(), local_addr, "HTTP".to_string());
             SessionGuard {
                 mgr: self.session_manager.clone(),
                 id: Some(id),
@@ -1408,7 +1413,11 @@ impl HttpSession {
 
         match api {
             "getMediaList" => {
-                let sources = self.source_manager.list();
+                let q = Self::parse_query(path);
+                let fvhost = q.get("vhost").map(|s| s.as_str());
+                let fapp = q.get("app").map(|s| s.as_str());
+                let fstream = q.get("stream").map(|s| s.as_str());
+                let sources = self.source_manager.list_filtered(fvhost, fapp, fstream);
                 let mut list = Vec::new();
                 for source in &sources {
                     let reader = source.subscriber_count().await;
@@ -1416,6 +1425,10 @@ impl HttpSession {
                     let tracks: Vec<serde_json::Value> =
                         info.tracks.iter().map(Self::track_to_json).collect();
                     drop(info);
+                    let alive = chrono::Utc::now()
+                        .signed_duration_since(source.created_at)
+                        .num_seconds()
+                        .max(0);
                     list.push(serde_json::json!({
                         "app": source.app,
                         "stream": source.stream,
@@ -1424,10 +1437,12 @@ impl HttpSession {
                         "readerCount": reader,
                         "totalReaderCount": reader,
                         "createTime": source.created_at.timestamp_millis(),
+                        "createStamp": source.created_at.timestamp(),
+                        "aliveSecond": alive,
                         "tracks": tracks,
                     }));
                 }
-                self.send_json(&serde_json::json!({"code": 0, "result": list}))
+                self.send_json(&serde_json::json!({"code": 0, "result": list, "data": list}))
                     .await?;
             }
             "kick_session" => {
@@ -1523,11 +1538,346 @@ impl HttpSession {
                 }
             }
             "getServerConfig" => {
+                let cfg = zlmediakit_core::config::runtime_config_snapshot();
+                let mut entries: Vec<serde_json::Value> = Vec::new();
+                for (k, v) in cfg.iter() {
+                    entries.push(serde_json::json!({ "key": k, "value": v }));
+                }
                 self.send_json(&serde_json::json!({
                     "code": 0,
                     "server": "zlmediakit-rs",
                     "version": env!("CARGO_PKG_VERSION"),
                     "api_version": "1.0",
+                    "result": {
+                        "data": entries,
+                        "api": {
+                            "apiDebug": cfg.get("api.apiDebug").cloned().unwrap_or_default(),
+                            "secret": cfg.get("api.secret").cloned().unwrap_or_default(),
+                            "port": cfg.get("api.port").cloned().unwrap_or_default(),
+                        },
+                        "rtmp": { "port": cfg.get("rtmp.port").cloned().unwrap_or_default() },
+                        "rtsp": { "port": cfg.get("rtsp.port").cloned().unwrap_or_default() },
+                        "http": { "port": cfg.get("http.port").cloned().unwrap_or_default() },
+                        "record": {
+                            "path": cfg.get("record.path").cloned().unwrap_or_default(),
+                            "hls": cfg.get("record.hls").cloned().unwrap_or_default(),
+                            "mp4": cfg.get("record.mp4").cloned().unwrap_or_default(),
+                            "flv": cfg.get("record.flv").cloned().unwrap_or_default(),
+                        },
+                        "general": {
+                            "mediaServerId": cfg.get("general.mediaServerId").cloned().unwrap_or_default(),
+                            "flowThreshold": cfg.get("general.flowThreshold").cloned().unwrap_or_default(),
+                        },
+                    }
+                }))
+                .await?;
+            }
+            "setServerConfig" => {
+                let q = Self::parse_query(path);
+                let mut changed = 0usize;
+                for (k, v) in q {
+                    if k == "secret" || k.is_empty() {
+                        continue;
+                    }
+                    if zlmediakit_core::config::set_runtime_config(&k, &v) {
+                        changed += 1;
+                    }
+                }
+                self.send_json(&serde_json::json!({
+                    "code": 0,
+                    "changed": changed,
+                }))
+                .await?;
+            }
+            "version" => {
+                self.send_json(&serde_json::json!({
+                    "code": 0,
+                    "data": {
+                        "branchName": "master",
+                        "buildTime": "2024-01-01 00:00:00",
+                        "commitHash": env!("CARGO_PKG_VERSION"),
+                    }
+                }))
+                .await?;
+            }
+            "getApiList" => {
+                const APIS: &[&str] = &[
+                    "getApiList",
+                    "getThreadsLoad",
+                    "getWorkThreadsLoad",
+                    "getServerConfig",
+                    "setServerConfig",
+                    "getAllSession",
+                    "kick_sessions",
+                    "getMediaList",
+                    "getMediaInfo",
+                    "getMediaPlayerList",
+                    "getStatistic",
+                    "isMediaOnline",
+                    "close_streams",
+                    "closeStream",
+                    "kick_session",
+                    "getSnap",
+                    "getMp4RecordFile",
+                    "getRecordStatus",
+                    "startRecord",
+                    "stopRecord",
+                    "isRecording",
+                    "addStreamPusher",
+                    "delStreamPusher",
+                    "getStreamPusherList",
+                    "addStreamProxy",
+                    "delStreamProxy",
+                    "getStreamProxyList",
+                    "addFFmpegSource",
+                    "delFFmpegSource",
+                    "getFFmpegSourceList",
+                    "openRtpServer",
+                    "closeRtpServer",
+                    "listRtpServer",
+                    "getRtpInfo",
+                    "startRtp",
+                    "stopRtp",
+                    "queryCatalog",
+                    "queryDeviceInfo",
+                    "getDeviceList",
+                    "getDeviceInfo",
+                    "getSipInfo",
+                    "stopSip",
+                    "addTranscode",
+                    "delTranscode",
+                    "getTranscode",
+                    "getTranscodeList",
+                ];
+                let data: Vec<String> = APIS.iter().map(|a| format!("/index/api/{}", a)).collect();
+                self.send_json(&serde_json::json!({ "code": 0, "data": data }))
+                    .await?;
+            }
+            "getThreadsLoad" | "getWorkThreadsLoad" => {
+                let threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1);
+                let data: Vec<serde_json::Value> = (0..threads)
+                    .map(|i| {
+                        serde_json::json!({
+                            "delay": 0,
+                            "load": 0,
+                            "thread_id": i,
+                        })
+                    })
+                    .collect();
+                self.send_json(&serde_json::json!({ "code": 0, "data": data }))
+                    .await?;
+            }
+            "getAllSession" => {
+                let mgr = match &self.session_manager {
+                    Some(m) => m,
+                    None => {
+                        self.send_json(&serde_json::json!({
+                            "code": -400,
+                            "msg": "session manager not available"
+                        }))
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                let q = Self::parse_query(path);
+                let local_port: Option<u16> = q.get("local_port").and_then(|v| v.parse().ok());
+                let peer_ip = q.get("peer_ip").map(|s| s.as_str());
+                let data: Vec<serde_json::Value> = mgr
+                    .list()
+                    .iter()
+                    .filter(|info| {
+                        let ip_ok = peer_ip.is_none_or(|ip| {
+                            info.peer_addr.split(':').next().unwrap_or("") == ip
+                        });
+                        let port_ok = local_port.is_none_or(|p| {
+                            info.local_addr
+                                .split(':')
+                                .next_back()
+                                .and_then(|s| s.parse::<u16>().ok())
+                                == Some(p)
+                        });
+                        ip_ok && port_ok
+                    })
+                    .map(|info| {
+                        let (peer_ip, peer_port) = split_addr(&info.peer_addr);
+                        let (local_ip, lport) = split_addr(&info.local_addr);
+                        serde_json::json!({
+                            "id": info.id,
+                            "peer_ip": peer_ip,
+                            "peer_port": peer_port,
+                            "local_ip": local_ip,
+                            "local_port": lport,
+                            "typeid": info.protocol,
+                            "created_at": info.created_at.timestamp(),
+                            "stream": info.stream.as_ref().map(|(v, a, s)| format!("{}/{}/{}", v, a, s)),
+                        })
+                    })
+                    .collect();
+                self.send_json(&serde_json::json!({ "code": 0, "data": data }))
+                    .await?;
+            }
+            "kick_sessions" => {
+                let mgr = match &self.session_manager {
+                    Some(m) => m,
+                    None => {
+                        self.send_json(&serde_json::json!({
+                            "code": -400,
+                            "msg": "session manager not available"
+                        }))
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                let q = Self::parse_query(path);
+                let peer_ip = q.get("peer_ip").map(|s| s.as_str());
+                let local_port: Option<u16> = q.get("local_port").and_then(|v| v.parse().ok());
+                let protocol = q.get("typeid").map(|s| s.as_str());
+                let count = mgr.kick_by_filter(peer_ip, local_port, protocol);
+                self.send_json(&serde_json::json!({
+                    "code": 0,
+                    "count_hit": count,
+                    "msg": format!("kicked {} session(s)", count)
+                }))
+                .await?;
+            }
+            "isMediaOnline" => {
+                let (vhost, app, stream) = Self::api_stream_params(path);
+                if stream.is_empty() {
+                    self.send_json(&serde_json::json!({
+                        "code": -400,
+                        "msg": "missing stream param"
+                    }))
+                    .await?;
+                    return Ok(());
+                }
+                let online = self.source_manager.get(&vhost, &app, &stream).is_some();
+                self.send_json(&serde_json::json!({ "code": 0, "online": online }))
+                    .await?;
+            }
+            "close_streams" => {
+                let q = Self::parse_query(path);
+                let vhost = q.get("vhost").map(|s| s.as_str());
+                let app = q.get("app").map(|s| s.as_str());
+                let stream = q.get("stream").map(|s| s.as_str());
+                let mut count = 0usize;
+                let ids: Vec<(String, String, String)> = self
+                    .source_manager
+                    .list_filtered(vhost, app, stream)
+                    .iter()
+                    .map(|s| (s.vhost.clone(), s.app.clone(), s.stream.clone()))
+                    .collect();
+                for (v, a, s) in ids {
+                    if self.source_manager.close_stream(&v, &a, &s) {
+                        count += 1;
+                    }
+                }
+                self.send_json(&serde_json::json!({
+                    "code": 0,
+                    "count_closed": count,
+                    "msg": format!("closed {} stream(s)", count)
+                }))
+                .await?;
+            }
+            "getMediaPlayerList" => {
+                let (vhost, app, stream) = Self::api_stream_params(path);
+                if stream.is_empty() {
+                    self.send_json(&serde_json::json!({
+                        "code": -400,
+                        "msg": "missing stream param"
+                    }))
+                    .await?;
+                    return Ok(());
+                }
+                match self.source_manager.get(&vhost, &app, &stream) {
+                    Some(source) => {
+                        let players: Vec<String> = source.subscriber_ids().await;
+                        let mut data = Vec::new();
+                        if let Some(mgr) = &self.session_manager {
+                            for id in &players {
+                                if let Some(info) = mgr.get(id) {
+                                    let (peer_ip, peer_port) = split_addr(&info.peer_addr);
+                                    let (_, local_port) = split_addr(&info.local_addr);
+                                    data.push(serde_json::json!({
+                                        "playerId": info.id,
+                                        "peer_ip": peer_ip,
+                                        "peer_port": peer_port,
+                                        "local_port": local_port,
+                                        "protocol": info.protocol,
+                                        "aliveSecond": chrono::Utc::now()
+                                            .signed_duration_since(info.created_at)
+                                            .num_seconds()
+                                            .max(0),
+                                    }));
+                                } else {
+                                    data.push(serde_json::json!({
+                                        "playerId": id,
+                                    }));
+                                }
+                            }
+                        } else {
+                            for id in &players {
+                                data.push(serde_json::json!({ "playerId": id }));
+                            }
+                        }
+                        self.send_json(&serde_json::json!({
+                            "code": 0,
+                            "data": data
+                        }))
+                        .await?;
+                    }
+                    None => {
+                        self.send_json(
+                            &serde_json::json!({"code": -404, "msg": "stream not found"}),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            "getRecordStatus" => {
+                let (vhost, app, stream) = Self::api_stream_params(path);
+                if stream.is_empty() {
+                    self.send_json(
+                        &serde_json::json!({"code": -400, "msg": "missing stream param"}),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let state = self
+                    .recorder
+                    .is_recording(&vhost, &app, &stream)
+                    .unwrap_or((false, false, false));
+                self.send_json(&serde_json::json!({
+                    "code": 0,
+                    "status": state.0 || state.1 || state.2,
+                    "recording": {
+                        "hls": state.0,
+                        "flv": state.1,
+                        "mp4": state.2,
+                    }
+                }))
+                .await?;
+            }
+            "getMp4RecordFile" => {
+                let (vhost, app, stream) = Self::api_stream_params(path);
+                let q = Self::parse_query(path);
+                let period = q.get("period").cloned().unwrap_or_default();
+                if stream.is_empty() {
+                    self.send_json(
+                        &serde_json::json!({"code": -400, "msg": "missing stream param"}),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let base = self
+                    .record_root
+                    .join(&app)
+                    .join(&stream);
+                let files = list_record_files(&base, &period, &vhost, &app, &stream);
+                self.send_json(&serde_json::json!({
+                    "code": 0,
+                    "data": files
                 }))
                 .await?;
             }
@@ -2155,6 +2505,9 @@ impl HttpSession {
                         if let Some(info) = rtp.find_by_stream(&app, stream) {
                             rtp.close(info.port);
                         }
+                        if let Some(sip) = &self.sip {
+                            let _ = sip.bye_stream(stream);
+                        }
                     }
                     let _ = self
                         .send_json(&serde_json::json!({"code": 0, "result": "ok"}))
@@ -2162,6 +2515,108 @@ impl HttpSession {
                 } else {
                     let _ = self
                         .send_json(&serde_json::json!({"code": -1, "msg": "rtp server disabled"}))
+                        .await;
+                }
+            }
+            "queryCatalog" => {
+                if let Some(sip) = &self.sip {
+                    let q = Self::parse_query(path);
+                    let device_id = q.get("device_id").cloned().unwrap_or_default();
+                    match sip.query_catalog(&device_id).await {
+                        Ok(channels) => {
+                            let _ = self
+                                .send_json(&serde_json::json!({"code": 0, "result": channels}))
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = self
+                                .send_json(&serde_json::json!({"code": -1, "msg": e.to_string()}))
+                                .await;
+                        }
+                    }
+                } else {
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": -1, "msg": "gb28181 disabled"}))
+                        .await;
+                }
+            }
+            "queryDeviceInfo" => {
+                if let Some(sip) = &self.sip {
+                    let q = Self::parse_query(path);
+                    let device_id = q.get("device_id").cloned().unwrap_or_default();
+                    match sip.query_device_info(&device_id).await {
+                        Ok(info) => {
+                            let _ = self
+                                .send_json(&serde_json::json!({"code": 0, "result": info}))
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = self
+                                .send_json(&serde_json::json!({"code": -1, "msg": e.to_string()}))
+                                .await;
+                        }
+                    }
+                } else {
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": -1, "msg": "gb28181 disabled"}))
+                        .await;
+                }
+            }
+            "getDeviceList" => {
+                if let Some(sip) = &self.sip {
+                    let q = Self::parse_query(path);
+                    let list = match q.get("device_id") {
+                        Some(id) => {
+                            let mut out = Vec::new();
+                            if let Some(dev) = sip.get_device(id) {
+                                out.push(dev);
+                            }
+                            out
+                        }
+                        None => sip.list_devices(),
+                    };
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": 0, "data": list}))
+                        .await;
+                } else {
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": -1, "msg": "gb28181 disabled"}))
+                        .await;
+                }
+            }
+            "getDeviceInfo" => {
+                if let Some(sip) = &self.sip {
+                    let q = Self::parse_query(path);
+                    let device_id = q.get("device_id").cloned().unwrap_or_default();
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": 0, "result": sip.get_device(&device_id)}))
+                        .await;
+                } else {
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": -1, "msg": "gb28181 disabled"}))
+                        .await;
+                }
+            }
+            "getSipInfo" => {
+                if let Some(sip) = &self.sip {
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": 0, "result": sip.info()}))
+                        .await;
+                } else {
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": -1, "msg": "gb28181 disabled"}))
+                        .await;
+                }
+            }
+            "stopSip" => {
+                if let Some(sip) = &self.sip {
+                    sip.stop();
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": 0, "result": "sip stopped"}))
+                        .await;
+                } else {
+                    let _ = self
+                        .send_json(&serde_json::json!({"code": -1, "msg": "gb28181 disabled"}))
                         .await;
                 }
             }
@@ -2771,4 +3226,101 @@ fn h264_to_annexb(data: &[u8]) -> Vec<u8> {
         i += nalu_len;
     }
     out
+}
+
+/// Splits an `ip:port` (or `[ipv6]:port`) socket address string into its parts.
+/// Returns `("", 0)` for unparseable input.
+fn split_addr(addr: &str) -> (String, u16) {
+    if addr.is_empty() {
+        return (String::new(), 0);
+    }
+    if let Some(rest) = addr.strip_prefix('[') {
+        // [ipv6]:port
+        if let Some((ip, port)) = rest.split_once("]:") {
+            return (format!("[{}]", ip), port.parse().unwrap_or(0));
+        }
+        return (addr.to_string(), 0);
+    }
+    match addr.rsplit_once(':') {
+        Some((ip, port)) => (ip.to_string(), port.parse().unwrap_or(0)),
+        None => (addr.to_string(), 0),
+    }
+}
+
+/// Lists MP4 record files under `base` (record_root/app/stream), optionally
+/// filtered by `period` (a date prefix like `20240101` or `2024-01-01`).
+fn list_record_files(
+    base: &Path,
+    period: &str,
+    vhost: &str,
+    app: &str,
+    stream: &str,
+) -> Vec<serde_json::Value> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return files;
+    };
+    let period = period.replace('-', "");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "mp4").unwrap_or(false) {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if !period.is_empty() && !name.starts_with(&period) {
+                continue;
+            }
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let start_time = parse_record_start(&name);
+            files.push(serde_json::json!({
+                "app": app,
+                "stream": stream,
+                "vhost": vhost,
+                "file_name": name,
+                "file_path": path.to_string_lossy(),
+                "file_size": size,
+                "startTime": start_time,
+                "time_len": 0,
+                "url": format!("/record/{}/{}/{}", app, stream, name),
+            }));
+        }
+    }
+    files
+}
+
+/// Parses a `YYYYMMDD_HHMMSS.mp4` record file name into a unix timestamp
+/// (milliseconds). Returns 0 when it cannot be parsed.
+fn parse_record_start(name: &str) -> i64 {
+    let stem = name.trim_end_matches(".mp4");
+    let (date, time) = stem.split_once('_').unwrap_or((stem, ""));
+    let ds = date
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect::<String>();
+    let ts = time
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect::<String>();
+    if ds.len() < 8 || (ts.len() < 4 && !ts.is_empty()) {
+        return 0;
+    }
+    let y: i32 = ds[0..4].parse().unwrap_or(0);
+    let mo: u32 = ds[4..6].parse().unwrap_or(1);
+    let d: u32 = ds[6..8].parse().unwrap_or(1);
+    let (h, mi, s): (u32, u32, u32) = if ts.is_empty() {
+        (0, 0, 0)
+    } else {
+        (
+            ts[0..2].parse().unwrap_or(0),
+            ts[2..4].parse().unwrap_or(0),
+            if ts.len() >= 6 { ts[4..6].parse().unwrap_or(0) } else { 0 },
+        )
+    };
+    use chrono::TimeZone;
+    chrono::Utc
+        .with_ymd_and_hms(y, mo, d, h, mi, s)
+        .single()
+        .map(|t| t.timestamp_millis())
+        .unwrap_or(0)
 }

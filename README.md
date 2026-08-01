@@ -220,11 +220,33 @@ ffplay http://localhost:8080/live/stream.mpd
 
 | 端点 | 说明 |
 |------|------|
-| `getMediaList` | 列出所有活跃流 |
+| `getMediaList` | 列出所有活跃流（支持 `vhost`/`app`/`stream` 过滤） |
 | `getMediaInfo` | 查询指定流信息 |
-| `getServerConfig` | 获取服务器配置 |
+| `getMediaPlayerList` | 列出指定流的播放者 |
+| `isMediaOnline` | 查询流是否在线（`?stream=`） |
+| `getServerConfig` | 获取服务器运行时配置 |
+| `setServerConfig` | 修改运行时配置（如 `?general.flowThreshold=2048`） |
 | `getStatistic` | 获取服务器统计 |
 | `closeStream` | 关闭指定流 |
+| `close_streams` | 按 `vhost`/`app`/`stream` 批量关闭流 |
+| `getMp4RecordFile` | 列出已录制的 MP4 文件（`?stream=&period=YYYYMMDD`） |
+
+### 会话管理
+
+| 端点 | 说明 |
+|------|------|
+| `getAllSession` | 列出所有会话（支持 `peer_ip`/`local_port` 过滤） |
+| `kick_session` | 按 id 或 vhost/app/stream 踢掉单个会话 |
+| `kick_sessions` | 按 `peer_ip`/`local_port`/`typeid` 批量踢掉会话 |
+
+### 系统信息
+
+| 端点 | 说明 |
+|------|------|
+| `getApiList` | 列出所有可用 API 路径 |
+| `version` | 版本信息 |
+| `getThreadsLoad` | 线程负载 |
+| `getWorkThreadsLoad` | 工作线程负载 |
 
 ### 录制控制
 
@@ -233,6 +255,7 @@ ffplay http://localhost:8080/live/stream.mpd
 | `startRecord` | 开始录制（`?type=hls/flv/mp4/all`） |
 | `stopRecord` | 停止录制 |
 | `isRecording` | 查询录制状态 |
+| `getRecordStatus` | 查询录制状态（`?stream=`） |
 
 ### 拉流代理
 
@@ -257,6 +280,23 @@ ffplay http://localhost:8080/live/stream.mpd
 | `addFFmpegSource` | 通过 ffmpeg 拉取任意格式的流 |
 | `delFFmpegSource` | 停止 ffmpeg 拉流 |
 | `getFFmpegSourceList` | 列出 ffmpeg 源 |
+
+### RTP / GB28181
+
+| 端点 | 说明 |
+|------|------|
+| `openRtpServer` | 开启 RTP 收流端口 |
+| `closeRtpServer` | 关闭 RTP 收流端口 |
+| `listRtpServer` | 列出 RTP 收流端口 |
+| `getRtpInfo` | 查询 RTP 收流信息 |
+| `startRtp` | 邀请 GB28181 设备推流（`?device_id=&channel_id=`） |
+| `stopRtp` | 停止 GB28181 推流（同时向设备发送 SIP BYE） |
+| `getDeviceList` | 列出已注册的 GB28181 设备（在线状态、地址、通道、静态信息），支持 `?device_id=` 过滤 |
+| `getDeviceInfo` | 查询单个设备快照（`?device_id=`） |
+| `queryCatalog` | 向设备发起 Catalog 查询并返回通道列表（`?device_id=`） |
+| `queryDeviceInfo` | 向设备发起 DeviceInfo 查询（`?device_id=`） |
+| `getSipInfo` | 查询 SIP 服务器信息（端口、realm、设备数、活跃流数） |
+| `stopSip` | 停止 SIP 服务器（清空设备、关闭流、退出接收循环） |
 
 ---
 
