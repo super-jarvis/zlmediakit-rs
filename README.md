@@ -15,15 +15,17 @@
 | 协议 | 推流 | 拉流 | 说明 |
 |------|:----:|:----:|------|
 | **RTMP(S)** | ✅ | ✅ | RTMP/RTMPS 推拉流 |
-| **RTSP** | ✅ | ✅ | TCP interleaved + UDP，RTSPS |
+| **RTSP** | ✅ | ✅ | TCP interleaved + UDP；RTSPS 公共 CA 校验；RECORD 推流支持 Digest |
 | **HTTP-FLV** | - | ✅ | HTTP 传输 FLV |
 | **WebSocket-FLV** | - | ✅ | WebSocket 传输 FLV |
 | **HLS (TS)** | - | ✅ | MPEG-TS 分片 + m3u8 |
 | **HLS CMAF** | - | ✅ | fMP4 分片 + EXT-X-MAP，与 DASH 共享段 |
 | **DASH** | - | ✅ | fMP4/CMAF 分片 + MPD 清单 |
 | **WebRTC** | WHIP | WHEP | H.264 + Opus，可选 AAC→Opus 转码 |
-| **SRT** | ✅ | - | libsrt 接收，自动发布到 MediaSource |
-| **GB28181** | ✅ | - | RTP/PS 推流接收，PS 解复用提取 H.264/H.265 |
+| **SRT** | ✅ | ✅ | Listener/Caller/Rendezvous，MPEG-TS 输入输出，可选延迟、streamid 与 AES passphrase |
+| **GB28181** | ✅ | ✅（对讲） | UDP/TCP active/passive RTP 接收；自动识别 PS/TS/ES，支持乱序恢复及 H.264/H.265/AAC/G.711/MP2/MP3；SIP 点播与 G.711A/U 语音对讲 |
+| **RTP ES/PS/TS 转推** | ✅ | - | `startSendRtp`/`startSendRtpPassive`/`stopSendRtp`/`listRtpSender`；UDP、TCP active/passive 与断线重连；`type=0/1/2`，默认 GB28181 PS-RTP |
+| **原生 HTTP 拉流** | ✅ | ✅ | HTTP/HTTPS-FLV、HTTP/HTTPS-TS、HLS MPEG-TS/CMAF；支持跳转、chunked、主/媒体清单和系统 CA 校验，接入统一拉流代理与协议互转 |
 | **VOD 点播** | - | ✅ | 录制文件回放，HTTP Range 支持，35 种 MIME 类型 |
 
 ### 编解码与协议互转边界
@@ -38,8 +40,8 @@
 | HLS MPEG-TS | H.264、H.265；AAC | 视频统一转 Annex-B，AAC 统一转 ADTS |
 | HLS CMAF / DASH / MP4 / fMP4 | H.264、H.265；AAC | 视频写长度前缀样本，AAC 写 raw access unit；CMAF/DASH 共享 fMP4 段 |
 | WebRTC WHIP/WHEP | H.264、Opus | WHEP 可通过 `aac-transcode` feature 把 AAC 转为 Opus；不声明 H.265 WebRTC 支持 |
-| SRT MPEG-TS 输入 | H.264、H.265；AAC/ADTS | 从 PAT/PMT、PES 读取轨道及 PTS/DTS 后发布 |
-| GB28181 输入 | PS 中的 H.264/H.265；裸 RTP G.711A/U | RTP/PS 跨包累积后发布，不把未知编码伪装为 H.264/AAC |
+| SRT MPEG-TS 输入/输出 | H.264、H.265；AAC/ADTS | Listener/Caller/Rendezvous；从 PAT/PMT、PES 读取轨道及 PTS/DTS，输出按 7 个 TS packet 分组发送 |
+| GB28181 输入 | PS：H.264/H.265/AAC/G.711/MP2/MP3；TS：H.264/H.265/AAC；ES：H.264/H.265/AAC/G.711 | RTP 跨包重排/去重；自动识别 PS/TS/ES，PSM 决定轨道编码，AAC 支持 ADTS/RFC3640 |
 
 转码能力目前限定为显式配置的 H.264 ↔ H.265，以及可选的 AAC → Opus。其他组合如果目标协议不能承载，会拒绝或不发布该轨道，不会原样写入伪合法容器。仓库中的 `protocol_conversion_matrix` 测试会由 ffmpeg 生成真实 H.264/AAC FLV，再验证 FLV、MPEG-TS、MP4、fMP4 输出可被 ffprobe 识别并由 ffmpeg 完整解码。
 
@@ -66,8 +68,8 @@
 
 | 功能 | 说明 |
 |------|------|
-| 拉流代理 | RTMP/RTSP 远程拉流，自动发布到本地 |
-| **推流中继** | 本地流自动推送至远程 RTMP 服务器 |
+| 拉流代理 | RTMP(S)、RTSP(S)、SRT Caller/Rendezvous、HTTP(S)-FLV、HTTP(S)-TS、HLS TS/CMAF 远程拉流，自动发布到本地 |
+| **推流中继** | 本地流自动推送至远程 RTMP(S)、RTSP(S) 或 SRT Caller/Rendezvous 端点 |
 | FFmpeg 拉流源 | 通过 API 添加任意格式的 ffmpeg 拉流源 |
 
 ### 鉴权
@@ -79,7 +81,7 @@
 
 ### 其他
 
-- **REST API**：流管理、录制控制、代理管理、推流管理、ffmpeg 源管理
+- **REST API**：流管理、录制控制、代理管理、推流管理、RTP ES/PS/TS 转推、ffmpeg 源管理
 - **Web 管理面板**：内置监控仪表盘
 - **静态文件服务**：www_root 提供 HTML/CSS/JS 等静态文件
 - **TOML 配置**：丰富的配置项，支持命令行覆盖
@@ -158,7 +160,17 @@ ffplay http://localhost:8080/live/stream.mpd
 
 ### 管理面板
 
-浏览器访问 `http://localhost:8080/` 查看内置监控仪表盘。
+浏览器访问 `http://localhost:8080/` 打开管理后台，使用配置文件顶层的
+`secret` 登录。管理 API 默认接受 `X-API-Secret` 请求头，也兼容
+`Authorization: Bearer <secret>` 和 ZLMediaKit 风格的 `?secret=` 查询参数；
+配置为空时可显式关闭管理鉴权。`getServerConfig` 只返回 secret 是否已配置，
+不会回显明文。
+
+后台已接入流与播放者详情、截图、连接会话、拉流代理、推流转发、FFmpeg
+源、HLS/FLV/MP4 录制与归档、GB28181 设备/目录/点播、RTP 服务、实时转码、
+运行时配置、线程负载和协议地址。浏览器播放器支持 HLS、HTTP/WS-FLV 和
+WebRTC WHEP；SRT 提供推流地址与运行状态。登录 secret 仅保存在当前标签页的
+`sessionStorage` 中，退出登录会立即清除。
 
 ---
 
@@ -233,6 +245,15 @@ ffplay http://localhost:8080/live/stream.mpd
 
 所有 API 端点位于 `/index/api/`：
 
+```bash
+# 推荐：请求头传递 secret，避免写入 URL 和常规访问日志
+curl -H 'X-API-Secret: <配置文件中的 secret>' \
+  http://localhost:8080/index/api/getMediaList
+
+# 兼容 ZLMediaKit 调用方式
+curl 'http://localhost:8080/index/api/getMediaList?secret=<secret>'
+```
+
 ### 流管理
 
 | 端点 | 说明 |
@@ -278,7 +299,7 @@ ffplay http://localhost:8080/live/stream.mpd
 
 | 端点 | 说明 |
 |------|------|
-| `addStreamProxy` | 添加远程拉流代理 |
+| `addStreamProxy` | 添加远程拉流代理；原生支持 RTMP(S)、RTSP(S)、SRT Caller/Rendezvous、HTTP(S)-FLV、HTTP(S)-TS 和 HLS TS/CMAF |
 | `delStreamProxy` | 删除拉流代理 |
 | `getStreamProxyList` | 列出拉流代理 |
 
@@ -286,7 +307,7 @@ ffplay http://localhost:8080/live/stream.mpd
 
 | 端点 | 说明 |
 |------|------|
-| `addStreamPusher` | 将本地流推送至远程 RTMP 服务器 |
+| `addStreamPusher` | 将本地流推送至远程 RTMP(S)、RTSP(S) 或 SRT 端点；RTSP 使用 ANNOUNCE/SETUP/RECORD、Digest 与 TCP interleaved RTP，SRT 使用 MPEG-TS Caller/Rendezvous |
 | `delStreamPusher` | 停止推流 |
 | `getStreamPusherList` | 列出推流任务 |
 
@@ -302,12 +323,16 @@ ffplay http://localhost:8080/live/stream.mpd
 
 | 端点 | 说明 |
 |------|------|
-| `openRtpServer` | 开启 RTP 收流端口 |
+| `openRtpServer` | 开启 RTP 收流端口；`tcp_mode=0/1/2` 表示 UDP/TCP passive/TCP active，默认自动识别 PS/TS/ES |
+| `connectRtpServer` | 为 `tcp_mode=2` 的收流端口设置主动连接目标（`stream_id`、`dst_url`、`dst_port`） |
 | `closeRtpServer` | 关闭 RTP 收流端口 |
 | `listRtpServer` | 列出 RTP 收流端口 |
 | `getRtpInfo` | 查询 RTP 收流信息 |
 | `startRtp` | 邀请 GB28181 设备推流（`?device_id=&channel_id=`） |
 | `stopRtp` | 停止 GB28181 推流（同时向设备发送 SIP BYE） |
+| `startTalk` | 发起 GB28181 语音对讲；指定设备/通道和本机已发布的 G.711A/U 音源（`device_id`、`channel_id`、`vhost`、`app`、`stream`） |
+| `stopTalk` | 停止指定通道的语音对讲并发送 SIP BYE（`?channel_id=`） |
+| `getTalkList` | 查询活动对讲及音源、编码、SSRC、本地 RTP 端口 |
 | `getDeviceList` | 列出已注册的 GB28181 设备（在线状态、地址、通道、静态信息），支持 `?device_id=` 过滤 |
 | `getDeviceInfo` | 查询单个设备快照（`?device_id=`） |
 | `queryCatalog` | 向设备发起 Catalog 查询并返回通道列表（`?device_id=`） |

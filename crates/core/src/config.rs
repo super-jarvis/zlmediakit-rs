@@ -6,8 +6,10 @@ use std::sync::{LazyLock, RwLock};
 /// (`api.secret`, `rtmp.port`, ...) exactly like the original ZLMediaKit.
 /// Seeded from `ServerConfig::default()`; `setServerConfig` mutates it at
 /// runtime and `getServerConfig` reports its current snapshot.
-static RUNTIME_CONFIG: LazyLock<RwLock<HashMap<String, String>>> = LazyLock::new(|| {
-    let d = ServerConfig::default();
+static RUNTIME_CONFIG: LazyLock<RwLock<HashMap<String, String>>> =
+    LazyLock::new(|| RwLock::new(runtime_config_values(&ServerConfig::default())));
+
+fn runtime_config_values(d: &ServerConfig) -> HashMap<String, String> {
     let mut m = HashMap::new();
     m.insert("api.apiDebug".to_string(), "0".to_string());
     m.insert("api.secret".to_string(), d.secret.clone());
@@ -24,8 +26,11 @@ static RUNTIME_CONFIG: LazyLock<RwLock<HashMap<String, String>>> = LazyLock::new
         d.general.stream_none_reader_delay.to_string(),
     );
     m.insert("rtmp.port".to_string(), d.rtmp_port.to_string());
+    m.insert("rtmp.enabled".to_string(), bool_to_str(d.rtmp.enabled));
     m.insert("rtsp.port".to_string(), d.rtsp_port.to_string());
+    m.insert("rtsp.enabled".to_string(), bool_to_str(d.rtsp.enabled));
     m.insert("http.port".to_string(), d.http_port.to_string());
+    m.insert("http.enabled".to_string(), bool_to_str(d.http.enabled));
     m.insert("api.port".to_string(), d.api_port.to_string());
     m.insert("record.path".to_string(), d.record.path.clone());
     m.insert("record.app".to_string(), d.record.app.clone());
@@ -33,6 +38,7 @@ static RUNTIME_CONFIG: LazyLock<RwLock<HashMap<String, String>>> = LazyLock::new
     m.insert("record.mp4".to_string(), bool_to_str(d.record.mp4));
     m.insert("record.flv".to_string(), bool_to_str(d.record.flv));
     m.insert("srt.port".to_string(), d.srt.port.to_string());
+    m.insert("srt.enabled".to_string(), bool_to_str(d.srt.enabled));
     m.insert(
         "gb28181.sip_port".to_string(),
         d.gb28181.sip_port.to_string(),
@@ -41,9 +47,14 @@ static RUNTIME_CONFIG: LazyLock<RwLock<HashMap<String, String>>> = LazyLock::new
         "gb28181.media_port".to_string(),
         d.gb28181.media_port.to_string(),
     );
+    m.insert(
+        "gb28181.enabled".to_string(),
+        bool_to_str(d.gb28181.enabled),
+    );
     m.insert("webrtc.port".to_string(), d.webrtc_port.to_string());
-    RwLock::new(m)
-});
+    m.insert("webrtc.enabled".to_string(), bool_to_str(d.webrtc.enabled));
+    m
+}
 
 fn bool_to_str(v: bool) -> String {
     if v {
@@ -56,6 +67,12 @@ fn bool_to_str(v: bool) -> String {
 /// Snapshot of the current runtime config (dotted keys -> string values).
 pub fn runtime_config_snapshot() -> HashMap<String, String> {
     RUNTIME_CONFIG.read().unwrap().clone()
+}
+
+/// Replaces the runtime snapshot with the effective startup configuration.
+/// Call this after config-file and command-line overrides have been applied.
+pub fn sync_runtime_config(config: &ServerConfig) {
+    *RUNTIME_CONFIG.write().unwrap() = runtime_config_values(config);
 }
 
 /// Sets a runtime config key, returning `true` if the value changed.

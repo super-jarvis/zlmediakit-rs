@@ -8,6 +8,7 @@ use zlmediakit_core::ffmpeg_source::FFmpegSourceControl;
 use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::recorder::RecorderControl;
+use zlmediakit_core::rtp::RtpSenderManager;
 use zlmediakit_core::session::SessionManager;
 use zlmediakit_core::stream_proxy::StreamProxyControl;
 use zlmediakit_core::stream_pusher::StreamPusherControl;
@@ -19,6 +20,7 @@ use zlmediakit_transcode::TranscodeManager;
 pub struct HttpServerConfig {
     pub addr: String,
     pub source_manager: Arc<MediaSourceManager>,
+    pub rtp_sender: Arc<RtpSenderManager>,
     pub auth: Arc<StreamAuth>,
     pub hook: Arc<HookClient>,
     pub recorder: Arc<RecorderControl>,
@@ -42,6 +44,7 @@ pub struct HttpServer {
     listener: TcpListener,
     tls: Option<TlsAcceptor>,
     source_manager: Arc<MediaSourceManager>,
+    rtp_sender: Arc<RtpSenderManager>,
     auth: Arc<StreamAuth>,
     hook: Arc<HookClient>,
     recorder: Arc<RecorderControl>,
@@ -69,6 +72,7 @@ impl HttpServer {
             listener,
             tls,
             source_manager: config.source_manager,
+            rtp_sender: config.rtp_sender,
             auth: config.auth,
             hook: config.hook,
             recorder: config.recorder,
@@ -92,6 +96,7 @@ impl HttpServer {
             match self.listener.accept().await {
                 Ok((stream, peer_addr)) => {
                     let source_manager = self.source_manager.clone();
+                    let rtp_sender = self.rtp_sender.clone();
                     let auth = self.auth.clone();
                     let hook = self.hook.clone();
                     let recorder = self.recorder.clone();
@@ -114,6 +119,7 @@ impl HttpServer {
                                         TransportStream::from_tls_accepted(tls_stream),
                                         peer2,
                                         source_manager,
+                                        rtp_sender,
                                         auth,
                                         hook,
                                         recorder,
@@ -142,6 +148,7 @@ impl HttpServer {
                                 TransportStream::Tcp(stream),
                                 peer,
                                 source_manager,
+                                rtp_sender,
                                 auth,
                                 hook,
                                 recorder,

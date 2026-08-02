@@ -1,5 +1,25 @@
 # 项目发现
 
+## 2026-08-02 前端完整性与鉴权审计
+
+- 当前前端是无构建依赖的静态管理页，包含控制台、拉流代理、录制、推流转发、FFmpeg 源和服务器信息 6 个模块。
+- 后端 `getApiList` 列出 48 个管理 API，前端实际调用约 17 个；GB28181/RTP、转码、会话、录像文件、流详情/截图、配置修改和线程监控尚未接入。
+- 前端 `apiGet` 只检查 HTTP 状态，不检查 JSON `code`，后端以 HTTP 200 返回业务错误时会出现假成功提示。
+- 播放器只接入 HLS、HTTP-FLV 与 WS-FLV；HTTPS 页面仍会生成 `ws://` 地址，存在 mixed-content 失败。
+- `ServerConfig` 已有顶层 `secret` 字段及默认值，但当前 `HttpSession::handle_api` 直接分派管理 API，没有统一 secret 校验。
+- `getServerConfig` 当前把 `api.secret` 放入响应，前端又会原样显示整份 JSON；实现鉴权时必须脱敏。
+- 管理 API 当前均通过 GET query 参数执行，包括修改配置、关闭流、踢会话和重启；本轮先保持兼容，同时由 UI 增加确认和统一鉴权。
+- 会话 API 返回连接 ID、对端/本地地址、协议、创建时间和绑定流，可直接支持筛选与单条/批量踢出。
+- `getMediaPlayerList` 能返回单流订阅者及会话信息；`getMp4RecordFile` 按 app/stream/period 返回归档；`getThreadsLoad`/`getWorkThreadsLoad` 返回线程负载列表。
+- 转码 API 支持 H.264/H.265、缩放、码率、自定义目标 app/stream，并返回可用于停止任务的 key。
+- API secret 可复用 `HttpSession` 已持有的 `Arc<StreamAuth>`，无需扩展 `HttpServerConfig` 和大量构造调用；当配置 secret 为空时可作为显式关闭管理鉴权的兼容模式。
+- GB28181 设备列表已包含在线状态、IP/端口、最后心跳、厂商/型号和缓存通道；通道对象包含 ID、名称、ON/OFF、厂商、型号及经纬度，足以直接构建设备/目录/点播页面。
+- VOD 播放签名算法是 `sha256(secret|vhost|record|app/stream/file|play)`；前端可用 Web Crypto 只生成摘要 URL，不需要把明文 secret 放入录像链接。
+- `runtime_config_snapshot` 原先只在首次访问时用 `ServerConfig::default()` 初始化，未同步配置文件和 CLI 覆盖后的有效值；这会让管理页显示错误端口。现增加启动后同步，且把 WebRTC、SRT、GB28181 的启用状态和端口纳入脱敏配置响应。
+- WebRTC 服务器已为 POST/OPTIONS/DELETE 响应提供 CORS，可由不同端口的管理页直接完成 WHEP SDP 协商；SRT 不能由浏览器原生播放，管理页提供准确推流 URL 和启用/端口状态。
+- 默认配置 `http.www_root="./www"` 原先会被再次拼接到已指向仓库 `www/` 的 bundled root，最终得到不存在的 `www/www`；启动路径解析现把空值、`.`、`www`、`./www` 都归一为 bundled `www/`。
+
+
 ## 2026-08-02 协议完整性审计
 
 - 原 FLV demuxer 会丢弃 FLV 音视频头、忽略配置帧与 CTS，并把未知编码强行认作 H.264/AAC；这会破坏后续无损转封装。现已保留完整 payload 和语义元数据。
@@ -127,3 +147,46 @@
 - WSL 上 `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo build --release` 全部成功；release 产物已生成。
 - 三份 workflow 均通过 PyYAML 语法解析，`git diff --check` 通过。
 - 产品改动为 3 个文件：`ci.yml`、`release.yml`、`Dockerfile`；另有本技能要求生成的 3 个未跟踪工作记录文件。
+# 2026-08-02 ZLMediaKit 开源能力对齐发现
+
+- 当前项目的主流 H.264/H.265/AAC 直播链路已经闭环，但通用 RTP sender 是最靠前的架构断点；现有 `startRtp` 是 GB28181 SIP INVITE，不等价于 ZLM `startSendRtp`。
+- RTSP session 内已有 H.264/H.265/AAC/Opus/G.711/L16/MP3 RTP packetizer 与 UDP/TCP interleaved 发送逻辑，可提取为通用 RTP packetizer，避免重新实现编码负载。
+- 当前 `MediaFrame` 已带 `track_id`、codec、DTS/PTS、payload format 和 config-frame 标识，足以驱动独立 RTP sender。
+- HLS `HlsDemuxer::parse_m3u8` 没有生产调用者，因此不构成原生 HLS 拉流客户端。
+- Stream proxy 原生只区分 RTMP 和 RTSP；Stream pusher 固定调用 RTMP push client。
+- SRT crate 只有 listener/server 输入链路，没有 caller、输出或 rendezvous。
+- 集群配置只有 RTMP push peers 与单个 RTMP/RTSP `origin_url`，没有多源站轮询和 HLS/HTTP-TS 溯源。
+- WebRTC 已有 NACK/PLI/TWCC 和 DataChannel，后续应补缺失高级特性，不能将整个 WebRTC 模块判定为未实现。
+- ZLMediaKit README 中的任意转码、JT1078、IPTV、S3、RTC 集群、AI、MCU 属于闭源专业版，本目标不以这些功能作为开源对齐验收项。
+- ZLM `startSendRtp` 的默认 `use_ps=1` 是 PS-RTP，而 `use_ps=0` 才是 ES；现已实现 MPEG-2 pack/system/PSM/PES、90 kHz PTS/DTS、MPEG-2 CRC 和 RTP 分片，默认参数不再降级为 ES。
+- PS 输出已覆盖 H.264/H.265、AAC（从 ASC/track 补 ADTS）、G.711A/U、MP2/MP3；Opus/L16 没有直接映射到 GB28181 PS，保持 ES 输出。
+- 审计发现既有 PS demuxer 的 PES 可选头少解析了 MPEG-2 flags 字节，只能解析项目自造的非标准测试数据；已修正为标准 `flags1 + flags2 + header_data_length`，并保留长度为 0 的 GB28181 视频 PES 支持。
+- `is_udp=0` 现已按 RFC 4571 使用两字节网络序长度前缀发送 RTP/TCP，ES 与 PS 共用传输层；下一断点缩小为 TCP passive、TS 输出、重连和端口复用。
+- ZLM master 当前优先使用 `type=0/1/2` 表示 ES/PS/TS，旧 `use_ps` 只作为兼容覆盖；同时公开 `only_audio`、`startSendRtpPassive` 与 `listRtpSender`。本项目已按该契约补齐这些入口。
+- TCP passive 由独立监听器接入，RFC 4571 连接断开后继续接受新客户端；TCP active 首次连接仍同步报错，成功后断线会按 1 秒退避重连。
+- TS-over-RTP 复用现有 `TsLiveMuxer`，通过 core muxer factory 注入避免 core/hls 循环依赖；每个 RTP 负载最多包含 7 个完整 188-byte TS packet，不切断 TS packet 边界。
+- `ssrc_multi_send=1` 已允许同一流/SSRC 按目标建立多路 sender；UDP 使用 `SO_REUSEADDR`/Unix `SO_REUSEPORT` 复用显式源端口，真实双目标测试确认两端同时收包且按 SSRC 一次停止全部。
+- 通用 RTP 输出阶段已经闭环，下一阶段进入 GB28181 TCP 接收、PS/TS/ES 自动识别、音频与乱序恢复。
+- GB28181 接收审计确认 `RtpServerManager::open` 只创建 UDP socket，API 虽有 `tcp_mode` 语义但未下传到 manager；TCP passive/active 接收尚未实现。
+- `RtpStreamReceiver::handle_rtp` 已解析 RTP sequence/PT，却未使用 sequence 做乱序、重复和丢包处理；payload 类型完全依赖开户参数，没有从 PT/PS pack/TS sync byte 自动识别。
+- RTP/TS 分支当前直接忽略 payload；已有 SRT TS demux 逻辑不在 GB28181 receiver 中复用，这是下一条最明显的断链。
+- PS demuxer 会跳过 PSM 而不保存 stream type，导致 PS 内所有 `0xC0` 音频都按 receiver 默认的 G.711A 发布；AAC/G.711U/MP2 等无法可靠识别。直接 AAC RTP 也尚未剥离 RFC 3640 AU header。
+- 上述 GB28181 接收断链已落实修复：UDP/TCP passive/TCP active 共用同一 ingest/reorder 层；`connectRtpServer` 对齐 ZLM 主动 TCP 两阶段控制语义；list/info 可观察 transport 与丢包统计。
+- 自动识别当前以首个有效 RTP payload 锁定封装：PT 0/8 映射 PCMU/PCMA，PS 识别 `00 00 01 BA..BF`，TS 识别 188-byte sync，H.265 识别 VPS/SPS/PPS/AP/FU，其余视频回落 H.264。调用方仍可用 `type` 显式覆盖。
+- SRT 的 TS demux 已抽成 crate 内共享入口供 GB RTP 复用；它目前覆盖 PMT 中 H.264/H.265 与 AAC，其他 TS 音频 stream_type 仍属于后续兼容矩阵工作。
+- PS PSM stream map 现由增量 `PsDemuxer` 保存，接收侧已映射 `0x1B/0x24/0x0F/0x11/0x90/0x91/0x04/0x03`；AAC 非 ADTS RTP 会按 RFC3640 AU header 拆出原始 access unit。
+- GB28181 阶段未完成项已缩小为“收到的 RTP 流按控制面再转推”与 SIP 语音对讲事务/音频发送；不能仅凭通用 `startSendRtp` 视为这两项已经完成。
+- SIP 响应解析存在一个影响所有平台主动 INVITE 的旧缺陷：`SIP/2.0 200 OK` 曾错误尝试把第三个 token `OK` 解析为状态码，因此点播和新对讲都不会 ACK/激活；现已改为第二个 token，并由对讲网络闭环覆盖。
+- 双向语音对讲当前明确以设备普遍支持的 G.711A/G.711U 为边界：从本机 MediaSource 选择音频轨，SDP 使用 PT 8/0 和 `sendonly`，200 SDP 决定设备接收地址，随后走通用 ES-RTP sender；不隐式执行任意音频转码。
+- 接收 RTP 的受控转推无需建立第二套 GB 专用 sender：首包发布统一 MediaSource 后，现有 `startSendRtp` 即可选择 ES/PS/TS 和 UDP/TCP 目的端。新增真实 UDP 测试已验证接收 H.264 RTP 经缓存 GOP 转为新 SSRC/PT 后到达第二目的端。
+- GB28181 阶段现已闭环；下一架构断点是代理层仍只有 RTMP/RTSP 原生客户端，HLS TS/fMP4、HTTP-FLV 和 HTTP-TS 都只能依赖外部 ffmpeg。
+- 原生 HTTP 拉流已补上上述断点：代理 supervisor 按 URL scheme 调用 HTTP client，HTTP-FLV 保持 FLV payload，HTTP/HLS-TS 输出 Annex-B/ADTS，HLS CMAF 输出 AVCC/HVCC/AAC raw，使下游复用现有无损转封装路径。
+- 既有 `HlsDemuxer` 只按 TS packet payload 生成粗粒度帧，不足以处理跨 packet PES；新 HTTP/HLS 输入改为复用 SRT 中已经验证的 PAT/PMT/PES 解封装状态，并新增网络 read 边界缓存。
+- 新增 `Fmp4Demuxer` 支持 CMAF init + fragment 的常用 ISO BMFF 字段，覆盖 H.264/H.265/AAC、默认/逐 sample duration/size/flags、CTS offset 和多 traf 数据偏移；测试同时覆盖项目 muxer 的视频与 AAC 往返。
+- 当前 HLS 原生客户端以未加密、URI segment 的开源核心路径为边界；尚未实现 AES-128/SAMPLE-AES、LL-HLS parts、EXT-X-BYTERANGE、cookie/session header 注入和自定义 CA，这些属于后续兼容性扩展，不隐式宣称支持。
+- 推流 supervisor 原先无条件调用 RTMP push client；现按 RTMP(S)、RTSP(S)、SRT 分流。RTSP RECORD client 复用 core RTP packetizer，覆盖 H.264/H.265 与 AAC SDP/RTP、Digest challenge/retry 和 WebPKI 校验的 RTSPS；仍未实现 UDP RECORD 与 Basic 上游认证。
+- SRT 原 FFI 常量来自错误的枚举序号，且把 libsrt 1.5 的三参数 `srt_recvmsg` 错声明为五参数；live 模式还错误调用 stream API。现已按本机公开 `srt.h` 对齐 ABI，并用真实 Caller/Listener/Rendezvous 网络测试固定行为。
+- SRT Listener 的非阻塞 `RCVSYN=false` 会被 accepted socket 继承，旧处理器把首个“暂无数据”当断线关闭；accepted socket 现在切回 200ms 有界同步接收，并对 async/timeout 重试，既能响应停止又不会抢先断开。
+- TS 解复用器原 PAT program loop 少跳过 5 字节、PMT program_info_length 多跳过 1 字节，导致 PMT/AAC PID 不生效；现按标准字段偏移解析，并保存 PMT stream_type 作为视频 codec，避免 H.264 P 帧被启发式误判成 H.265。
+
+---

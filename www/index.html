@@ -8,6 +8,19 @@
 </head>
 <body>
 
+<div id="login-screen" class="login-screen">
+  <form id="login-form" class="login-card">
+    <div class="brand-mark">ZL</div>
+    <h1>ZLMediaKit-RS</h1>
+    <p>输入配置文件中的 API secret 进入管理后台</p>
+    <label for="login-secret">API Secret</label>
+    <input id="login-secret" type="password" autocomplete="current-password" placeholder="配置文件中的 secret" />
+    <div id="login-error" class="player-error" style="display:none"></div>
+    <button id="login-button" type="submit" class="btn btn-primary btn-block">登录</button>
+    <span class="text-secondary text-small">若服务端将 secret 配置为空，可留空登录。</span>
+  </form>
+</div>
+
 <nav class="sidebar">
   <div class="sidebar-header">
     <h1>ZLMediaKit</h1>
@@ -15,11 +28,18 @@
   </div>
   <div class="sidebar-nav">
     <a href="#" data-tab="dashboard" class="active"><span class="icon">📊</span> <span>控制台</span></a>
+    <a href="#" data-tab="sessions"><span class="icon">🔌</span> <span>会话管理</span></a>
     <a href="#" data-tab="proxies"><span class="icon">🔄</span> <span>拉流代理</span></a>
     <a href="#" data-tab="recording"><span class="icon">⏺️</span> <span>录制管理</span></a>
     <a href="#" data-tab="forwarding"><span class="icon">📤</span> <span>推流转发</span></a>
     <a href="#" data-tab="ffmpeg"><span class="icon">🎬</span> <span>FFmpeg 源</span></a>
+    <a href="#" data-tab="gb28181"><span class="icon">📡</span> <span>GB28181</span></a>
+    <a href="#" data-tab="rtp"><span class="icon">📥</span> <span>RTP 服务</span></a>
+    <a href="#" data-tab="transcode"><span class="icon">⚙️</span> <span>转码管理</span></a>
     <a href="#" data-tab="server"><span class="icon">ℹ️</span> <span>服务器</span></a>
+  </div>
+  <div class="sidebar-footer">
+    <button id="logout-button" class="btn btn-sm btn-block">退出登录</button>
   </div>
 </nav>
 
@@ -35,6 +55,19 @@
     </div>
 
     <div id="dash-alerts"></div>
+
+    <div class="card">
+      <div class="card-header"><h3>流筛选与批量操作</h3></div>
+      <form id="stream-filter" onsubmit="event.preventDefault();loadDashboard();">
+        <div class="form-row">
+          <div class="form-group"><label>应用名</label><input name="app" placeholder="live（可选）" /></div>
+          <div class="form-group"><label>流名称</label><input name="stream" placeholder="可选" /></div>
+          <div class="form-group form-action"><label>&nbsp;</label><button class="btn btn-primary">查询</button></div>
+          <div class="form-group form-action"><label>&nbsp;</label><button type="button" class="btn" onclick="checkMediaOnline()">在线探测</button></div>
+          <div class="form-group form-action"><label>&nbsp;</label><button type="button" class="btn btn-danger" onclick="closeFilteredStreams()">批量关闭</button></div>
+        </div>
+      </form>
+    </div>
 
     <div class="status-bar">
       <div class="stat-item">
@@ -82,6 +115,7 @@
             <option value="hls">HLS</option>
             <option value="flv">HTTP-FLV</option>
             <option value="wsflv">WebSocket-FLV</option>
+            <option value="whep">WebRTC (WHEP)</option>
           </select>
         </div>
         <div class="form-group" style="flex:0 0 auto;">
@@ -97,13 +131,33 @@
     </div>
   </div>
 
+  <div id="page-sessions" class="page">
+    <div class="page-header"><h2>会话管理</h2><span class="subtitle">查看和断开客户端连接</span></div>
+    <div id="session-alerts"></div>
+    <div class="card">
+      <div class="card-header"><h3>连接筛选</h3></div>
+      <form id="session-filter" onsubmit="event.preventDefault();loadSessions();">
+        <div class="form-row">
+          <div class="form-group"><label>对端 IP</label><input name="peer_ip" placeholder="可选" /></div>
+          <div class="form-group"><label>本地端口</label><input name="local_port" type="number" placeholder="可选" /></div>
+          <div class="form-group"><label>协议</label><input name="typeid" placeholder="HTTP / RTMP / RTSP" /></div>
+          <div class="form-group form-action"><label>&nbsp;</label><button class="btn btn-primary">查询</button></div>
+          <div class="form-group form-action"><label>&nbsp;</label><button type="button" class="btn btn-danger" onclick="kickFilteredSessions()">断开筛选结果</button></div>
+        </div>
+      </form>
+    </div>
+    <div class="card"><div class="card-header"><h3>活动会话</h3><button class="btn btn-sm" onclick="loadSessions()">↻ 刷新</button></div>
+      <div class="table-wrap"><table><thead><tr><th>协议</th><th>对端</th><th>本地</th><th>绑定流</th><th>连接时间</th><th>操作</th></tr></thead><tbody id="session-table-body"></tbody></table></div>
+    </div>
+  </div>
+
   <!-- ════════════════════════════════════════════════ -->
   <!-- 拉流代理                                         -->
   <!-- ════════════════════════════════════════════════ -->
   <div id="page-proxies" class="page">
     <div class="page-header">
       <h2>拉流代理</h2>
-      <span class="subtitle">通过 RTMP/RTSP/HTTP 拉取远程流</span>
+      <span class="subtitle">通过 RTMP/RTSP(S)/SRT/HTTP/HLS 拉取远程流</span>
     </div>
     <div id="proxy-alerts"></div>
 
@@ -171,6 +225,17 @@
         </table>
       </div>
     </div>
+
+    <div class="card">
+      <div class="card-header"><h3>MP4 录像归档</h3></div>
+      <form id="record-file-form" onsubmit="event.preventDefault();loadRecordFiles();"><div class="form-row">
+        <div class="form-group"><label>应用名</label><input name="app" value="live" /></div>
+        <div class="form-group"><label>流名称</label><input name="stream" required /></div>
+        <div class="form-group"><label>日期</label><input name="period" type="date" /></div>
+        <div class="form-group form-action"><label>&nbsp;</label><button class="btn btn-primary">查询录像</button></div>
+      </div></form>
+      <div class="table-wrap"><table><thead><tr><th>文件名</th><th>开始时间</th><th>大小</th><th>操作</th></tr></thead><tbody id="record-file-table-body"><tr class="empty-row"><td colspan="4">请输入流名称查询</td></tr></tbody></table></div>
+    </div>
   </div>
 
   <!-- ════════════════════════════════════════════════ -->
@@ -179,7 +244,7 @@
   <div id="page-forwarding" class="page">
     <div class="page-header">
       <h2>推流转发</h2>
-      <span class="subtitle">将流转发到远程服务器</span>
+      <span class="subtitle">通过 RTMP(S)、RTSP(S) 或 SRT 将流主动推送到远程服务器</span>
     </div>
     <div id="forward-alerts"></div>
 
@@ -189,7 +254,7 @@
         <div class="form-row">
           <div class="form-group" style="flex:2;">
             <label>目标地址 URL</label>
-            <input type="text" name="dst_url" placeholder="rtmp://remote-server.com/live/stream" required />
+            <input type="text" name="dst_url" placeholder="rtmp://...、rtsps://... 或 srt://...?mode=caller" required />
           </div>
           <div class="form-group">
             <label>应用名</label>
@@ -296,6 +361,72 @@
     </div>
   </div>
 
+  <div id="page-gb28181" class="page">
+    <div class="page-header"><h2>GB28181</h2><span class="subtitle">SIP 设备、通道目录、点播与语音对讲控制</span></div>
+    <div id="gb-alerts"></div>
+    <div class="status-bar" id="sip-summary"></div>
+    <div class="card"><div class="card-header"><h3>设备列表</h3><div class="card-actions"><button class="btn btn-sm" onclick="loadGb28181()">↻ 刷新</button><button class="btn btn-danger btn-sm" onclick="stopSipServer()">停止 SIP 服务</button></div></div>
+      <div class="table-wrap"><table><thead><tr><th>设备 ID</th><th>地址</th><th>状态</th><th>注册/更新时间</th><th>操作</th></tr></thead><tbody id="device-table-body"></tbody></table></div>
+    </div>
+    <div class="card"><div class="card-header"><h3>语音对讲音源</h3><span class="text-secondary text-small">选择本机已发布的 G.711A/G.711U 音频流，再从通道列表发起对讲</span></div>
+      <div class="form-row">
+        <div class="form-group"><label>虚拟主机</label><input id="talk-vhost" value="__defaultVhost__" /></div>
+        <div class="form-group"><label>应用名</label><input id="talk-app" value="live" /></div>
+        <div class="form-group"><label>音源流名称</label><input id="talk-stream" placeholder="例如 microphone_g711" /></div>
+      </div>
+      <div class="table-wrap"><table><thead><tr><th>设备/通道</th><th>本地音源</th><th>编码</th><th>SSRC</th><th>本地端口</th><th>操作</th></tr></thead><tbody id="talk-table-body"><tr class="empty-row"><td colspan="6">暂无活动对讲</td></tr></tbody></table></div>
+    </div>
+    <div class="card"><div class="card-header"><h3>设备通道</h3><span id="catalog-title" class="text-secondary text-small">选择设备并查询目录</span></div>
+      <div class="table-wrap"><table><thead><tr><th>通道 ID</th><th>名称</th><th>状态</th><th>厂商/型号</th><th>操作</th></tr></thead><tbody id="catalog-table-body"><tr class="empty-row"><td colspan="5">暂无目录</td></tr></tbody></table></div>
+    </div>
+  </div>
+
+  <div id="page-rtp" class="page">
+    <div class="page-header"><h2>RTP 服务</h2><span class="subtitle">管理 RTP/PS、H.264、H.265 接收端口</span></div>
+    <div id="rtp-alerts"></div>
+    <div class="card"><div class="card-header"><h3>打开 RTP 接收端口</h3></div>
+      <form id="rtp-form" onsubmit="event.preventDefault();openRtpServer();"><div class="form-row">
+        <div class="form-group"><label>端口（0 自动分配）</label><input name="port" type="number" value="0" min="0" max="65535" /></div>
+        <div class="form-group"><label>应用名</label><input name="app" value="rtp" /></div>
+        <div class="form-group"><label>流名称</label><input name="stream" placeholder="rtp_stream" /></div>
+        <div class="form-group"><label>负载类型</label><select name="type"><option value="ps">MPEG-PS</option><option value="h264">H.264</option><option value="h265">H.265</option></select></div>
+        <div class="form-group"><label>SSRC（可选）</label><input name="ssrc" type="number" /></div>
+        <div class="form-group form-action"><label>&nbsp;</label><button class="btn btn-primary">打开</button></div>
+      </div></form>
+    </div>
+    <div class="card"><div class="card-header"><h3>RTP 端口</h3><button class="btn btn-sm" onclick="loadRtpServers()">↻ 刷新</button></div>
+      <div class="table-wrap"><table><thead><tr><th>端口</th><th>应用/流</th><th>类型</th><th>SSRC</th><th>状态</th><th>操作</th></tr></thead><tbody id="rtp-table-body"></tbody></table></div>
+    </div>
+  </div>
+
+  <div id="page-transcode" class="page">
+    <div class="page-header"><h2>转码管理</h2><span class="subtitle">创建和管理实时 H.264/H.265 转码任务</span></div>
+    <div id="transcode-alerts"></div>
+    <div class="card"><div class="card-header"><h3>添加转码任务</h3></div>
+      <form id="transcode-form" onsubmit="event.preventDefault();addTranscode();">
+        <div class="form-row">
+          <div class="form-group"><label>源应用</label><input name="app" value="live" /></div>
+          <div class="form-group"><label>源流</label><input name="stream" required /></div>
+          <div class="form-group"><label>输出编码</label><select name="code"><option>H264</option><option>H265</option></select></div>
+          <div class="form-group"><label>分辨率</label><input name="scale" placeholder="1280x720" /></div>
+          <div class="form-group"><label>码率</label><input name="bitrate" placeholder="2000k" /></div>
+        </div><div class="form-row">
+          <div class="form-group"><label>任务名</label><input name="name" placeholder="可选" /></div>
+          <div class="form-group"><label>目标应用</label><input name="dst_app" placeholder="transcode" /></div>
+          <div class="form-group"><label>目标流</label><input name="dst_stream" placeholder="自动生成" /></div>
+          <div class="form-group form-action"><label>&nbsp;</label><button class="btn btn-primary">创建任务</button></div>
+        </div>
+      </form>
+    </div>
+    <div class="card"><div class="card-header"><h3>转码任务</h3><button class="btn btn-sm" onclick="loadTranscodes()">↻ 刷新</button></div>
+      <div class="table-wrap"><table><thead><tr><th>任务 Key</th><th>源</th><th>目标</th><th>编码/尺寸</th><th>状态</th><th>操作</th></tr></thead><tbody id="transcode-table-body"></tbody></table></div>
+    </div>
+  </div>
+
+</div>
+
+<div id="detail-modal" class="modal" aria-hidden="true">
+  <div class="modal-card"><div class="card-header"><h3 id="detail-title">流详情</h3><button class="btn btn-sm" onclick="closeDetailModal()">✕</button></div><div id="detail-content"></div></div>
 </div>
 
 <!-- Local vendored players so the UI works fully offline. -->

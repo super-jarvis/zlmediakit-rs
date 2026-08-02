@@ -80,6 +80,7 @@ async fn hls_e2e_generates_playlist_and_segments() {
     let srv = HttpServer::new(HttpServerConfig {
         addr,
         source_manager: mgr.clone(),
+        rtp_sender: Arc::new(zlmediakit_core::rtp::RtpSenderManager::new(mgr.clone())),
         auth,
         hook,
         recorder,

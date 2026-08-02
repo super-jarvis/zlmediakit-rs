@@ -1,10 +1,10 @@
+use crate::client_transport::{connect, ClientStream};
 use crate::parser::{RtspParser, RtspResponse};
 use crate::session::{parse_sdp, RtpDepacketizer};
 use bytes::{Buf, BytesMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tracing::{debug, error, info};
 use zlmediakit_core::media_frame::{AudioInfo, CodecId, TrackInfo, VideoInfo};
@@ -27,10 +27,8 @@ pub async fn start(
         "stream proxy: pulling {} -> {}/{}/{}",
         url, vhost, app, stream_name
     );
-    let (host, port, path) = parse_rtsp_url(url)?;
-    let mut stream = TcpStream::connect((host.as_str(), port))
-        .await
-        .map_err(|e| anyhow::anyhow!("connect {}:{} failed: {}", host, port, e))?;
+    let target = parse_rtsp_url(url)?;
+    let mut stream = connect(&target.host, target.port, target.secure).await?;
 
     let source = source_manager.get_or_create(vhost, app, stream_name);
 
@@ -38,14 +36,14 @@ pub async fn start(
     let mut buffer = BytesMut::new();
 
     // OPTIONS
-    send_request(&mut stream, "OPTIONS", &path, &mut cseq, &[]).await?;
+    send_request(&mut stream, "OPTIONS", &target.path, &mut cseq, &[]).await?;
     let _ = read_response(&mut stream, &mut buffer).await;
 
     // DESCRIBE
     send_request(
         &mut stream,
         "DESCRIBE",
-        &path,
+        &target.path,
         &mut cseq,
         &[("Accept", "application/sdp")],
     )
@@ -61,7 +59,7 @@ pub async fn start(
     send_request(
         &mut stream,
         "SETUP",
-        &format!("{}/trackID=0", path),
+        &format!("{}/trackID=0", target.path.trim_end_matches('/')),
         &mut cseq,
         &[("Transport", "RTP/AVP/TCP;unicast;interleaved=0-1")],
     )
@@ -80,7 +78,7 @@ pub async fn start(
         send_request(
             &mut stream,
             "SETUP",
-            &format!("{}/trackID=1", path),
+            &format!("{}/trackID=1", target.path.trim_end_matches('/')),
             &mut cseq,
             &extra,
         )
@@ -93,7 +91,7 @@ pub async fn start(
     if let Some(ref s) = session {
         play_extra.push(("Session", s));
     }
-    send_request(&mut stream, "PLAY", &path, &mut cseq, &play_extra).await?;
+    send_request(&mut stream, "PLAY", &target.path, &mut cseq, &play_extra).await?;
     let play_resp = read_response(&mut stream, &mut buffer).await?;
     if play_resp.status_code != 200 {
         anyhow::bail!("PLAY failed with status {}", play_resp.status_code);
@@ -187,32 +185,58 @@ pub async fn start(
     // Best-effort TEARDOWN so the upstream frees the session promptly.
     if let Some(ref s) = session {
         let extra = vec![("Session", s.as_str())];
-        let _ = send_request(&mut stream, "TEARDOWN", &path, &mut cseq, &extra).await;
+        let _ = send_request(&mut stream, "TEARDOWN", &target.path, &mut cseq, &extra).await;
     }
     Ok(())
 }
 
-fn parse_rtsp_url(url: &str) -> anyhow::Result<(String, u16, String)> {
-    let s = url
-        .strip_prefix("rtsp://")
-        .or_else(|| url.strip_prefix("rtsps://"))
-        .ok_or_else(|| anyhow::anyhow!("not an rtsp url: {}", url))?;
-    let (authority, path) = match s.find('/') {
-        Some(i) => (s[..i].to_string(), format!("/{}", &s[i + 1..])),
-        None => (s.to_string(), "/".to_string()),
+struct PullUrl {
+    host: String,
+    port: u16,
+    path: String,
+    secure: bool,
+}
+
+fn parse_rtsp_url(url: &str) -> anyhow::Result<PullUrl> {
+    let (rest, secure, default_port) = if let Some(rest) = url.strip_prefix("rtsps://") {
+        (rest, true, 322)
+    } else if let Some(rest) = url.strip_prefix("rtsp://") {
+        (rest, false, 554)
+    } else {
+        anyhow::bail!("not an RTSP URL: {url}");
     };
-    let (host, port) = match authority.rfind(':') {
-        Some(i) => {
-            let p = authority[i + 1..].parse::<u16>().unwrap_or(554);
-            (authority[..i].to_string(), p)
-        }
-        None => (authority, 554),
+    let (authority, path) = rest
+        .find('/')
+        .map_or((rest, "/"), |index| (&rest[..index], &rest[index..]));
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let end = bracketed
+            .find(']')
+            .ok_or_else(|| anyhow::anyhow!("invalid bracketed IPv6 RTSP host"))?;
+        let suffix = &bracketed[end + 1..];
+        (
+            bracketed[..end].to_string(),
+            suffix
+                .strip_prefix(':')
+                .map(str::parse)
+                .transpose()?
+                .unwrap_or(default_port),
+        )
+    } else if authority.matches(':').count() == 1 {
+        let (host, port) = authority.rsplit_once(':').expect("count checked");
+        (host.to_string(), port.parse()?)
+    } else {
+        (authority.to_string(), default_port)
     };
-    Ok((host, port, path))
+    Ok(PullUrl {
+        host,
+        port,
+        path: path.to_string(),
+        secure,
+    })
 }
 
 async fn send_request(
-    stream: &mut TcpStream,
+    stream: &mut ClientStream,
     method: &str,
     uri: &str,
     cseq: &mut u32,
@@ -229,7 +253,7 @@ async fn send_request(
 }
 
 async fn read_response(
-    stream: &mut TcpStream,
+    stream: &mut ClientStream,
     buffer: &mut BytesMut,
 ) -> anyhow::Result<RtspResponse> {
     let mut tmp = [0u8; 4096];

@@ -1,23 +1,32 @@
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::Duration;
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::hook::HookClient;
-use zlmediakit_core::media_frame::{CodecId, MediaFrame};
+use zlmediakit_core::media_frame::{CodecId, MediaFrame, PayloadFormat, TrackInfo, VideoInfo};
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::recorder::RecorderControl;
 use zlmediakit_core::session::SessionManager;
 use zlmediakit_core::stream_proxy::StreamProxyControl;
+use zlmediakit_hls::TsLiveMuxer;
 use zlmediakit_http::server::{HttpServer, HttpServerConfig};
 
 const TEST_PORT: u16 = 19149;
 
 async fn http_get(path: &str, port: u16) -> (u16, Vec<u8>) {
+    http_get_with_headers(path, port, &[]).await
+}
+
+async fn http_get_with_headers(path: &str, port: u16, headers: &[(&str, &str)]) -> (u16, Vec<u8>) {
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("connect");
-    let request = format!("GET {} HTTP/1.0\r\nHost: localhost\r\n\r\n", path);
+    let mut request = format!("GET {} HTTP/1.0\r\nHost: localhost\r\n", path);
+    for (name, value) in headers {
+        request.push_str(&format!("{}: {}\r\n", name, value));
+    }
+    request.push_str("\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.unwrap();
@@ -66,9 +75,20 @@ struct TestServer {
 
 impl TestServer {
     async fn new(port: u16) -> Self {
+        Self::new_with_secret(port, "").await
+    }
+
+    async fn new_with_secret(_port: u16, secret: &str) -> Self {
+        Self::new_with_options(secret, None).await
+    }
+
+    async fn new_with_options(secret: &str, www_root: Option<std::path::PathBuf>) -> Self {
+        let probe = TcpListener::bind("127.0.0.1:0").await.expect("bind probe");
+        let port = probe.local_addr().expect("probe address").port();
+        drop(probe);
         let mgr = Arc::new(MediaSourceManager::new(None));
         let session_mgr = Arc::new(SessionManager::new());
-        let auth = StreamAuth::new(false, String::new());
+        let auth = StreamAuth::new(false, secret.to_string());
         let hook = HookClient::empty();
         let recorder = Arc::new(RecorderControl::new().0);
         let proxy = Arc::new(StreamProxyControl::new().0);
@@ -77,6 +97,14 @@ impl TestServer {
         let srv = HttpServer::new(HttpServerConfig {
             addr,
             source_manager: mgr.clone(),
+            rtp_sender: Arc::new(
+                zlmediakit_core::rtp::RtpSenderManager::new(mgr.clone()).with_ts_muxer_factory(
+                    Arc::new(|| {
+                        let mut muxer = TsLiveMuxer::new();
+                        Box::new(move |frame: &MediaFrame| Ok(muxer.push_frame(frame)))
+                    }),
+                ),
+            ),
             auth,
             hook,
             recorder,
@@ -84,7 +112,7 @@ impl TestServer {
             pusher: Default::default(),
             ffmpeg: Default::default(),
             record_root: std::path::PathBuf::from("./record"),
-            www_root: None,
+            www_root,
             ssl_cert: None,
             ssl_key: None,
             rtp: None,
@@ -110,6 +138,341 @@ impl TestServer {
     fn mgr(&self) -> &Arc<MediaSourceManager> {
         &self.mgr
     }
+}
+
+#[tokio::test]
+async fn start_and_stop_send_rtp_api_streams_udp_es() {
+    let server = TestServer::new(TEST_PORT + 30).await;
+    let source = server
+        .mgr()
+        .get_or_create("__defaultVhost__", "live", "rtp-api");
+    source
+        .update_tracks(vec![TrackInfo::Video(VideoInfo {
+            codec: CodecId::H264,
+            width: 1280,
+            height: 720,
+            fps: 25.0,
+            key_frame: true,
+        })])
+        .await;
+
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let destination = receiver.local_addr().unwrap();
+    let path = format!(
+        "/index/api/startSendRtp?vhost=__defaultVhost__&app=live&stream=rtp-api&ssrc=4321&dst_url=127.0.0.1&dst_port={}&is_udp=1&use_ps=0&pt=98",
+        destination.port()
+    );
+    let (status, body) = server.get(&path).await;
+    assert_eq!(status, 200);
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["code"], 0);
+    assert!(response["local_port"].as_u64().unwrap_or(0) > 0);
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let frame = MediaFrame::new_video(
+        0,
+        CodecId::H264,
+        40,
+        40,
+        40,
+        bytes::Bytes::from_static(&[0, 0, 0, 1, 0x65, 1, 2, 3]),
+        true,
+    )
+    .with_payload_format(PayloadFormat::AnnexB);
+    source.publish_and_cache(frame).await;
+
+    let mut packet = [0u8; 1500];
+    let received = tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(received > 12);
+    assert_eq!(packet[1] & 0x7f, 98);
+    assert_eq!(u32::from_be_bytes(packet[8..12].try_into().unwrap()), 4321);
+
+    let (status, body) = server
+        .get("/index/api/stopSendRtp?vhost=__defaultVhost__&app=live&stream=rtp-api&ssrc=4321")
+        .await;
+    assert_eq!(status, 200);
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["code"], 0);
+    assert_eq!(response["stopped"], 1);
+}
+
+#[tokio::test]
+async fn start_send_rtp_defaults_to_gb28181_ps_payload() {
+    let server = TestServer::new(TEST_PORT + 31).await;
+    let source = server
+        .mgr()
+        .get_or_create("__defaultVhost__", "live", "rtp-ps-api");
+    source
+        .update_tracks(vec![TrackInfo::Video(VideoInfo {
+            codec: CodecId::H264,
+            width: 1280,
+            height: 720,
+            fps: 25.0,
+            key_frame: true,
+        })])
+        .await;
+
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let destination = receiver.local_addr().unwrap();
+    let path = format!(
+        "/index/api/startSendRtp?vhost=__defaultVhost__&app=live&stream=rtp-ps-api&ssrc=9876&dst_url=127.0.0.1&dst_port={}&is_udp=1&pt=96",
+        destination.port()
+    );
+    let (status, body) = server.get(&path).await;
+    assert_eq!(status, 200);
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["code"], 0, "{response}");
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let frame = MediaFrame::new_video(
+        0,
+        CodecId::H264,
+        40,
+        40,
+        40,
+        bytes::Bytes::from_static(&[0, 0, 0, 1, 0x65, 1, 2, 3]),
+        true,
+    )
+    .with_payload_format(PayloadFormat::AnnexB);
+    source.publish_and_cache(frame).await;
+
+    let mut packet = [0u8; 1500];
+    let received = tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(received > 16);
+    assert_eq!(&packet[12..16], &[0, 0, 1, 0xba]);
+    assert_eq!(u32::from_be_bytes(packet[8..12].try_into().unwrap()), 9876);
+
+    let (status, body) = server
+        .get("/index/api/listRtpSender?vhost=__defaultVhost__&app=live&stream=rtp-ps-api")
+        .await;
+    assert_eq!(status, 200);
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["data"], serde_json::json!(["9876"]));
+    assert!(response["details"][0]["packets"].as_u64().unwrap_or(0) > 0);
+
+    let (_, body) = server
+        .get("/index/api/stopSendRtp?vhost=__defaultVhost__&app=live&stream=rtp-ps-api&ssrc=9876")
+        .await;
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["stopped"], 1);
+}
+
+#[tokio::test]
+async fn start_send_rtp_passive_accepts_tcp_client() {
+    let server = TestServer::new(TEST_PORT + 32).await;
+    let source = server
+        .mgr()
+        .get_or_create("__defaultVhost__", "live", "rtp-passive-api");
+    source
+        .update_tracks(vec![TrackInfo::Video(VideoInfo {
+            codec: CodecId::H264,
+            width: 640,
+            height: 360,
+            fps: 25.0,
+            key_frame: true,
+        })])
+        .await;
+
+    let (status, body) = server
+        .get("/index/api/startSendRtpPassive?vhost=__defaultVhost__&app=live&stream=rtp-passive-api&ssrc=1357")
+        .await;
+    assert_eq!(status, 200);
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["code"], 0, "{response}");
+    let port = response["local_port"].as_u64().unwrap() as u16;
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    source
+        .publish_and_cache(
+            MediaFrame::new_video(
+                0,
+                CodecId::H264,
+                40,
+                40,
+                40,
+                bytes::Bytes::from_static(&[0, 0, 0, 1, 0x65, 4, 3, 2]),
+                true,
+            )
+            .with_payload_format(PayloadFormat::AnnexB),
+        )
+        .await;
+
+    use tokio::io::AsyncReadExt;
+    let mut length = [0u8; 2];
+    tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut length))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut packet = vec![0u8; u16::from_be_bytes(length) as usize];
+    stream.read_exact(&mut packet).await.unwrap();
+    assert_eq!(&packet[12..16], &[0, 0, 1, 0xba]);
+    assert_eq!(u32::from_be_bytes(packet[8..12].try_into().unwrap()), 1357);
+
+    let (_, body) = server
+        .get("/index/api/stopSendRtp?vhost=__defaultVhost__&app=live&stream=rtp-passive-api&ssrc=1357")
+        .await;
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["stopped"], 1);
+}
+
+#[tokio::test]
+async fn start_send_rtp_type_two_streams_mpeg_ts() {
+    let server = TestServer::new(TEST_PORT + 33).await;
+    let source = server
+        .mgr()
+        .get_or_create("__defaultVhost__", "live", "rtp-ts-api");
+    source
+        .update_tracks(vec![TrackInfo::Video(VideoInfo {
+            codec: CodecId::H264,
+            width: 640,
+            height: 360,
+            fps: 25.0,
+            key_frame: true,
+        })])
+        .await;
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let path = format!(
+        "/index/api/startSendRtp?vhost=__defaultVhost__&app=live&stream=rtp-ts-api&ssrc=8642&dst_url=127.0.0.1&dst_port={}&is_udp=1&type=2",
+        receiver.local_addr().unwrap().port()
+    );
+    let (_, body) = server.get(&path).await;
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["code"], 0, "{response}");
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    source
+        .publish_and_cache(
+            MediaFrame::new_video(
+                0,
+                CodecId::H264,
+                40,
+                40,
+                40,
+                bytes::Bytes::from_static(&[0, 0, 0, 1, 0x65, 8, 6, 4]),
+                true,
+            )
+            .with_payload_format(PayloadFormat::AnnexB),
+        )
+        .await;
+    let mut packet = [0u8; 1500];
+    let received = tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(received > 12);
+    assert_eq!(packet[12], 0x47, "RTP payload must start with a TS packet");
+    assert_eq!((received - 12) % 188, 0);
+
+    let (_, body) = server
+        .get("/index/api/stopSendRtp?vhost=__defaultVhost__&app=live&stream=rtp-ts-api&ssrc=8642")
+        .await;
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["stopped"], 1);
+}
+
+#[tokio::test]
+async fn web_admin_assets_expose_authenticated_management_modules() {
+    const SECRET: &str = "management-test-secret";
+    let www_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../www");
+    let srv = TestServer::new_with_options(SECRET, Some(www_root)).await;
+
+    let (code, body) = srv.get("/").await;
+    assert_eq!(code, 200);
+    let html = String::from_utf8(body).unwrap();
+    for marker in [
+        "login-screen",
+        "page-sessions",
+        "page-gb28181",
+        "page-rtp",
+        "page-transcode",
+        "WebRTC (WHEP)",
+    ] {
+        assert!(html.contains(marker), "missing admin UI marker: {marker}");
+    }
+
+    let (code, body) = srv.get("/js/app.js").await;
+    assert_eq!(code, 200);
+    let js = String::from_utf8(body).unwrap();
+    for marker in [
+        "X-API-Secret",
+        "sessionStorage",
+        "startWhepPlayer",
+        "wss",
+        "getDeviceList",
+        "getTranscodeList",
+        "close_streams",
+        "getRecordStatus",
+        "getRtpInfo",
+        "getDeviceInfo",
+        "stopSip",
+        "getTranscode",
+    ] {
+        assert!(js.contains(marker), "missing admin JS marker: {marker}");
+    }
+
+    let (code, _) = srv.get("/index/api/getApiList").await;
+    assert_eq!(
+        code, 401,
+        "static assets must not bypass API authentication"
+    );
+}
+
+#[tokio::test]
+async fn http_api_requires_configured_secret_and_redacts_it() {
+    const SECRET: &str = "management-test-secret";
+    let srv = TestServer::new_with_secret(TEST_PORT, SECRET).await;
+    let secret_port = srv.port;
+
+    let (code, body) = http_get("/index/api/getServerConfig", secret_port).await;
+    assert_eq!(code, 401);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], -401);
+
+    let (code, _) = http_get_with_headers(
+        "/index/api/getServerConfig",
+        secret_port,
+        &[("X-API-Secret", "wrong")],
+    )
+    .await;
+    assert_eq!(code, 401);
+
+    let (code, body) = http_get_with_headers(
+        "/index/api/getServerConfig",
+        secret_port,
+        &[("X-API-Secret", SECRET)],
+    )
+    .await;
+    assert_eq!(code, 200);
+    let text = String::from_utf8(body).unwrap();
+    assert!(
+        !text.contains(SECRET),
+        "API secret must never be echoed back"
+    );
+
+    let bearer = format!("Bearer {SECRET}");
+    let (code, _) = http_get_with_headers(
+        "/index/api/getApiList",
+        secret_port,
+        &[("Authorization", bearer.as_str())],
+    )
+    .await;
+    assert_eq!(code, 200);
+
+    let (code, _) = http_get(
+        &format!("/index/api/getApiList?secret={SECRET}"),
+        secret_port,
+    )
+    .await;
+    assert_eq!(code, 200);
 }
 
 #[tokio::test]
@@ -477,6 +840,7 @@ async fn http_api_gb28181_device_list() {
     let srv = HttpServer::new(HttpServerConfig {
         addr,
         source_manager: mgr.clone(),
+        rtp_sender: Arc::new(zlmediakit_core::rtp::RtpSenderManager::new(mgr.clone())),
         auth: zlmediakit_core::auth::StreamAuth::new(false, String::new()),
         hook: zlmediakit_core::hook::HookClient::empty(),
         recorder: Arc::new(RecorderControl::new().0),
@@ -592,6 +956,23 @@ async fn http_api_gb28181_device_list() {
     assert_eq!(json["result"]["sip_port"], sip_port);
     assert_eq!(json["result"]["device_count"], 1);
     assert_eq!(json["result"]["stopped"], false);
+
+    // Talk management is exposed even when there are no active dialogs.
+    let (code, body) = http_get("/index/api/getTalkList", port).await;
+    assert_eq!(code, 200);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], 0);
+    assert!(json["data"].as_array().unwrap().is_empty());
+
+    // A talk request must point at a real local G.711 source.
+    let (code, body) = http_get(
+        "/index/api/startTalk?device_id=34020000001320000001&channel_id=34020000001320000002&app=talk&stream=missing",
+        port,
+    )
+    .await;
+    assert_eq!(code, 200);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_ne!(json["code"], 0);
 
     // stopSip stops the SIP server and clears its devices.
     let (code, body) = http_get("/index/api/stopSip", port).await;

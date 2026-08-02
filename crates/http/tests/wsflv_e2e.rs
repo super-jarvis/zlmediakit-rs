@@ -96,6 +96,7 @@ async fn wsflv_e2e_receives_flv_over_websocket() {
     let srv = HttpServer::new(HttpServerConfig {
         addr,
         source_manager: mgr.clone(),
+        rtp_sender: Arc::new(zlmediakit_core::rtp::RtpSenderManager::new(mgr.clone())),
         auth,
         hook,
         recorder: Arc::new(recorder),

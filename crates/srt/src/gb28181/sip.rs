@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
+use zlmediakit_core::media_frame::{CodecId, TrackInfo};
+use zlmediakit_core::rtp::{RtpDataType, RtpSendRequest, RtpSenderManager};
 use zlmediakit_core::MediaSourceManager;
 
 use super::rtp_server::{RtpPayloadType, RtpServerManager};
@@ -187,6 +189,37 @@ struct InviteCtx {
     device_id: String,
     channel_id: String,
     media_port: u16,
+    kind: InviteKind,
+    dialog_from: String,
+    dialog_to: String,
+}
+
+#[derive(Debug, Clone)]
+enum InviteKind {
+    Play,
+    Talk(TalkCtx),
+}
+
+#[derive(Debug, Clone)]
+struct TalkCtx {
+    vhost: String,
+    app: String,
+    stream: String,
+    codec: CodecId,
+    payload_type: u8,
+    ssrc: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TalkInfo {
+    pub device_id: String,
+    pub channel_id: String,
+    pub vhost: String,
+    pub app: String,
+    pub stream: String,
+    pub codec: String,
+    pub ssrc: u32,
+    pub local_port: u16,
 }
 
 /// A parsed SIP message.
@@ -242,7 +275,7 @@ fn parse_sip(buf: &[u8]) -> Option<SipMessage> {
     let c = parts.next().unwrap_or("").to_string();
 
     let (method, status, uri) = if a.starts_with("SIP/2.0") {
-        (None, c.parse::<u16>().ok(), b)
+        (None, b.parse::<u16>().ok(), c)
     } else {
         (Some(a), None, b)
     };
@@ -310,6 +343,35 @@ fn sdp_value(body: &str, prefix: &str) -> Option<String> {
     None
 }
 
+fn talk_destination(
+    body: &str,
+    fallback: SocketAddr,
+    expected_payload_type: u8,
+) -> anyhow::Result<SocketAddr> {
+    let connection_ip = sdp_value(body, "c=")
+        .and_then(|line| line.split_whitespace().last().map(str::to_string))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| fallback.ip());
+    let media = sdp_value(body, "m=audio ")
+        .ok_or_else(|| anyhow::anyhow!("talk SDP answer has no audio media line"))?;
+    let fields: Vec<&str> = media.split_whitespace().collect();
+    if fields.len() < 3 {
+        anyhow::bail!("invalid talk SDP audio media line");
+    }
+    let port = fields[0].parse::<u16>()?;
+    if port == 0 {
+        anyhow::bail!("device rejected the talk audio media");
+    }
+    let accepted = fields[2..]
+        .iter()
+        .filter_map(|value| value.parse::<u8>().ok())
+        .any(|payload_type| payload_type == expected_payload_type);
+    if !accepted {
+        anyhow::bail!("device did not accept RTP payload type {expected_payload_type}");
+    }
+    Ok(SocketAddr::new(connection_ip, port))
+}
+
 /// Extract the channels listed in a `Catalog` response.
 fn parse_catalog(root: &XmlNode) -> Vec<ChannelInfo> {
     let mut out = Vec::new();
@@ -326,6 +388,8 @@ pub struct SipServer {
     socket: UdpSocket,
     config: SipServerConfig,
     rtp: Arc<RtpServerManager>,
+    media_manager: Arc<MediaSourceManager>,
+    rtp_sender: Arc<RtpSenderManager>,
     devices: DashMap<String, DeviceContact>,
     pending: DashMap<String, InviteCtx>,
     active: DashMap<String, InviteCtx>,
@@ -341,11 +405,14 @@ impl SipServer {
         media_port_base: u16,
     ) -> anyhow::Result<Arc<Self>> {
         let socket = UdpSocket::bind(("0.0.0.0", config.sip_port)).await?;
-        let rtp = RtpServerManager::new(manager, media_port_base);
+        let rtp = RtpServerManager::new(manager.clone(), media_port_base);
+        let rtp_sender = Arc::new(RtpSenderManager::new(manager.clone()));
         Ok(Arc::new(Self {
             socket,
             config,
             rtp,
+            media_manager: manager,
+            rtp_sender,
             devices: DashMap::new(),
             pending: DashMap::new(),
             active: DashMap::new(),
@@ -478,7 +545,128 @@ impl SipServer {
                 device_id: device_id.to_string(),
                 channel_id: channel_id.to_string(),
                 media_port,
+                kind: InviteKind::Play,
+                dialog_from: format!("{from};tag={tag}"),
+                dialog_to: to,
             },
+        );
+        Ok(media_port)
+    }
+
+    /// Start a GB28181 voice-talk dialog. The selected local media source must
+    /// expose a G.711 A-law or mu-law audio track; after the device accepts the
+    /// SIP INVITE, audio is sent as RTP ES to the endpoint in its SDP answer.
+    pub async fn start_talk(
+        &self,
+        device_id: &str,
+        channel_id: &str,
+        vhost: &str,
+        app: &str,
+        stream: &str,
+    ) -> anyhow::Result<u16> {
+        let device = self.registered(device_id)?;
+        if self.active.iter().any(|entry| {
+            entry.value().channel_id == channel_id
+                && matches!(&entry.value().kind, InviteKind::Talk(_))
+        }) || self.pending.iter().any(|entry| {
+            entry.value().channel_id == channel_id
+                && matches!(&entry.value().kind, InviteKind::Talk(_))
+        }) {
+            anyhow::bail!("voice talk is already active or pending for channel {channel_id}");
+        }
+        let source = self
+            .media_manager
+            .get(vhost, app, stream)
+            .ok_or_else(|| anyhow::anyhow!("talk audio source not found"))?;
+        let info = source.info.read().await;
+        let codec = info.tracks.iter().find_map(|track| match track {
+            TrackInfo::Audio(audio) if matches!(audio.codec, CodecId::G711A | CodecId::G711U) => {
+                Some(audio.codec)
+            }
+            _ => None,
+        });
+        drop(info);
+        let codec = codec.ok_or_else(|| {
+            anyhow::anyhow!("talk source must contain a G.711A or G.711U audio track")
+        })?;
+        let (payload_type, encoding) = if codec == CodecId::G711U {
+            (0u8, "PCMU")
+        } else {
+            (8u8, "PCMA")
+        };
+        let media_port = self.rtp_port_for_invite();
+        let ssrc = gen_ssrc(&format!("talk-{channel_id}"));
+        let call_id = format!("{}@{}", gen_tag(), self.host());
+        let branch = format!("z9hG4bK{}", gen_tag());
+        let tag = gen_tag();
+        let host = self.host();
+        let from = format!("<sip:{}@{}>", self.config.realm, host);
+        let to = format!("<sip:{}@{}>", device_id, device.addr.ip());
+        let sdp = format!(
+            "v=0\r\n\
+             o={} 0 0 IN IP4 {}\r\n\
+             s=Talk\r\n\
+             c=IN IP4 {}\r\n\
+             t=0 0\r\n\
+             m=audio {} RTP/AVP {}\r\n\
+             a=rtpmap:{} {}/8000\r\n\
+             a=sendonly\r\n\
+             y={:09}\r\n",
+            self.config.realm, host, host, media_port, payload_type, payload_type, encoding, ssrc
+        );
+        let invite = format!(
+            "INVITE sip:{}@{}:{} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP {};branch={}\r\n\
+             From: {};tag={}\r\n\
+             To: {}\r\n\
+             Call-ID: {}\r\n\
+             CSeq: 1 INVITE\r\n\
+             Contact: <sip:{}@{}:{}>\r\n\
+             Content-Type: application/sdp\r\n\
+             Max-Forwards: 70\r\n\
+             Subject: {}\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            channel_id,
+            device.addr.ip(),
+            device.addr.port(),
+            host,
+            branch,
+            from,
+            tag,
+            to,
+            call_id,
+            self.config.realm,
+            host,
+            self.config.sip_port,
+            channel_id,
+            sdp.len(),
+            sdp
+        );
+        self.socket.send_to(invite.as_bytes(), device.addr).await?;
+        self.pending.insert(
+            call_id,
+            InviteCtx {
+                device_id: device_id.to_string(),
+                channel_id: channel_id.to_string(),
+                media_port,
+                kind: InviteKind::Talk(TalkCtx {
+                    vhost: vhost.to_string(),
+                    app: app.to_string(),
+                    stream: stream.to_string(),
+                    codec,
+                    payload_type,
+                    ssrc,
+                }),
+                dialog_from: format!("{from};tag={tag}"),
+                dialog_to: to,
+            },
+        );
+        info!(
+            device = device_id,
+            channel = channel_id,
+            stream,
+            media_port,
+            "gb28181 talk invite sent"
         );
         Ok(media_port)
     }
@@ -608,6 +796,7 @@ impl SipServer {
         via: &str,
         cseq: &str,
     ) {
+        let cseq_number = cseq.split_whitespace().next().unwrap_or("1");
         let ack = format!(
             "ACK sip:{}@{}:{} SIP/2.0\r\n\
              Via: {}\r\n\
@@ -624,15 +813,9 @@ impl SipServer {
             from,
             to,
             call_id,
-            cseq
+            cseq_number
         );
         let _ = self.socket.try_send_to(ack.as_bytes(), addr);
-        self.active.insert(call_id.to_string(), ctx.clone());
-        info!(
-            channel = ctx.channel_id,
-            media_port = ctx.media_port,
-            "gb28181 stream active"
-        );
     }
 
     fn handle_register(&self, addr: SocketAddr, msg: &SipMessage) {
@@ -841,6 +1024,9 @@ impl SipServer {
                     device_id,
                     channel_id: stream.clone(),
                     media_port,
+                    kind: InviteKind::Play,
+                    dialog_from: format!("{to};tag={tag}"),
+                    dialog_to: from.clone(),
                 },
             );
         }
@@ -882,14 +1068,14 @@ impl SipServer {
         let via = msg.get("via").cloned().unwrap_or_default();
         let tag = gen_tag();
         if let Some((_, ctx)) = self.active.remove(&call_id) {
-            self.rtp.close(ctx.media_port);
+            self.stop_media(&ctx);
             info!(
                 channel = ctx.channel_id,
                 media_port = ctx.media_port,
                 "gb28181 stream stopped"
             );
         } else if let Some((_, ctx)) = self.pending.remove(&call_id) {
-            self.rtp.close(ctx.media_port);
+            self.stop_media(&ctx);
         }
         self.send_response(
             addr,
@@ -905,24 +1091,83 @@ impl SipServer {
         );
     }
 
-    fn handle_response(&self, addr: SocketAddr, msg: &SipMessage) {
+    async fn handle_response(&self, addr: SocketAddr, msg: &SipMessage) {
         let call_id = match msg.get("call-id") {
             Some(c) => c.clone(),
             None => return,
         };
         let status = msg.status.unwrap_or(0);
         if status >= 200 {
-            if let Some(ctx) = self.pending.remove(&call_id).map(|(_, c)| c) {
+            if let Some(mut ctx) = self.pending.remove(&call_id).map(|(_, c)| c) {
                 if status == 200 {
                     let to = msg.get("to").cloned().unwrap_or_default();
                     let from = msg.get("from").cloned().unwrap_or_default();
                     let via = msg.get("via").cloned().unwrap_or_default();
                     let cseq = msg.get("cseq").cloned().unwrap_or_default();
                     self.ack(addr, &ctx, &call_id, &to, &from, &via, &cseq);
+                    ctx.dialog_from = from;
+                    ctx.dialog_to = to;
+                    match &ctx.kind {
+                        InviteKind::Play => {
+                            self.active.insert(call_id.clone(), ctx.clone());
+                            info!(
+                                channel = ctx.channel_id,
+                                media_port = ctx.media_port,
+                                "gb28181 stream active"
+                            );
+                        }
+                        InviteKind::Talk(talk) => {
+                            let destination = match talk_destination(
+                                &msg.body,
+                                addr,
+                                talk.payload_type,
+                            ) {
+                                Ok(destination) => destination,
+                                Err(error) => {
+                                    warn!(channel = ctx.channel_id, %error, "gb28181 talk SDP rejected");
+                                    return;
+                                }
+                            };
+                            let request = RtpSendRequest {
+                                vhost: talk.vhost.clone(),
+                                app: talk.app.clone(),
+                                stream: talk.stream.clone(),
+                                ssrc: talk.ssrc,
+                                dst_host: destination.ip().to_string(),
+                                dst_port: destination.port(),
+                                src_port: ctx.media_port,
+                                payload_type: talk.payload_type,
+                                is_udp: true,
+                                data_type: RtpDataType::Es,
+                                only_audio: true,
+                                passive: false,
+                                ssrc_multi_send: false,
+                            };
+                            match self.rtp_sender.start(request).await {
+                                Ok(local_port) => {
+                                    self.active.insert(call_id.clone(), ctx.clone());
+                                    info!(channel = ctx.channel_id, %destination, local_port, "gb28181 talk active");
+                                }
+                                Err(error) => {
+                                    warn!(channel = ctx.channel_id, %error, "failed to start gb28181 talk RTP");
+                                }
+                            }
+                        }
+                    }
                 } else {
-                    self.rtp.close(ctx.media_port);
+                    self.stop_media(&ctx);
                     warn!(channel = ctx.channel_id, status, "gb28181 invite rejected");
                 }
+            }
+        }
+    }
+
+    fn stop_media(&self, ctx: &InviteCtx) {
+        match &ctx.kind {
+            InviteKind::Play => self.rtp.close(ctx.media_port),
+            InviteKind::Talk(talk) => {
+                self.rtp_sender
+                    .stop(&talk.vhost, &talk.app, &talk.stream, Some(talk.ssrc));
             }
         }
     }
@@ -938,7 +1183,7 @@ impl SipServer {
                 .collect();
             for call_id in to_close {
                 if let Some((_, ctx)) = self.active.remove(&call_id) {
-                    self.rtp.close(ctx.media_port);
+                    self.stop_media(&ctx);
                 }
             }
             warn!(device = device_id, reason, "gb28181 device offline");
@@ -995,7 +1240,7 @@ impl SipServer {
                                 _ => debug!(method, "unhandled sip method"),
                             }
                         } else {
-                            self.handle_response(addr, &msg);
+                            self.handle_response(addr, &msg).await;
                         }
                     }
                 }
@@ -1057,18 +1302,54 @@ impl SipServer {
     /// given channel id, and close the local RTP port. Best-effort: returns
     /// `false` when no such stream exists.
     pub fn bye_stream(&self, channel_id: &str) -> bool {
+        self.bye_dialog(channel_id, false)
+    }
+
+    /// Stop an active voice-talk dialog and its RTP sender.
+    pub fn stop_talk(&self, channel_id: &str) -> bool {
+        self.bye_dialog(channel_id, true)
+    }
+
+    pub fn list_talks(&self) -> Vec<TalkInfo> {
+        self.active
+            .iter()
+            .filter_map(|entry| {
+                let InviteKind::Talk(talk) = &entry.value().kind else {
+                    return None;
+                };
+                Some(TalkInfo {
+                    device_id: entry.value().device_id.clone(),
+                    channel_id: entry.value().channel_id.clone(),
+                    vhost: talk.vhost.clone(),
+                    app: talk.app.clone(),
+                    stream: talk.stream.clone(),
+                    codec: format!("{:?}", talk.codec),
+                    ssrc: talk.ssrc,
+                    local_port: entry.value().media_port,
+                })
+            })
+            .collect()
+    }
+
+    fn bye_dialog(&self, channel_id: &str, talk: bool) -> bool {
         let entry = self
             .active
             .iter()
-            .find(|e| e.value().channel_id == channel_id)
+            .find(|entry| {
+                entry.value().channel_id == channel_id
+                    && matches!(
+                        (&entry.value().kind, talk),
+                        (InviteKind::Talk(_), true) | (InviteKind::Play, false)
+                    )
+            })
             .map(|e| (e.key().clone(), e.value().clone()));
         if let Some((call_id, ctx)) = entry {
             if let Some(device) = self.devices.get(&ctx.device_id) {
                 let msg = format!(
                     "BYE sip:{}@{}:{} SIP/2.0\r\n\
                      Via: SIP/2.0/UDP {};branch=z9hG4bK{}\r\n\
-                     From: <sip:{}@{}>;tag={}\r\n\
-                     To: <sip:{}@{}>\r\n\
+                     From: {}\r\n\
+                     To: {}\r\n\
                      Call-ID: {}\r\n\
                      CSeq: 2 BYE\r\n\
                      Max-Forwards: 70\r\n\
@@ -1078,18 +1359,18 @@ impl SipServer {
                     device.addr.port(),
                     self.host(),
                     gen_tag(),
-                    self.config.realm,
-                    self.host(),
-                    gen_tag(),
-                    ctx.device_id,
-                    device.addr.ip(),
+                    ctx.dialog_from,
+                    ctx.dialog_to,
                     call_id
                 );
                 let _ = self.socket.try_send_to(msg.as_bytes(), device.addr);
             }
             self.active.remove(&call_id);
-            self.rtp.close(ctx.media_port);
-            info!(channel = channel_id, "gb28181 bye sent, stream stopped");
+            self.stop_media(&ctx);
+            info!(
+                channel = channel_id,
+                talk, "gb28181 bye sent, media stopped"
+            );
             return true;
         }
         false
@@ -1224,6 +1505,17 @@ mod tests {
             Some("34020000001320000001".to_string())
         );
         assert_eq!(uri_user("sip:dev@host"), Some("dev".to_string()));
+    }
+
+    #[test]
+    fn test_talk_destination_parses_audio_answer() {
+        let fallback: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let answer = "v=0\r\nc=IN IP4 192.0.2.10\r\nm=audio 30000 RTP/AVP 8\r\n";
+        assert_eq!(
+            talk_destination(answer, fallback, 8).unwrap(),
+            "192.0.2.10:30000".parse().unwrap()
+        );
+        assert!(talk_destination(answer, fallback, 0).is_err());
     }
 
     #[test]
@@ -1439,6 +1731,148 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(server.list_devices().is_empty());
 
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_voice_talk_sip_and_rtp_roundtrip() {
+        use bytes::Bytes;
+        use zlmediakit_core::media_frame::{AudioInfo, MediaFrame, PayloadFormat};
+
+        let mgr = Arc::new(MediaSourceManager::new(None));
+        let source = mgr.get_or_create("__defaultVhost__", "talk", "mic");
+        source
+            .info
+            .write()
+            .await
+            .tracks
+            .push(TrackInfo::Audio(AudioInfo {
+                codec: CodecId::G711A,
+                sample_rate: 8_000,
+                channels: 1,
+                bits_per_sample: 8,
+            }));
+        let cfg = SipServerConfig {
+            sip_port: 0,
+            realm: "3402000000".to_string(),
+            password: None,
+            host: Some("127.0.0.1".to_string()),
+            media_port_base: 24000,
+            vhost: "__defaultVhost__".to_string(),
+        };
+        let server = SipServer::new(cfg, mgr, 24000).await.unwrap();
+        let sip_addr = server.socket.local_addr().unwrap();
+        let run = server.clone();
+        let handle = tokio::spawn(async move { run.run().await });
+        let device = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let device_addr = device.local_addr().unwrap();
+        let mut sip_buf = [0u8; 4096];
+
+        device
+            .send_to(
+                sip_msg(
+                    "REGISTER",
+                    device_addr,
+                    sip_addr.port(),
+                    "talk-device@host",
+                    1,
+                    "3600",
+                    "",
+                )
+                .as_bytes(),
+                sip_addr,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), device.recv_from(&mut sip_buf))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let local_port = server
+            .start_talk(
+                "34020000001320000001",
+                "34020000001320000002",
+                "__defaultVhost__",
+                "talk",
+                "mic",
+            )
+            .await
+            .unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), device.recv_from(&mut sip_buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let invite = parse_sip(&sip_buf[..n]).expect("talk INVITE");
+        assert_eq!(invite.method.as_deref(), Some("INVITE"));
+        assert_eq!(sdp_value(&invite.body, "s="), Some("Talk".to_string()));
+        assert!(invite.body.contains("m=audio"));
+        assert!(invite.body.contains("a=sendonly"));
+
+        let rtp_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_port = rtp_receiver.local_addr().unwrap().port();
+        let answer = format!(
+            "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio {rtp_port} RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\na=recvonly\r\n"
+        );
+        let response = format!(
+            "SIP/2.0 200 OK\r\nVia: {}\r\nFrom: {}\r\nTo: {};tag=device\r\nCall-ID: {}\r\nCSeq: 1 INVITE\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
+            invite.get("via").unwrap(),
+            invite.get("from").unwrap(),
+            invite.get("to").unwrap(),
+            invite.get("call-id").unwrap(),
+            answer.len(),
+            answer
+        );
+        device.send_to(response.as_bytes(), sip_addr).await.unwrap();
+        let (ack_len, _) =
+            tokio::time::timeout(Duration::from_secs(2), device.recv_from(&mut sip_buf))
+                .await
+                .unwrap()
+                .unwrap();
+        let ack = String::from_utf8_lossy(&sip_buf[..ack_len]);
+        assert!(ack.starts_with("ACK "));
+        assert!(ack.contains("CSeq: 1 ACK"));
+
+        for _ in 0..20 {
+            if !server.list_talks().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.list_talks().len(), 1);
+        assert_eq!(server.list_talks()[0].local_port, local_port);
+        source
+            .publish_and_cache(
+                MediaFrame::new_audio(
+                    1,
+                    CodecId::G711A,
+                    20,
+                    20,
+                    20,
+                    Bytes::from_static(&[0xD5; 160]),
+                )
+                .with_payload_format(PayloadFormat::Raw),
+            )
+            .await;
+        let mut rtp_buf = [0u8; 512];
+        let (rtp_len, _) =
+            tokio::time::timeout(Duration::from_secs(2), rtp_receiver.recv_from(&mut rtp_buf))
+                .await
+                .expect("timed out waiting for talk RTP")
+                .expect("talk RTP receive failed");
+        assert!(rtp_len > 12);
+        assert_eq!(rtp_buf[1] & 0x7F, 8);
+        assert_eq!(&rtp_buf[12..rtp_len], &[0xD5; 160]);
+
+        assert!(server.stop_talk("34020000001320000002"));
+        let (bye_len, _) =
+            tokio::time::timeout(Duration::from_secs(2), device.recv_from(&mut sip_buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(String::from_utf8_lossy(&sip_buf[..bye_len]).starts_with("BYE "));
+        assert!(server.list_talks().is_empty());
+        assert!(server.rtp_sender.list().is_empty());
         handle.abort();
     }
 }

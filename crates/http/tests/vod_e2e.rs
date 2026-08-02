@@ -115,6 +115,7 @@ async fn vod_flv_playback_with_range_and_dir_listing() {
     let srv = HttpServer::new(HttpServerConfig {
         addr: format!("127.0.0.1:{}", port),
         source_manager: mgr.clone(),
+        rtp_sender: Arc::new(zlmediakit_core::rtp::RtpSenderManager::new(mgr.clone())),
         auth,
         hook,
         recorder: recorder.clone(),
@@ -345,6 +346,7 @@ async fn mp4_vod_flv_remux_playback() {
     let srv = HttpServer::new(HttpServerConfig {
         addr: format!("127.0.0.1:{}", port),
         source_manager: mgr.clone(),
+        rtp_sender: Arc::new(zlmediakit_core::rtp::RtpSenderManager::new(mgr.clone())),
         auth,
         hook,
         recorder: recorder.clone(),
@@ -439,6 +441,7 @@ async fn static_file_serving_from_www_root() {
     let srv = HttpServer::new(HttpServerConfig {
         addr: format!("127.0.0.1:{}", port),
         source_manager: mgr.clone(),
+        rtp_sender: Arc::new(zlmediakit_core::rtp::RtpSenderManager::new(mgr.clone())),
         auth,
         hook,
         recorder: recorder.clone(),
@@ -536,6 +539,7 @@ async fn vod_auth_rejects_without_valid_sign() {
     let srv = HttpServer::new(HttpServerConfig {
         addr: format!("127.0.0.1:{}", port),
         source_manager: mgr.clone(),
+        rtp_sender: Arc::new(zlmediakit_core::rtp::RtpSenderManager::new(mgr.clone())),
         auth,
         hook,
         recorder: recorder.clone(),

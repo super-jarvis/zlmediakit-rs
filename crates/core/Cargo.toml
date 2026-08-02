@@ -6,6 +6,7 @@ edition.workspace = true
 
 [dependencies]
 tokio.workspace = true
+socket2.workspace = true
 bytes.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

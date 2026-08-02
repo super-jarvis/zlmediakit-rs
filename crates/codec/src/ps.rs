@@ -5,6 +5,7 @@
 //! This module demuxes PS data to extract raw NAL units.
 
 use bytes::{Buf, Bytes, BytesMut};
+use std::collections::HashMap;
 
 /// Demuxed PES packet content.
 #[derive(Debug, Clone)]
@@ -25,6 +26,7 @@ pub struct PesPacket {
 /// so the caller no longer has to wait for a marker before parsing.
 pub struct PsDemuxer {
     buf: BytesMut,
+    stream_types: HashMap<u8, u8>,
     /// Max buffer size before we assume the stream is malformed and resync.
     max_buf: usize,
 }
@@ -33,6 +35,7 @@ impl PsDemuxer {
     pub fn new() -> Self {
         Self {
             buf: BytesMut::new(),
+            stream_types: HashMap::new(),
             max_buf: 4 * 1024 * 1024,
         }
     }
@@ -55,6 +58,14 @@ impl PsDemuxer {
     /// resyncs to the next start code).
     pub fn next_pes(&mut self) -> Option<PesPacket> {
         loop {
+            while let Some(length) = leading_header_len(&self.buf) {
+                if self.buf.get(3) == Some(&0xBC) {
+                    for (stream_id, stream_type) in parse_program_stream_map(&self.buf[..length]) {
+                        self.stream_types.insert(stream_id, stream_type);
+                    }
+                }
+                self.buf.advance(length);
+            }
             match parse_one_pes(&self.buf) {
                 Ok(Some((pes, consumed))) => {
                     self.buf.advance(consumed);
@@ -90,6 +101,11 @@ impl PsDemuxer {
 
     pub fn pending(&self) -> usize {
         self.buf.len()
+    }
+
+    /// Returns the MPEG stream_type declared by the latest program stream map.
+    pub fn stream_type(&self, stream_id: u8) -> Option<u8> {
+        self.stream_types.get(&stream_id).copied()
     }
 }
 
@@ -173,6 +189,36 @@ fn leading_header_len(data: &[u8]) -> Option<usize> {
 pub enum PsError {
     Incomplete,
     InvalidStartCode,
+    InvalidPesHeader,
+}
+
+fn parse_program_stream_map(data: &[u8]) -> Vec<(u8, u8)> {
+    if data.len() < 16 || !data.starts_with(&[0, 0, 1, 0xBC]) {
+        return Vec::new();
+    }
+    let map_length = u16::from_be_bytes([data[4], data[5]]) as usize;
+    let map_end = (6 + map_length).min(data.len());
+    let program_info_length = u16::from_be_bytes([data[8], data[9]]) as usize;
+    let elementary_length_offset = 10 + program_info_length;
+    if elementary_length_offset + 2 > map_end {
+        return Vec::new();
+    }
+    let elementary_length = u16::from_be_bytes([
+        data[elementary_length_offset],
+        data[elementary_length_offset + 1],
+    ]) as usize;
+    let mut offset = elementary_length_offset + 2;
+    let elementary_end = (offset + elementary_length).min(map_end.saturating_sub(4));
+    let mut streams = Vec::new();
+    while offset + 4 <= elementary_end {
+        let stream_type = data[offset];
+        let stream_id = data[offset + 1];
+        let info_length =
+            u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize & 0x0FFF;
+        streams.push((stream_id, stream_type));
+        offset += 4 + info_length;
+    }
+    streams
 }
 
 /// Parses a single PES packet from a buffer of PS data.
@@ -252,22 +298,14 @@ fn parse_pes_packet(data: &[u8]) -> Result<Option<(PesPacket, usize)>, PsError> 
         return Ok(None);
     }
 
-    let mut pos = 6; // after packet length field
-
-    // Check PTS/DTS flags
-    let pts_dts_flags = if pos < data.len() {
-        (data[pos] >> 6) & 0x03
-    } else {
-        0
-    };
-    let pes_hdr_data_len = if pos + 1 < data.len() {
-        data[pos + 1] as usize
-    } else {
-        0
-    };
-
-    // Skip flags + PES header data length byte
-    pos += 2;
+    // MPEG-2 PES optional header: marker/scrambling flags, PTS/DTS flags,
+    // then PES_header_data_length.
+    if data[6] & 0xc0 != 0x80 {
+        return Err(PsError::InvalidPesHeader);
+    }
+    let pts_dts_flags = (data[7] >> 6) & 0x03;
+    let pes_hdr_data_len = data[8] as usize;
+    let mut pos = 9;
     let hdr_end = pos + pes_hdr_data_len;
     if hdr_end > data.len() {
         return Ok(None);
@@ -426,13 +464,14 @@ mod tests {
         data.extend_from_slice(&[0x01, 0x02, 0x03, 0xF8]); // mux_rate(3) + stuffing_len=0
                                                            // PES video
         let pes_payload = vec![0x00, 0x00, 0x00, 0x01, 0x09, 0x10, 0x20, 0x30];
-        let pes_len = 7 + pes_payload.len(); // flags(1) + hdr_len(1) + PTS(5) + payload
+        let pes_len = 8 + pes_payload.len(); // flags(2) + hdr_len(1) + PTS(5) + payload
         data.push(0x00);
         data.push(0x00);
         data.push(0x01);
         data.push(0xE0); // stream_id = video
         data.extend_from_slice(&(pes_len as u16).to_be_bytes());
-        // Flags: PTS present, PES header data length = 5
+        // Flags: MPEG-2 PES, PTS present, PES header data length = 5
+        data.push(0x80); // MPEG-2 marker bits, no scrambling
         data.push(0x80); // PTS only
         data.push(0x05); // PES hdr data len = 5
                          // PTS (5 bytes)
@@ -471,6 +510,7 @@ mod tests {
     fn build_pes(stream_id: u8, pes_packet_len: u16, payload: &[u8]) -> Vec<u8> {
         let mut data = vec![0x00, 0x00, 0x01, stream_id];
         data.extend_from_slice(&pes_packet_len.to_be_bytes());
+        data.push(0x80); // MPEG-2 marker bits, no scrambling
         data.push(0x80); // PTS only
         data.push(0x05); // PES hdr data len = 5
         data.extend_from_slice(&[0x21, 0x00, 0x01, 0x00, 0x01]); // PTS
@@ -522,7 +562,7 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&PACK_HEADER);
         let payload = vec![0x00, 0x00, 0x00, 0x01, 0x09, 0x10, 0x20, 0x30, 0x40];
-        data.extend_from_slice(&build_pes(0xE0, (7 + payload.len()) as u16, &payload));
+        data.extend_from_slice(&build_pes(0xE0, (8 + payload.len()) as u16, &payload));
 
         let mut demuxer = PsDemuxer::new();
         let mut out = Vec::new();
@@ -583,12 +623,25 @@ mod tests {
     }
 
     #[test]
+    fn ps_demuxer_retains_program_stream_map_types() {
+        let mut bytes = vec![
+            0, 0, 1, 0xBC, 0, 14, 0xE0, 0xFF, 0, 0, 0, 4, 0x0F, 0xC0, 0, 0, 0, 0, 0, 0,
+        ];
+        bytes.extend_from_slice(&[0, 0, 1, 0xC0, 0, 7, 0x80, 0, 0, 0xFF, 0xF1, 0x50, 0x80]);
+        let mut demuxer = PsDemuxer::new();
+        demuxer.push(&bytes);
+        let packet = demuxer.next_pes().expect("audio PES");
+        assert_eq!(packet.stream_id, 0xC0);
+        assert_eq!(demuxer.stream_type(0xC0), Some(0x0F));
+    }
+
+    #[test]
     fn ps_demuxer_resync() {
         // Garbage prefix before valid PS data should be skipped.
         let mut data = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x01, 0x09, 0xFF];
         data.extend_from_slice(&PACK_HEADER);
         let payload = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x01, 0x02];
-        data.extend_from_slice(&build_pes(0xE0, (7 + payload.len()) as u16, &payload));
+        data.extend_from_slice(&build_pes(0xE0, (8 + payload.len()) as u16, &payload));
         data.extend_from_slice(&PACK_HEADER);
 
         let mut demuxer = PsDemuxer::new();

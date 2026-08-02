@@ -11,13 +11,14 @@ use zlmediakit_core::ffmpeg_source::FFmpegSourceControl;
 use zlmediakit_core::hook::HookResult;
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::recorder::RecorderControl;
+use zlmediakit_core::rtp::{RtpDataType, RtpSendRequest, RtpSenderManager};
 use zlmediakit_core::session::SessionManager;
 use zlmediakit_core::stream_proxy::StreamProxyControl;
 use zlmediakit_core::stream_pusher::StreamPusherControl;
 use zlmediakit_core::transport::TransportStream;
 use zlmediakit_hls::muxer::{self, HlsSegment};
 use zlmediakit_hls::TsLiveMuxer;
-use zlmediakit_srt::{RtpPayloadType, RtpServerManager, SipServer};
+use zlmediakit_srt::{RtpPayloadType, RtpServerManager, RtpTcpMode, SipServer};
 use zlmediakit_transcode::{TranscodeConfig, TranscodeManager};
 
 use crate::ws::{upgrade_response, WsSession};
@@ -47,6 +48,7 @@ pub struct HttpSession {
     stream: TransportStream,
     peer_addr: String,
     source_manager: Arc<MediaSourceManager>,
+    rtp_sender: Arc<RtpSenderManager>,
     auth: Arc<StreamAuth>,
     hook: Arc<zlmediakit_core::hook::HookClient>,
     recorder: Arc<RecorderControl>,
@@ -68,6 +70,7 @@ impl HttpSession {
         stream: TransportStream,
         peer_addr: String,
         source_manager: Arc<MediaSourceManager>,
+        rtp_sender: Arc<RtpSenderManager>,
         auth: Arc<StreamAuth>,
         hook: Arc<zlmediakit_core::hook::HookClient>,
         recorder: Arc<RecorderControl>,
@@ -85,6 +88,7 @@ impl HttpSession {
             stream,
             peer_addr,
             source_manager,
+            rtp_sender,
             auth,
             hook,
             recorder,
@@ -222,6 +226,11 @@ impl HttpSession {
 
         let www_root = self.www_root.clone();
         if route.starts_with("/index/api/") {
+            if !self.is_api_authorized(path, &request_str) {
+                warn!("HTTP API authentication failed from {}", self.peer_addr);
+                self.send_api_unauthorized().await?;
+                return Ok(());
+            }
             self.handle_api(path).await?;
         } else if route.starts_with("/record/") {
             self.handle_vod(path, &request_str).await?;
@@ -1575,8 +1584,14 @@ impl HttpSession {
                 let cfg = zlmediakit_core::config::runtime_config_snapshot();
                 let mut entries: Vec<serde_json::Value> = Vec::new();
                 for (k, v) in cfg.iter() {
-                    entries.push(serde_json::json!({ "key": k, "value": v }));
+                    let value = if Self::is_secret_config_key(k) {
+                        "******"
+                    } else {
+                        v
+                    };
+                    entries.push(serde_json::json!({ "key": k, "value": value }));
                 }
+                let secret_configured = !self.auth.secret.is_empty();
                 self.send_json(&serde_json::json!({
                     "code": 0,
                     "server": "zlmediakit-rs",
@@ -1586,12 +1601,26 @@ impl HttpSession {
                         "data": entries,
                         "api": {
                             "apiDebug": cfg.get("api.apiDebug").cloned().unwrap_or_default(),
-                            "secret": cfg.get("api.secret").cloned().unwrap_or_default(),
+                            "secret": "******",
+                            "secretConfigured": secret_configured,
                             "port": cfg.get("api.port").cloned().unwrap_or_default(),
                         },
                         "rtmp": { "port": cfg.get("rtmp.port").cloned().unwrap_or_default() },
                         "rtsp": { "port": cfg.get("rtsp.port").cloned().unwrap_or_default() },
                         "http": { "port": cfg.get("http.port").cloned().unwrap_or_default() },
+                        "webrtc": {
+                            "enabled": cfg.get("webrtc.enabled").cloned().unwrap_or_default(),
+                            "port": cfg.get("webrtc.port").cloned().unwrap_or_default(),
+                        },
+                        "srt": {
+                            "enabled": cfg.get("srt.enabled").cloned().unwrap_or_default(),
+                            "port": cfg.get("srt.port").cloned().unwrap_or_default(),
+                        },
+                        "gb28181": {
+                            "enabled": cfg.get("gb28181.enabled").cloned().unwrap_or_default(),
+                            "sipPort": cfg.get("gb28181.sip_port").cloned().unwrap_or_default(),
+                            "mediaPort": cfg.get("gb28181.media_port").cloned().unwrap_or_default(),
+                        },
                         "record": {
                             "path": cfg.get("record.path").cloned().unwrap_or_default(),
                             "hls": cfg.get("record.hls").cloned().unwrap_or_default(),
@@ -1696,11 +1725,19 @@ impl HttpSession {
                     "delFFmpegSource",
                     "getFFmpegSourceList",
                     "openRtpServer",
+                    "connectRtpServer",
                     "closeRtpServer",
                     "listRtpServer",
                     "getRtpInfo",
+                    "startSendRtp",
+                    "startSendRtpPassive",
+                    "listRtpSender",
+                    "stopSendRtp",
                     "startRtp",
                     "stopRtp",
+                    "startTalk",
+                    "stopTalk",
+                    "getTalkList",
                     "queryCatalog",
                     "queryDeviceInfo",
                     "getDeviceList",
@@ -2463,16 +2500,39 @@ impl HttpSession {
                     let payload = q
                         .get("type")
                         .map(|s| RtpPayloadType::parse(s))
-                        .unwrap_or(RtpPayloadType::Ps);
+                        .unwrap_or(RtpPayloadType::Auto);
+                    let tcp_mode = q
+                        .get("tcp_mode")
+                        .and_then(|value| value.parse::<u8>().ok())
+                        .unwrap_or(0);
                     let vhost = q
                         .get("vhost")
                         .map(|s| s.as_str())
                         .unwrap_or("__defaultVhost__")
                         .to_string();
-                    match rtp.open(port, &vhost, &app, &stream, payload, ssrc).await {
+                    let tcp_mode = match RtpTcpMode::try_from(tcp_mode) {
+                        Ok(mode) => mode,
+                        Err(error) => {
+                            let _ = self
+                                .send_json(&serde_json::json!({
+                                    "code": -1,
+                                    "msg": error.to_string()
+                                }))
+                                .await;
+                            return Ok(());
+                        }
+                    };
+                    match rtp
+                        .open_with_mode(port, &vhost, &app, &stream, payload, ssrc, tcp_mode)
+                        .await
+                    {
                         Ok(p) => {
                             let _ = self
-                                .send_json(&serde_json::json!({"code": 0, "result": p}))
+                                .send_json(&serde_json::json!({
+                                    "code": 0,
+                                    "port": p,
+                                    "result": p
+                                }))
                                 .await;
                         }
                         Err(e) => {
@@ -2485,6 +2545,53 @@ impl HttpSession {
                     let _ = self
                         .send_json(&serde_json::json!({"code": -1, "msg": "rtp server disabled"}))
                         .await;
+                }
+            }
+            "connectRtpServer" => {
+                if let Some(rtp) = &self.rtp {
+                    let q = Self::parse_query(path);
+                    let stream = q
+                        .get("stream_id")
+                        .cloned()
+                        .or_else(|| q.get("stream").cloned())
+                        .unwrap_or_default();
+                    let app = q.get("app").map(String::as_str);
+                    let dst_host = q.get("dst_url").cloned().unwrap_or_default();
+                    let dst_port = q
+                        .get("dst_port")
+                        .and_then(|value| value.parse::<u16>().ok())
+                        .unwrap_or(0);
+                    if stream.is_empty() || dst_host.is_empty() || dst_port == 0 {
+                        self.send_json(&serde_json::json!({
+                            "code": -300,
+                            "msg": "stream_id, dst_url and dst_port are required"
+                        }))
+                        .await?;
+                        return Ok(());
+                    }
+                    match rtp.connect_stream(app, &stream, &dst_host, dst_port).await {
+                        Ok(local_port) => {
+                            self.send_json(&serde_json::json!({
+                                "code": 0,
+                                "local_port": local_port,
+                                "result": true
+                            }))
+                            .await?;
+                        }
+                        Err(error) => {
+                            self.send_json(&serde_json::json!({
+                                "code": -1,
+                                "msg": error.to_string()
+                            }))
+                            .await?;
+                        }
+                    }
+                } else {
+                    self.send_json(&serde_json::json!({
+                        "code": -1,
+                        "msg": "rtp server disabled"
+                    }))
+                    .await?;
                 }
             }
             "closeRtpServer" => {
@@ -2526,6 +2633,186 @@ impl HttpSession {
                         .send_json(&serde_json::json!({"code": -1, "msg": "rtp server disabled"}))
                         .await;
                 }
+            }
+            "startSendRtp" | "startSendRtpPassive" => {
+                let q = Self::parse_query(path);
+                let passive = api == "startSendRtpPassive";
+                let vhost = q
+                    .get("vhost")
+                    .cloned()
+                    .unwrap_or_else(|| "__defaultVhost__".to_string());
+                let app = q.get("app").cloned().unwrap_or_else(|| "live".to_string());
+                let stream = q.get("stream").cloned().unwrap_or_default();
+                let dst_host = q.get("dst_url").cloned().unwrap_or_default();
+                let dst_port = q
+                    .get("dst_port")
+                    .and_then(|value| value.parse::<u16>().ok());
+                let ssrc = q.get("ssrc").and_then(|value| {
+                    value
+                        .strip_prefix("0x")
+                        .or_else(|| value.strip_prefix("0X"))
+                        .map_or_else(
+                            || value.parse::<u32>().ok(),
+                            |hex| u32::from_str_radix(hex, 16).ok(),
+                        )
+                });
+                if stream.is_empty()
+                    || ssrc.is_none()
+                    || (!passive && (dst_host.is_empty() || dst_port.is_none()))
+                {
+                    self.send_json(&serde_json::json!({
+                        "code": -300,
+                        "msg": if passive {
+                            "stream and ssrc are required"
+                        } else {
+                            "stream, ssrc, dst_url and dst_port are required"
+                        }
+                    }))
+                    .await?;
+                    return Ok(());
+                }
+                let data_type_value = if let Some(value) = q.get("use_ps") {
+                    if value == "1" || value.eq_ignore_ascii_case("true") {
+                        1
+                    } else {
+                        0
+                    }
+                } else {
+                    q.get("type")
+                        .and_then(|value| value.parse::<u8>().ok())
+                        .unwrap_or(1)
+                };
+                let data_type = match RtpDataType::try_from(data_type_value) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.send_json(&serde_json::json!({
+                            "code": -300,
+                            "msg": error.to_string()
+                        }))
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                let request = RtpSendRequest {
+                    vhost,
+                    app,
+                    stream,
+                    ssrc: ssrc.expect("validated above"),
+                    dst_host,
+                    dst_port: dst_port.unwrap_or(0),
+                    src_port: q
+                        .get("src_port")
+                        .and_then(|value| value.parse::<u16>().ok())
+                        .unwrap_or(0),
+                    payload_type: q
+                        .get("pt")
+                        .and_then(|value| value.parse::<u8>().ok())
+                        .unwrap_or(96),
+                    is_udp: if passive {
+                        false
+                    } else {
+                        q.get("is_udp")
+                            .is_none_or(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                    },
+                    data_type,
+                    only_audio: q
+                        .get("only_audio")
+                        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+                    passive,
+                    ssrc_multi_send: q
+                        .get("ssrc_multi_send")
+                        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+                };
+                match self.rtp_sender.start(request).await {
+                    Ok(local_port) => {
+                        self.send_json(&serde_json::json!({
+                            "code": 0,
+                            "local_port": local_port
+                        }))
+                        .await?;
+                    }
+                    Err(error) => {
+                        self.send_json(&serde_json::json!({
+                            "code": -1,
+                            "msg": error.to_string()
+                        }))
+                        .await?;
+                    }
+                }
+            }
+            "listRtpSender" => {
+                let q = Self::parse_query(path);
+                let vhost = q
+                    .get("vhost")
+                    .map(String::as_str)
+                    .unwrap_or("__defaultVhost__");
+                let app = q.get("app").map(String::as_str).unwrap_or("live");
+                let stream = q.get("stream").map(String::as_str).unwrap_or("");
+                if stream.is_empty() {
+                    self.send_json(&serde_json::json!({
+                        "code": -300,
+                        "msg": "stream is required"
+                    }))
+                    .await?;
+                    return Ok(());
+                }
+                let senders: Vec<_> = self
+                    .rtp_sender
+                    .list()
+                    .into_iter()
+                    .filter(|sender| {
+                        sender.vhost == vhost && sender.app == app && sender.stream == stream
+                    })
+                    .collect();
+                let data: Vec<String> = senders
+                    .iter()
+                    .map(|sender| sender.ssrc.to_string())
+                    .collect();
+                let details: Vec<_> = senders
+                    .iter()
+                    .map(|sender| {
+                        serde_json::json!({
+                            "ssrc": sender.ssrc.to_string(),
+                            "destination": sender.destination.map(|value| value.to_string()),
+                            "local_port": sender.local_port,
+                            "packets": sender.packets,
+                            "totalBytes": sender.bytes,
+                        })
+                    })
+                    .collect();
+                let total_bytes: u64 = senders.iter().map(|sender| sender.bytes).sum();
+                self.send_json(&serde_json::json!({
+                    "code": 0,
+                    "data": data,
+                    "details": details,
+                    "bytesSpeed": 0,
+                    "totalBytes": total_bytes,
+                }))
+                .await?;
+            }
+            "stopSendRtp" => {
+                let q = Self::parse_query(path);
+                let vhost = q
+                    .get("vhost")
+                    .map(String::as_str)
+                    .unwrap_or("__defaultVhost__");
+                let app = q.get("app").map(String::as_str).unwrap_or("live");
+                let stream = q.get("stream").map(String::as_str).unwrap_or("");
+                if stream.is_empty() {
+                    self.send_json(&serde_json::json!({
+                        "code": -300,
+                        "msg": "stream is required"
+                    }))
+                    .await?;
+                    return Ok(());
+                }
+                let ssrc = q.get("ssrc").and_then(|value| value.parse::<u32>().ok());
+                let stopped = self.rtp_sender.stop(vhost, app, stream, ssrc);
+                self.send_json(&serde_json::json!({
+                    "code": 0,
+                    "stopped": stopped
+                }))
+                .await?;
             }
             "startRtp" => {
                 if let Some(sip) = &self.sip {
@@ -2576,6 +2863,85 @@ impl HttpSession {
                     let _ = self
                         .send_json(&serde_json::json!({"code": -1, "msg": "rtp server disabled"}))
                         .await;
+                }
+            }
+            "startTalk" => {
+                if let Some(sip) = &self.sip {
+                    let q = Self::parse_query(path);
+                    let device_id = q.get("device_id").cloned().unwrap_or_default();
+                    let channel_id = q.get("channel_id").cloned().unwrap_or_default();
+                    let vhost = q
+                        .get("vhost")
+                        .map(String::as_str)
+                        .unwrap_or("__defaultVhost__");
+                    let app = q.get("app").map(String::as_str).unwrap_or("live");
+                    let stream = q.get("stream").map(String::as_str).unwrap_or("");
+                    if device_id.is_empty() || channel_id.is_empty() || stream.is_empty() {
+                        self.send_json(&serde_json::json!({
+                            "code": -300,
+                            "msg": "device_id, channel_id and stream are required"
+                        }))
+                        .await?;
+                        return Ok(());
+                    }
+                    match sip
+                        .start_talk(&device_id, &channel_id, vhost, app, stream)
+                        .await
+                    {
+                        Ok(local_port) => {
+                            self.send_json(&serde_json::json!({
+                                "code": 0,
+                                "local_port": local_port
+                            }))
+                            .await?;
+                        }
+                        Err(error) => {
+                            self.send_json(&serde_json::json!({
+                                "code": -1,
+                                "msg": error.to_string()
+                            }))
+                            .await?;
+                        }
+                    }
+                } else {
+                    self.send_json(&serde_json::json!({
+                        "code": -1,
+                        "msg": "gb28181 disabled"
+                    }))
+                    .await?;
+                }
+            }
+            "stopTalk" => {
+                if let Some(sip) = &self.sip {
+                    let q = Self::parse_query(path);
+                    let channel_id = q.get("channel_id").cloned().unwrap_or_default();
+                    let stopped = !channel_id.is_empty() && sip.stop_talk(&channel_id);
+                    self.send_json(&serde_json::json!({
+                        "code": 0,
+                        "stopped": stopped
+                    }))
+                    .await?;
+                } else {
+                    self.send_json(&serde_json::json!({
+                        "code": -1,
+                        "msg": "gb28181 disabled"
+                    }))
+                    .await?;
+                }
+            }
+            "getTalkList" => {
+                if let Some(sip) = &self.sip {
+                    self.send_json(&serde_json::json!({
+                        "code": 0,
+                        "data": sip.list_talks()
+                    }))
+                    .await?;
+                } else {
+                    self.send_json(&serde_json::json!({
+                        "code": -1,
+                        "msg": "gb28181 disabled"
+                    }))
+                    .await?;
                 }
             }
             "queryCatalog" => {
@@ -2738,6 +3104,65 @@ impl HttpSession {
         let response = format!(
             "HTTP/1.1 200 OK\r\n\
              Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        self.stream.write_all(response.as_bytes()).await?;
+        Ok(())
+    }
+
+    /// Authorizes management API requests with the configured shared secret.
+    /// The dedicated request header keeps the secret out of normal URLs while
+    /// the query parameter remains compatible with the upstream ZLMediaKit API.
+    fn is_api_authorized(&self, path: &str, request: &str) -> bool {
+        let expected = self.auth.secret.as_str();
+        if expected.is_empty() {
+            return true;
+        }
+
+        let header_secret = request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("x-api-secret") {
+                Some(value.trim())
+            } else if name.trim().eq_ignore_ascii_case("authorization") {
+                value.trim().strip_prefix("Bearer ")
+            } else {
+                None
+            }
+        });
+        let query = Self::parse_query(path);
+        let supplied = header_secret.or_else(|| query.get("secret").map(String::as_str));
+
+        supplied.is_some_and(|candidate| Self::constant_time_eq(expected, candidate))
+    }
+
+    fn constant_time_eq(expected: &str, candidate: &str) -> bool {
+        if expected.len() != candidate.len() {
+            return false;
+        }
+        expected
+            .as_bytes()
+            .iter()
+            .zip(candidate.as_bytes())
+            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+            == 0
+    }
+
+    fn is_secret_config_key(key: &str) -> bool {
+        key.eq_ignore_ascii_case("secret") || key.to_ascii_lowercase().ends_with(".secret")
+    }
+
+    async fn send_api_unauthorized(&mut self) -> anyhow::Result<()> {
+        let body = serde_json::to_string(&serde_json::json!({
+            "code": -401,
+            "msg": "invalid or missing API secret"
+        }))?;
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\n\
+             Content-Type: application/json\r\n\
+             Cache-Control: no-store\r\n\
              Content-Length: {}\r\n\
              Connection: close\r\n\r\n{}",
             body.len(),

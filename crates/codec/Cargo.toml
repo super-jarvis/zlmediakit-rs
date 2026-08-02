@@ -8,3 +8,6 @@ edition.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+zlmediakit-core = { path = "../core" }

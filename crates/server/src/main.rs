@@ -15,10 +15,11 @@ use zlmediakit_core::ffmpeg_source::{FFmpegCmd, FFmpegSourceControl, FFmpegTable
 use zlmediakit_core::hook::{HookClient, HookResult};
 use zlmediakit_core::media_source::{MediaSource, MediaSourceManager};
 use zlmediakit_core::recorder::{RecorderCommand, RecorderControl};
+use zlmediakit_core::rtp::RtpSenderManager;
 use zlmediakit_core::stream_proxy::{ProxyCmd, ProxyTable, StreamProxyControl};
 use zlmediakit_core::stream_pusher::{PusherCmd, PusherTable, StreamPusherControl};
 use zlmediakit_flv::FlvRecorder;
-use zlmediakit_hls::HlsRecorder;
+use zlmediakit_hls::{HlsRecorder, TsLiveMuxer};
 use zlmediakit_http::{HttpServer, HttpServerConfig};
 use zlmediakit_mp4::recorder::Mp4Recorder;
 use zlmediakit_rtmp::pull_client as rtmp_pull_client;
@@ -108,8 +109,19 @@ async fn main() -> Result<()> {
         config.webrtc_port = port;
     }
 
+    // Keep the management API snapshot aligned with the effective startup
+    // configuration, including config-file values and CLI port overrides.
+    zlmediakit_core::config::sync_runtime_config(&config);
+
     let event_bus = Arc::new(EventBus::new(1024));
     let source_manager = Arc::new(MediaSourceManager::new(Some(event_bus.clone())));
+    let ts_muxer_factory: zlmediakit_core::RtpMuxerFactory = Arc::new(|| {
+        let mut muxer = TsLiveMuxer::new();
+        Box::new(move |frame: &zlmediakit_core::MediaFrame| Ok(muxer.push_frame(frame)))
+    });
+    let rtp_sender = Arc::new(
+        RtpSenderManager::new(source_manager.clone()).with_ts_muxer_factory(ts_muxer_factory),
+    );
     let auth = StreamAuth::new_with_realm(
         config.auth_enabled,
         config.secret.clone(),
@@ -172,7 +184,7 @@ async fn main() -> Result<()> {
     // box. Absolute paths in config always win.
     let www_root = if config.http.dir_root {
         let cfg = config.http.www_root.trim();
-        let p = if cfg.is_empty() {
+        let p = if cfg.is_empty() || matches!(cfg, "." | "www" | "./www") {
             default_www_root_path()
         } else {
             let p = std::path::PathBuf::from(cfg);
@@ -276,6 +288,7 @@ async fn main() -> Result<()> {
     if config.http.enabled {
         let addr = format!("0.0.0.0:{}", config.http_port);
         let sm = source_manager.clone();
+        let http_rtp_sender = rtp_sender.clone();
         let http_auth = auth.clone();
         let rec = recorder_control.clone();
         let proxy = proxy_control.clone();
@@ -293,6 +306,7 @@ async fn main() -> Result<()> {
             match HttpServer::new(HttpServerConfig {
                 addr: addr.clone(),
                 source_manager: sm,
+                rtp_sender: http_rtp_sender,
                 auth: http_auth,
                 hook: http_hook,
                 recorder: rec,
@@ -327,6 +341,7 @@ async fn main() -> Result<()> {
     if config.http.enabled && config.api_port != config.http_port {
         let addr = format!("0.0.0.0:{}", config.api_port);
         let sm = source_manager.clone();
+        let api_rtp_sender = rtp_sender.clone();
         let api_auth = auth.clone();
         let rec = recorder_control.clone();
         let proxy = proxy_control.clone();
@@ -344,6 +359,7 @@ async fn main() -> Result<()> {
             match HttpServer::new(HttpServerConfig {
                 addr: addr.clone(),
                 source_manager: sm,
+                rtp_sender: api_rtp_sender,
                 auth: api_auth,
                 hook: api_hook,
                 recorder: rec,
@@ -812,6 +828,22 @@ async fn run_proxy_supervisor(
                 {
                     warn!("RTMP proxy task error {}: {}", key, e);
                 }
+            } else if url.starts_with("http://") || url.starts_with("https://") {
+                if let Err(e) = zlmediakit_http::pull_client::start(
+                    &url, &vhost, &app, &stream, sm, stop, stopped,
+                )
+                .await
+                {
+                    warn!("HTTP proxy task error {}: {}", key, e);
+                }
+            } else if url.starts_with("srt://") {
+                if let Err(e) = zlmediakit_srt::pull_client::start(
+                    &url, &vhost, &app, &stream, sm, stop, stopped,
+                )
+                .await
+                {
+                    warn!("SRT proxy task error {}: {}", key, e);
+                }
             } else {
                 if let Err(e) =
                     rtsp_pull_start(&url, &vhost, &app, &stream, sm, stop, stopped).await
@@ -891,17 +923,41 @@ fn spawn_push_task(cmd: PusherCmd, source_manager: Arc<MediaSourceManager>, acti
             "Stream pusher: {}/{}/{} -> {}",
             cmd.vhost, cmd.app, cmd.stream, cmd.dst_url
         );
-        if let Err(e) = rtmp_push_client::start(
-            &cmd.dst_url,
-            &cmd.vhost,
-            &cmd.app,
-            &cmd.stream,
-            source_manager,
-            cmd.stop,
-            cmd.stopped,
-        )
-        .await
-        {
+        let result = if cmd.dst_url.starts_with("rtsp://") || cmd.dst_url.starts_with("rtsps://") {
+            zlmediakit_rtsp::rtsp_push_start(
+                &cmd.dst_url,
+                &cmd.vhost,
+                &cmd.app,
+                &cmd.stream,
+                source_manager,
+                cmd.stop,
+                cmd.stopped,
+            )
+            .await
+        } else if cmd.dst_url.starts_with("srt://") {
+            zlmediakit_srt::push_client::start(
+                &cmd.dst_url,
+                &cmd.vhost,
+                &cmd.app,
+                &cmd.stream,
+                source_manager,
+                cmd.stop,
+                cmd.stopped,
+            )
+            .await
+        } else {
+            rtmp_push_client::start(
+                &cmd.dst_url,
+                &cmd.vhost,
+                &cmd.app,
+                &cmd.stream,
+                source_manager,
+                cmd.stop,
+                cmd.stopped,
+            )
+            .await
+        };
+        if let Err(e) = result {
             warn!("Stream pusher error {}/{}: {}", cmd.vhost, cmd.app, e);
         }
         info!("Stream pusher ended: {}", key);

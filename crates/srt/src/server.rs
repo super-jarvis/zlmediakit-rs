@@ -41,11 +41,7 @@ impl SrtServer {
         }
         self.started = true;
 
-        // Initialize SRT
-        let ret = unsafe { ffi::srt_startup() };
-        if ret != 0 {
-            anyhow::bail!("srt_startup failed: {}", ffi::last_error());
-        }
+        ffi::ensure_startup()?;
 
         let addr: SocketAddr = self.config.addr.parse()?;
 
@@ -67,7 +63,7 @@ impl SrtServer {
             ffi::SRT_SOCKOPT_RCVLATENCY,
             self.config.latency_ms as c_int,
         )?;
-        ffi::set_sockflag_int(sock, ffi::SRT_SOCKOPT_RCVSYN, 0)?;
+        ffi::set_sockflag_bool(sock, ffi::SRT_SOCKOPT_RCVSYN, false)?;
         ffi::set_sockflag_int(sock, ffi::SRT_SOCKOPT_RCVBUF, 1024 * 1024)?;
 
         if let Some(ref pw) = self.config.passphrase {
@@ -125,7 +121,7 @@ impl SrtServer {
                     ffi::srt_getlasterror(&mut e);
                     e
                 };
-                if err == ffi::SRT_EASYNCRCV {
+                if matches!(err, ffi::SRT_EASYNCFAIL | ffi::SRT_EASYNCRCV) {
                     std::thread::yield_now();
                 } else {
                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -134,6 +130,13 @@ impl SrtServer {
             }
 
             let streamid = ffi::get_streamid(accept_fd);
+            if let Err(error) = ffi::set_sockflag_bool(accept_fd, ffi::SRT_SOCKOPT_RCVSYN, true)
+                .and_then(|_| ffi::set_sockflag_int(accept_fd, ffi::SRT_SOCKOPT_RCVTIMEO, 200))
+            {
+                warn!("SRT accepted socket setup failed (fd={accept_fd}): {error}");
+                unsafe { ffi::srt_close(accept_fd) };
+                continue;
+            }
             if let Some(ref sid) = streamid {
                 info!("SRT client connected (fd={}, streamid={})", accept_fd, sid);
             } else {
@@ -147,7 +150,6 @@ impl SrtServer {
         }
 
         unsafe { ffi::srt_close(sock) };
-        unsafe { ffi::srt_cleanup() };
         info!("SRT server stopped");
         Ok(())
     }
@@ -160,9 +162,11 @@ const PID_PAT: u16 = 0x0000;
 const PID_DEFAULT_AUDIO: u16 = 0x1100;
 
 /// Holds TS stream state for a single SRT connection.
-struct TsContext {
+pub(crate) struct TsContext {
     /// PID of the video elementary stream (from PMT).
     video_pid: Option<u16>,
+    /// Video codec declared by the PMT stream type.
+    video_codec: Option<CodecId>,
     /// PID of the audio elementary stream (from PMT).
     audio_pid: Option<u16>,
     /// PMT PID discovered from PAT, used to route PSI packets to the PMT parser.
@@ -178,9 +182,10 @@ struct TsContext {
 }
 
 impl TsContext {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             video_pid: None,
+            video_codec: None,
             audio_pid: None,
             pmt_pid: None,
             video_accum: Vec::new(),
@@ -211,7 +216,7 @@ async fn handle_srt_connection(fd: c_int, sm: Arc<MediaSourceManager>, streamid:
         let result = tokio::task::spawn_blocking(move || {
             let mut buf = vec![0u8; buf_cap];
             unsafe {
-                let n = ffi::srt_recv(
+                let n = ffi::srt_recvmsg(
                     fd_copy,
                     buf.as_mut_ptr() as *mut std::ffi::c_void,
                     buf.len() as c_int,
@@ -241,6 +246,13 @@ async fn handle_srt_connection(fd: c_int, sm: Arc<MediaSourceManager>, streamid:
                 break;
             }
             Ok(Err(n)) => {
+                let code = ffi::last_error_code();
+                if matches!(
+                    code,
+                    ffi::SRT_EASYNCFAIL | ffi::SRT_EASYNCRCV | ffi::SRT_ETIMEOUT
+                ) {
+                    continue;
+                }
                 let err = ffi::last_error();
                 warn!("SRT recv error (fd={}): code={}, {}", fd, n, err);
                 break;
@@ -258,7 +270,7 @@ async fn handle_srt_connection(fd: c_int, sm: Arc<MediaSourceManager>, streamid:
 }
 
 /// Iterates over 188-byte TS packets and publishes video/audio frames.
-async fn demux_ts_packets(
+pub(crate) async fn demux_ts_packets(
     data: &[u8],
     ctx: &mut TsContext,
     source: &zlmediakit_core::media_source::MediaSource,
@@ -315,6 +327,7 @@ async fn demux_ts_packets(
                         publish_video(
                             &ctx.video_accum,
                             source,
+                            ctx.video_codec,
                             ctx.video_pts,
                             ctx.video_dts,
                             timestamp,
@@ -364,6 +377,7 @@ async fn flush_ts_context(
         publish_video(
             &ctx.video_accum,
             source,
+            ctx.video_codec,
             ctx.video_pts,
             ctx.video_dts,
             timestamp,
@@ -384,10 +398,61 @@ async fn flush_ts_context(
     }
 }
 
+/// Incremental MPEG-TS demuxer shared by SRT, HTTP-TS and HLS pull inputs.
+/// It preserves partial 188-byte packets across network reads and publishes
+/// normalized media frames into the supplied media source.
+pub struct TsStreamDemuxer {
+    pending: Vec<u8>,
+    context: TsContext,
+    timestamp: u32,
+}
+
+impl TsStreamDemuxer {
+    pub fn new() -> Self {
+        Self {
+            pending: Vec::with_capacity(TS_PACKET_SIZE * 16),
+            context: TsContext::new(),
+            timestamp: 0,
+        }
+    }
+
+    pub async fn feed(&mut self, data: &[u8], source: &zlmediakit_core::media_source::MediaSource) {
+        self.pending.extend_from_slice(data);
+        while self.pending.len() >= TS_PACKET_SIZE {
+            if self.pending[0] != TS_SYNC {
+                if let Some(offset) = self.pending.iter().position(|byte| *byte == TS_SYNC) {
+                    self.pending.drain(..offset);
+                } else {
+                    self.pending.clear();
+                    return;
+                }
+                if self.pending.len() < TS_PACKET_SIZE {
+                    return;
+                }
+            }
+            let packet: Vec<u8> = self.pending.drain(..TS_PACKET_SIZE).collect();
+            demux_ts_packets(&packet, &mut self.context, source, &mut self.timestamp).await;
+        }
+    }
+
+    pub async fn flush(&mut self, source: &zlmediakit_core::media_source::MediaSource) {
+        flush_ts_context(&mut self.context, source, &mut self.timestamp).await;
+        self.pending.clear();
+    }
+}
+
+impl Default for TsStreamDemuxer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Parses PAT to find PMT PID.
 fn parse_pat(payload: &[u8], ctx: &mut TsContext) {
-    // PAT starts after pointer (1 byte) + table_id (1) + section_length (2).
-    if payload.len() < 8 {
+    // PAT program loop starts after table_id, section_length,
+    // transport_stream_id, version/current, section_number and
+    // last_section_number (8 bytes after the pointer field).
+    if payload.len() < 12 {
         return;
     }
     let pointer = payload[0] as usize;
@@ -395,8 +460,7 @@ fn parse_pat(payload: &[u8], ctx: &mut TsContext) {
     if pat_start + 4 > payload.len() {
         return;
     }
-    // Skip table_id (1), section_syntax_indicator + reserved + section_length (2).
-    let program_offset = pat_start + 3;
+    let program_offset = pat_start + 8;
     if program_offset + 4 > payload.len() {
         return;
     }
@@ -432,8 +496,8 @@ fn parse_pmt(payload: &[u8], ctx: &mut TsContext) {
     }
     // Skip PCR_PID (2) + program_info_length (2) = 4 bytes
     let info_len =
-        ((payload[pcr_pid_offset + 3] as u16 & 0x0F) << 8) | payload[pcr_pid_offset + 4] as u16;
-    let es_start = pcr_pid_offset + 5 + info_len as usize;
+        ((payload[pcr_pid_offset + 2] as u16 & 0x0F) << 8) | payload[pcr_pid_offset + 3] as u16;
+    let es_start = pcr_pid_offset + 4 + info_len as usize;
 
     let mut pos = es_start;
     while pos + 5 <= payload.len() {
@@ -442,7 +506,14 @@ fn parse_pmt(payload: &[u8], ctx: &mut TsContext) {
         // es_info_length (2)
         let es_info = ((payload[pos + 3] as u16 & 0x0F) << 8) | payload[pos + 4] as u16;
         match stream_type {
-            0x1B | 0x24 => ctx.video_pid = Some(pid), // H.264 / H.265
+            0x1B => {
+                ctx.video_pid = Some(pid);
+                ctx.video_codec = Some(CodecId::H264);
+            }
+            0x24 => {
+                ctx.video_pid = Some(pid);
+                ctx.video_codec = Some(CodecId::H265);
+            }
             0x0F | 0x11 => ctx.audio_pid = Some(pid), // AAC / AAC-latm
             _ => {}
         }
@@ -517,6 +588,7 @@ fn parse_pes_timestamp(data: &[u8]) -> Option<u64> {
 async fn publish_video(
     data: &[u8],
     source: &zlmediakit_core::media_source::MediaSource,
+    declared_codec: Option<CodecId>,
     pts: Option<u64>,
     dts: Option<u64>,
     fallback_timestamp: &mut u32,
@@ -524,7 +596,7 @@ async fn publish_video(
     if data.len() < 4 {
         return;
     }
-    let codec = detect_codec(data);
+    let codec = declared_codec.unwrap_or_else(|| detect_codec(data));
     let key_frame = is_keyframe(data, codec);
     let (timestamp, pts_ms, dts_ms) = media_timestamps(pts, dts, fallback_timestamp);
     let frame = MediaFrame::new_video(

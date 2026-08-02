@@ -117,6 +117,7 @@ async fn recording_api_start_stop_via_http() {
     let srv = HttpServer::new(HttpServerConfig {
         addr: format!("127.0.0.1:{}", port),
         source_manager: mgr.clone(),
+        rtp_sender: Arc::new(zlmediakit_core::rtp::RtpSenderManager::new(mgr.clone())),
         auth,
         hook,
         recorder: recorder.clone(),

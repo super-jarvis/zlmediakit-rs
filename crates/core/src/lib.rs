@@ -9,7 +9,9 @@ pub mod media_frame;
 pub mod media_sink;
 pub mod media_source;
 pub mod payload;
+pub mod ps;
 pub mod recorder;
+pub mod rtp;
 pub mod session;
 pub mod signal;
 pub mod stream_proxy;
@@ -33,7 +35,12 @@ pub use payload::{
     aac_audio_specific_config, aac_raw_payload, flv_payload, video_config_annex_b,
     video_decoder_config, video_sample_annex_b, video_sample_length_prefixed,
 };
+pub use ps::PsMuxer;
 pub use recorder::{RecorderCommand, RecorderControl};
+pub use rtp::{
+    RtpDataType, RtpFrameMuxer, RtpMuxerFactory, RtpPacketizer, RtpSendRequest, RtpSenderInfo,
+    RtpSenderManager,
+};
 pub use session::{SessionId, SessionManager};
 pub use stream_proxy::{ProxyCmd, ProxyEntry, StreamProxyControl};
 pub use stream_pusher::{PusherCmd, PusherEntry, StreamPusherControl};

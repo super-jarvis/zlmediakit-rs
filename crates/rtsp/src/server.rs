@@ -18,6 +18,10 @@ pub struct RtspServer {
 }
 
 impl RtspServer {
+    pub fn local_addr(&self) -> anyhow::Result<std::net::SocketAddr> {
+        Ok(self.listener.local_addr()?)
+    }
+
     pub async fn new(
         addr: &str,
         source_manager: Arc<MediaSourceManager>,

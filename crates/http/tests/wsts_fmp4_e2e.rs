@@ -105,6 +105,7 @@ async fn start_server(port: u16) -> Fixture {
     let srv = HttpServer::new(HttpServerConfig {
         addr: format!("127.0.0.1:{}", port),
         source_manager: mgr.clone(),
+        rtp_sender: Arc::new(zlmediakit_core::rtp::RtpSenderManager::new(mgr.clone())),
         auth,
         hook,
         recorder: Arc::new(recorder),

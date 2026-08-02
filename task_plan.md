@@ -1,4 +1,49 @@
-# 任务计划：补齐协议实现与协议互转
+# 任务计划：完善前端管理后台与 API Secret 鉴权
+
+## 当前目标（2026-08-02）
+
+参考 ZLMediaKit 的管理控制台能力，完整接入本项目已有 HTTP API，覆盖流、会话、录像、拉流代理、推流转发、FFmpeg、GB28181/RTP、转码、服务器配置与运行监控；使用配置文件中的 `secret` 对管理 API 进行统一鉴权，并补齐前端可靠性、安全性、自动化测试和 WSL 全量验证。
+
+## 当前验收边界
+
+- 除明确列为内部/危险的接口外，`getApiList` 所列管理能力均有可发现、可操作的前端入口。
+- `/index/api/*` 默认校验配置文件中的 `secret`；错误、缺失口令返回明确的 HTTP/JSON 错误，前端提供登录、退出、会话保存与失效处理。
+- `getServerConfig` 不向前端回显明文 secret；修改配置、重启、关闭流、踢会话等危险操作有确认与错误反馈。
+- 页面覆盖桌面与移动端，HTTPS 下正确使用 WSS；WebRTC/SRT 等浏览器不能原生直接承载的能力提供正确入口或状态说明。
+- 为鉴权、API 客户端和关键页面交互增加自动化测试；最终在 WSL 通过 fmt、Clippy、workspace tests 与 release build。
+
+## 当前阶段
+
+1. [completed] 审计 API、配置加载、HTTP 请求解析和前端结构，固化鉴权契约与页面信息架构
+2. [completed] 实现后端 API secret 守卫、敏感配置脱敏、鉴权测试
+3. [completed] 实现前端登录态、统一 API 错误处理、HTTPS/WSS 和基础组件
+4. [completed] 完善流详情、会话、截图、录像文件、服务器配置与监控
+5. [completed] 实现 GB28181/RTP、转码以及剩余协议管理入口
+6. [completed] 完成交互、安全、响应式、WebRTC/SRT 能力说明与前端自动化测试
+7. [completed] WSL 全量质量门禁、文档与最终能力矩阵验收
+
+## 当前实施决策
+
+- secret 由后端从 `ServerConfig.secret` 注入 HTTP 服务并统一校验；前端不硬编码默认 secret。
+- 前端优先使用请求头传递 secret，兼容 ZLMediaKit 风格的 `secret` 查询参数，避免在正常页面 URL 中暴露口令。
+- 登录态默认使用 `sessionStorage`，不把 secret 持久保存到磁盘；用户可主动退出清除。
+- 不引入大型前端框架，继续沿用当前无构建依赖的静态 HTML/CSS/JavaScript 架构，除非实现测试时证明需要最小开发依赖。
+- 保留已完成的协议实现及用户现有工作区内容，不撤销无关改动。
+
+## 当前错误记录
+
+| 错误 | 尝试次数 | 解决方案 |
+|---|---:|---|
+| Windows PATH 中 `node` 不可用，无法直接执行 `node --check` | 1 | 后续通过 WSL Node 或浏览器级测试验证前端 |
+| HTTP API E2E 并行运行偶发 `Address already in use` | 1 | 将测试服务器由共享固定端口改为每用例动态端口 |
+| WSL 未安装 Node，无法运行 `node --check` | 1 | 改用 Codex 工作区捆绑 Node 运行时和浏览器测试 |
+| 首次联调按 crate 名猜测二进制为 `zlmediakit-server`，启动后立即退出 | 1 | 通过产物清单确认实际二进制名为 `target/debug/zlmediakit`，后续使用正确入口 |
+| 使用 WSL `--cd` 直接执行 cargo 时登录环境未加载，提示 `cargo: command not found` | 1 | 后续固定通过 `bash -lc 'cargo ...'` 加载 Rust 工具链 |
+| 最终 `cargo fmt --all --check` 报告新增测试一处换行差异 | 1 | 执行 `cargo fmt --all` 后复验通过 |
+
+---
+
+## 已完成历史目标：补齐协议实现与协议互转
 
 ## 目标
 
@@ -50,3 +95,64 @@
 - `.github/workflows/ci.yml`、`.github/workflows/release.yml` 当前被用户移动/删除，`.github/workflows_bak/` 为未跟踪目录。
 - `.github/workflows/docker-publish.yml` 含此前的 `actions/checkout@v6` 更新。
 - 协议实现过程中不修改或撤销上述改动，除非后续阶段明确更新 CI 测试入口。
+# 当前目标：对齐 ZLMediaKit 开源版核心能力（2026-08-02）
+
+## 目标边界
+
+在保留现有协议互转、管理前端和 API Secret 鉴权成果的基础上，按依赖顺序补齐 ZLMediaKit 开源版核心能力。闭源专业版的 JT1078、GPU/任意转码、S3、AI、RTC 集群代理和 MCU 不纳入本目标。
+
+## 验收原则
+
+- 每项能力必须形成真实网络入口到真实网络出口的闭环，并有单元测试或端到端测试。
+- 优先保持 ZLMediaKit REST API、参数和返回语义兼容；无法兼容时必须文档化差异。
+- 不以类型、枚举或未接线的解析器作为“已实现”依据。
+- 每个阶段完成后执行针对性测试；里程碑完成后在 WSL 执行 fmt、check、clippy、workspace tests 和 release build。
+- 保留用户现有未提交改动，不回滚 `.github/workflows_bak/` 或前端/鉴权成果。
+
+## 实施阶段
+
+1. [completed] 通用 RTP 基线：建立 RTP sender 管理器，实现 ZLM 兼容 `startSendRtp`/`stopSendRtp` API、UDP 主动发送、SSRC/PT/时间戳/序列号和端到端测试。
+2. [completed] 通用 RTP 完整传输：TCP active/passive、PS/TS/ES 输出、端口复用、同 SSRC 多目标、重连与统计。
+3. [completed] GB28181 完整化：TCP RTP 接收、PS/TS/ES 自动识别、音频轨、乱序/去重、RTP 转推和双向语音对讲。
+4. [completed] 原生拉流客户端：HLS TS/fMP4、HTTP-FLV、HTTP-TS，并接入代理、按需启停和协议互转。
+5. [in_progress] 双向协议与点播：RTSP 主动推流、SRT Caller/输出/Rendezvous、MP4 经 RTSP/RTMP/WS-FLV 点播和 seek。
+6. [pending] 集群与生命周期：多源站轮询、HLS/HTTP-TS 溯源、无人观看关闭、按需转协议、先播后推、断连续推。
+7. [pending] WebRTC 与多轨：simulcast、RTX/REMB、单端口/迁移/TCP、ice-full 客户端、多音视频轨和扩展编码。
+8. [pending] 运维与平台：补齐 Hook/API 响应语义、真实配置/TLS 热更新、IPv6、跨平台 CI 和可嵌入 SDK 接口。
+9. [pending] 商用验证：兼容性矩阵、故障恢复、长稳、压力、模糊测试、性能基线和完整文档。
+
+## 当前阶段设计决策
+
+- 第一批先做 H.264/H.265/AAC `MediaFrame` 到 RTP 的无转码发送；封装层复用现有 payload 规范化工具。
+- `startSendRtp` 与当前用于 SIP INVITE 的 `startRtp` 分开，避免 API 名称相似但语义混淆。
+- sender 生命周期由独立管理器持有，API 只负责创建、停止和查询，不能把长任务绑在 HTTP session 上。
+- 先实现 UDP active 形成最小可验证闭环，再在同一抽象上增加 TCP active/passive 与 PS/TS/ES。
+- UDP/TCP active、TCP passive、ES/PS/TS、断线重连、sender 统计、端口复用与同 SSRC 多目标已完成；当前转入 GB28181 接收完整化。
+- GB28181 接收侧已完成 UDP/TCP passive/TCP active（`connectRtpServer`）、RFC4571、64 包/50ms 乱序窗口、重复/丢包统计、PS/TS/ES 自动识别、H.264/H.265 分片重组、PSM 音频映射和 RFC3640 AAC。
+- 收到的 GB RTP 会发布为统一 `MediaSource`，可由 `startSendRtp` 再次受控转推；真实 UDP 测试已验证接收 SSRC/PT 与新目的 SSRC/PT 隔离。
+- SIP 对讲现支持 `INVITE(s=Talk/sendonly)`、200 SDP 协商、ACK、G.711A/U ES-RTP 发送、BYE 和设备离线清理；管理 API 与前端均可启动、停止和查看活动对讲。阶段 3 已完成，当前转入原生 HTTP/HLS 拉流。
+- 原生 HTTP 拉流已实现 HTTP/1.1 固定长度、连接关闭和 chunked body、最多 5 次跳转、IPv4/IPv6 URL、HTTPS 公共 CA 校验；HTTP-FLV、HTTP-TS、HLS 主/媒体清单、TS segment 与 `EXT-X-MAP` CMAF/fMP4 均发布统一 MediaSource。
+- CMAF 解封装器解析 init 段的 H.264/H.265/AAC 轨道与配置，并解析 `moof/traf/tfhd/tfdt/trun/mdat` 的 sample duration/size/flags/CTS；HTTP-FLV 与 HLS-fMP4→UDP RTP 网络闭环均已验证。阶段 4 完成，当前转入双向协议与点播。
+- RTSP 主动推流已接入既有 `addStreamPusher`：支持 H.264/H.265 与可选 AAC，执行 ANNOUNCE/SETUP/RECORD、TCP interleaved RTP、缓存 GOP/实时帧发送和 TEARDOWN；支持 Digest 上游鉴权，`rtsps://` 拉推流使用 WebPKI 公共 CA 校验，真实双服务器与 TLS 测试通过。
+- SRT 已补齐正确的 libsrt 1.5 ABI、Listener/Caller/Rendezvous、MPEG-TS 拉推流、streamid、延迟与 passphrase 参数，并接入 `addStreamProxy`/`addStreamPusher`；Caller 推流、Caller 拉流与 Rendezvous 均有真实 UDP 网络测试。阶段 5 继续完成 MP4 多协议 VOD 与 seek。
+
+## 本轮错误记录
+
+| 错误 | 尝试次数 | 处理 |
+|---|---:|---|
+| PowerShell 内嵌引号检查规划文件时解析失败 | 1 | 改用 `rtk rg --files` 与逐文件读取，不重复该命令 |
+| `rtk bat`/`rtk Get-Content` 不可用 | 1 | 使用 `rtk powershell -NoProfile -Command Get-Content` 或 `rtk rg` |
+| RTP 单元测试构造 `VideoInfo` 时误用了不存在的 `bitrate` 字段 | 1 | 按实际结构删除该字段后重新编译 |
+| 机械插入 `http_rtp_sender` clone 时命中了更早的 RTMP `sm` 变量 | 1 | 用协议分支上下文将 clone 移到 HTTP server 分支 |
+| 标准化 PES parser 后旧 `parse_pes_video_basic` 仍构造少一个 flags 字节的非标准 PES | 1 | 同步修正测试夹具和 `PES_packet_length`，再以 core mux → codec demux 往返测试验收 |
+| Clippy 报 `send_frame` 9 个参数超过限制 | 1 | 将轨道选择、packetizer 和容器 muxer 合并为 `RtpSendState`，全目标 Clippy 复验通过 |
+| 全量 SRT 测试中的 PS 分片夹具重复使用 sequence=1 且 PES 少写 flags2 | 2 | 改为递增 sequence 并构造标准 `flags1 + flags2 + header_data_length` PES，分片无 marker 测试恢复通过 |
+| Clippy 报 GB RTP `handle_rtp` 8 个参数超过限制 | 1 | 将 PS/TS/自动识别/FU 状态统一收进 `RtpIngestState`，严格 Clippy 复验通过 |
+| SIP 响应首行把 `OK` 当作状态码解析，导致平台 INVITE 永远不进入 ACK/激活分支 | 1 | 改为解析 `SIP/2.0` 后的第二个 token，并由真实对讲 SIP/RTP 往返测试覆盖 |
+| RTP 转推测试在首个入站包前启动 sender，媒体源尚未创建 | 1 | 先发送入站 RTP 并等待接收端发布 MediaSource，再验证缓存 GOP 经 sender 到达新 UDP 目的端 |
+| HTTP-FLV 测试在拉流任务结束后才订阅广播，错过实时帧 | 1 | 按真实晚加入播放者语义读取 GOP cache，再增加拉流→RTP 网络出口验证 |
+| 严格 Clippy 报 HLS playlist 四元组返回类型过于复杂 | 1 | 提取 `PlaylistEntries` 结构体后复验通过 |
+| SRT URL 解析时 `local_port` 无法推断整数类型 | 1 | 显式标注为 `Option<u16>`，单元测试与 Clippy 通过 |
+| 首条 SRT 网络 E2E 长时间等待且无媒体 | 3 | 增加有界超时与 socket 状态诊断，依次修复错误 FFI 常量、message API 签名、accepted socket 非阻塞继承及 PAT/PMT 偏移 |
+
+---
