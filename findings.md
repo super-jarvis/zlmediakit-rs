@@ -154,7 +154,7 @@
 - 当前 `MediaFrame` 已带 `track_id`、codec、DTS/PTS、payload format 和 config-frame 标识，足以驱动独立 RTP sender。
 - HLS `HlsDemuxer::parse_m3u8` 没有生产调用者，因此不构成原生 HLS 拉流客户端。
 - Stream proxy 原生只区分 RTMP 和 RTSP；Stream pusher 固定调用 RTMP push client。
-- SRT crate 只有 listener/server 输入链路，没有 caller、输出或 rendezvous。
+- SRT 初审时只有 listener/server 输入链路；现已补齐 Caller 拉流、MPEG-TS 输出与 Rendezvous，并通过真实 libsrt 网络闭环验收。
 - 集群配置只有 RTMP push peers 与单个 RTMP/RTSP `origin_url`，没有多源站轮询和 HLS/HTTP-TS 溯源。
 - WebRTC 已有 NACK/PLI/TWCC 和 DataChannel，后续应补缺失高级特性，不能将整个 WebRTC 模块判定为未实现。
 - ZLMediaKit README 中的任意转码、JT1078、IPTV、S3、RTC 集群、AI、MCU 属于闭源专业版，本目标不以这些功能作为开源对齐验收项。

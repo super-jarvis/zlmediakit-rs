@@ -4,7 +4,7 @@
 [![Docker Publish](https://github.com/super-jarvis/zlmediakit-rs/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/super-jarvis/zlmediakit-rs/actions/workflows/docker-publish.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**ZLMediaKit-RS** 是 [ZLMediaKit](https://github.com/super-jarvis/zlmediakit-rs) 的 Rust 语言实现。高性能、多协议流媒体服务器，利用 Rust 的内存安全和高性能异步运行时，提供与 ZLMediaKit 兼容的 HTTP API。
+**ZLMediaKit-RS** 是 [ZLMediaKit](https://github.com/ZLMediaKit/ZLMediaKit) 的 Rust 语言实现。高性能、多协议流媒体服务器，利用 Rust 的内存安全和高性能异步运行时，提供与 ZLMediaKit 兼容的 HTTP API。
 
 ---
 
