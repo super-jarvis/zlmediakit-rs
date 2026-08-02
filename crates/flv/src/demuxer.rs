@@ -1,5 +1,5 @@
-use bytes::{Buf, Bytes, BytesMut};
-use zlmediakit_core::media_frame::{CodecId, MediaFrame};
+use bytes::{Buf, BytesMut};
+use zlmediakit_core::media_frame::{CodecId, MediaFrame, PayloadFormat};
 
 pub struct FlvDemuxer {
     buffer: BytesMut,
@@ -80,25 +80,28 @@ impl FlvDemuxer {
                 let codec = match codec_id {
                     7 => CodecId::H264,
                     12 => CodecId::H265,
-                    _ => CodecId::H264,
+                    _ => CodecId::Unknown(codec_id as u32),
                 };
 
                 let is_key = frame_type == 1;
-                let data = if payload.len() > 5 {
-                    payload.freeze().slice(5..)
+                let packet_type = payload.get(1).copied().map(|value| value & 0x0f);
+                let composition_time = if payload.len() >= 5 && packet_type == Some(1) {
+                    signed_i24(payload[2], payload[3], payload[4])
                 } else {
-                    Bytes::new()
+                    0
+                };
+                let dts = timestamp as u64;
+                let pts = if composition_time.is_negative() {
+                    dts.saturating_sub(composition_time.unsigned_abs() as u64)
+                } else {
+                    dts.saturating_add(composition_time as u64)
                 };
 
-                MediaFrame::new_video(
-                    0,
-                    codec,
-                    timestamp,
-                    timestamp as u64,
-                    timestamp as u64,
-                    data,
-                    is_key,
-                )
+                let mut frame =
+                    MediaFrame::new_video(0, codec, timestamp, pts, dts, payload.freeze(), is_key)
+                        .with_payload_format(PayloadFormat::Flv);
+                frame.config_frame = packet_type == Some(0);
+                frame
             }
             0x08 => {
                 if payload.is_empty() {
@@ -111,23 +114,23 @@ impl FlvDemuxer {
                 let codec = match sound_format {
                     10 => CodecId::AAC,
                     2 => CodecId::Mp3,
-                    _ => CodecId::AAC,
+                    7 => CodecId::G711A,
+                    8 => CodecId::G711U,
+                    _ => CodecId::Unknown(sound_format as u32),
                 };
 
-                let data = if payload.len() > 2 {
-                    payload.freeze().slice(2..)
-                } else {
-                    Bytes::new()
-                };
-
-                MediaFrame::new_audio(
+                let is_aac_config = codec == CodecId::AAC && payload.get(1) == Some(&0);
+                let mut frame = MediaFrame::new_audio(
                     1,
                     codec,
                     timestamp,
                     timestamp as u64,
                     timestamp as u64,
-                    data,
+                    payload.freeze(),
                 )
+                .with_payload_format(PayloadFormat::Flv);
+                frame.config_frame = is_aac_config;
+                frame
             }
             _ => {
                 return self.parse_tag();
@@ -135,6 +138,15 @@ impl FlvDemuxer {
         };
 
         Some(frame)
+    }
+}
+
+fn signed_i24(high: u8, middle: u8, low: u8) -> i32 {
+    let value = ((high as i32) << 16) | ((middle as i32) << 8) | low as i32;
+    if value & 0x0080_0000 != 0 {
+        value | !0x00ff_ffff
+    } else {
+        value
     }
 }
 
@@ -165,6 +177,7 @@ mod tests {
     fn video_tag(data: &[u8], timestamp: u32, is_key: bool) -> Vec<u8> {
         let frame_type = if is_key { 1 } else { 2 };
         let mut payload = vec![(frame_type << 4) | 7]; // AVC/H264
+        payload.push(1); // AVC NALU packet
         payload.extend_from_slice(&0u32.to_be_bytes()[1..]); // 3-byte cts
         payload.extend_from_slice(data);
         build_tag(0x09, &payload, timestamp)
@@ -172,6 +185,7 @@ mod tests {
 
     fn audio_tag(data: &[u8], timestamp: u32) -> Vec<u8> {
         let mut payload = vec![0xAF]; // AAC, 44100, 16-bit, stereo
+        payload.push(1); // AAC raw packet
         payload.extend_from_slice(data);
         build_tag(0x08, &payload, timestamp)
     }
@@ -239,6 +253,9 @@ mod tests {
         );
         assert_eq!(frame.codec, CodecId::H264);
         assert!(frame.key_frame);
+        assert_eq!(frame.payload_format, PayloadFormat::Flv);
+        assert_eq!(&frame.data[..5], &[0x17, 1, 0, 0, 0]);
+        assert!(!frame.config_frame);
     }
 
     #[test]
@@ -254,6 +271,8 @@ mod tests {
             zlmediakit_core::media_frame::FrameType::Audio
         );
         assert_eq!(frame.codec, CodecId::AAC);
+        assert_eq!(frame.payload_format, PayloadFormat::Flv);
+        assert_eq!(&frame.data[..2], &[0xaf, 1]);
     }
 
     #[test]
@@ -301,6 +320,7 @@ mod tests {
         let mut d = FlvDemuxer::new();
         let mut stream = flv_header(true, false);
         let mut payload = vec![(1 << 4) | 12]; // key frame, HEVC (codec_id 12)
+        payload.push(1);
         payload.extend_from_slice(&0u32.to_be_bytes()[1..]);
         payload.extend_from_slice(b"\x40\x01\x0c");
         stream.extend_from_slice(&build_tag(0x09, &payload, 50));
@@ -308,5 +328,44 @@ mod tests {
         d.parse_header();
         let frame = d.parse_tag().unwrap();
         assert_eq!(frame.codec, CodecId::H265);
+    }
+
+    #[test]
+    fn marks_decoder_config_and_applies_signed_composition_time() {
+        let mut d = FlvDemuxer::new();
+        let mut stream = flv_header(true, false);
+        let config = [0x17, 0, 0, 0, 0, 1, 0x64, 0, 0x1f];
+        stream.extend_from_slice(&build_tag(0x09, &config, 10));
+        let positive_cts = [0x27, 1, 0, 0, 40, 0, 0, 0, 1, 0x41];
+        stream.extend_from_slice(&build_tag(0x09, &positive_cts, 100));
+        let negative_cts = [0x27, 1, 0xff, 0xff, 0xec, 0, 0, 0, 1, 0x41];
+        stream.extend_from_slice(&build_tag(0x09, &negative_cts, 200));
+        d.feed(&stream);
+        d.parse_header();
+
+        let config_frame = d.parse_tag().unwrap();
+        assert!(config_frame.config_frame);
+        assert_eq!(config_frame.data.as_ref(), config);
+
+        let positive = d.parse_tag().unwrap();
+        assert_eq!(positive.dts, 100);
+        assert_eq!(positive.pts, 140);
+
+        let negative = d.parse_tag().unwrap();
+        assert_eq!(negative.dts, 200);
+        assert_eq!(negative.pts, 180);
+    }
+
+    #[test]
+    fn preserves_unknown_codec_instead_of_claiming_h264() {
+        let mut d = FlvDemuxer::new();
+        let mut stream = flv_header(true, false);
+        stream.extend_from_slice(&build_tag(0x09, &[0x14, 1, 0, 0, 0], 0));
+        d.feed(&stream);
+        d.parse_header();
+
+        let frame = d.parse_tag().unwrap();
+        assert_eq!(frame.codec, CodecId::Unknown(4));
+        assert_eq!(frame.payload_format, PayloadFormat::Flv);
     }
 }

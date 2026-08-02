@@ -6,6 +6,9 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::VecDeque;
 use zlmediakit_core::media_frame::{CodecId, MediaFrame};
+use zlmediakit_core::{
+    aac_audio_specific_config, aac_raw_payload, video_decoder_config, video_sample_length_prefixed,
+};
 
 /// A single fMP4 segment ready for delivery.
 #[derive(Debug, Clone)]
@@ -88,15 +91,27 @@ impl Fmp4Muxer {
             self.base_timestamp = Some(frame.timestamp);
         }
 
-        if frame.config_frame {
+        if frame.config_frame || zlmediakit_core::gop_cache::is_config_frame(frame) {
             match frame.frame_type {
                 zlmediakit_core::media_frame::FrameType::Video => {
+                    let config = match video_decoder_config(frame) {
+                        Ok(config) => config,
+                        Err(_) => return,
+                    };
                     self.video_codec = Some(frame.codec);
-                    self.video_config = Some(frame.data.clone());
+                    self.video_config = Some(config);
                 }
                 zlmediakit_core::media_frame::FrameType::Audio => {
+                    let config = if frame.codec == CodecId::AAC {
+                        match aac_audio_specific_config(frame) {
+                            Ok(config) => config,
+                            Err(_) => return,
+                        }
+                    } else {
+                        frame.data.clone()
+                    };
                     self.audio_codec = Some(frame.codec);
-                    self.audio_config = Some(frame.data.clone());
+                    self.audio_config = Some(config);
                 }
                 _ => {}
             }
@@ -108,8 +123,24 @@ impl Fmp4Muxer {
             .saturating_sub(self.base_timestamp.unwrap_or(0));
         let duration = self.video_timescale / 25; // default 25fps fallback
 
+        let data = match frame.frame_type {
+            zlmediakit_core::media_frame::FrameType::Video => {
+                match video_sample_length_prefixed(frame) {
+                    Ok(data) => data,
+                    Err(_) => return,
+                }
+            }
+            zlmediakit_core::media_frame::FrameType::Audio if frame.codec == CodecId::AAC => {
+                match aac_raw_payload(frame) {
+                    Ok(data) => data,
+                    Err(_) => return,
+                }
+            }
+            _ => frame.data.clone(),
+        };
+
         let sample = Fmp4Sample {
-            data: frame.data.clone(),
+            data,
             timestamp: rel_ts,
             duration,
             is_sync: frame.key_frame,
@@ -280,6 +311,17 @@ impl Fmp4Muxer {
             }
         }
 
+        let mut mvex = BytesMut::new();
+        if self.video_codec.is_some() {
+            mvex.extend_from_slice(&build_trex(1));
+        }
+        if self.audio_codec.is_some() {
+            mvex.extend_from_slice(&build_trex(2));
+        }
+        if !mvex.is_empty() {
+            moov_data.extend_from_slice(&make_box(b"mvex", &mvex));
+        }
+
         buf.extend_from_slice(&make_box(b"moov", &moov_data));
     }
 
@@ -311,11 +353,7 @@ impl Fmp4Muxer {
             tkhd.extend_from_slice(&[0u8; 8]); // reserved
             tkhd.put_u16(0); // layer
             tkhd.put_u16(0); // alternate group
-            if is_video {
-                tkhd.put_u16(0x0100); // volume
-            } else {
-                tkhd.put_u16(0x0100);
-            }
+            tkhd.put_u16(if is_video { 0 } else { 0x0100 }); // volume
             tkhd.put_u16(0); // reserved
                              // identity matrix (9 fixed-point 16.16 values = 36 bytes):
                              // [ 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0 ]
@@ -388,7 +426,7 @@ impl Fmp4Muxer {
                     let mut dref = BytesMut::new();
                     dref.put_u32(0); // version+flags
                     dref.put_u32(1); // entry_count
-                    let url = make_box(b"url ", &0u32.to_be_bytes());
+                    let url = make_box(b"url ", &1u32.to_be_bytes());
                     dref.extend_from_slice(&url);
                     minf.extend_from_slice(&make_box(b"dinf", &make_box(b"dref", &dref)));
                 }
@@ -433,13 +471,13 @@ impl Fmp4Muxer {
                     }
 
                     // stts (empty — samples in fragments)
-                    stbl.extend_from_slice(&make_box(b"stts", &0u32.to_be_bytes()));
+                    stbl.extend_from_slice(&make_box(b"stts", &[0u8; 8]));
                     // stsc (empty)
-                    stbl.extend_from_slice(&make_box(b"stsc", &0u32.to_be_bytes()));
+                    stbl.extend_from_slice(&make_box(b"stsc", &[0u8; 8]));
                     // stsz (empty)
-                    stbl.extend_from_slice(&make_box(b"stsz", &[0u8; 8])); // sample_size=0 + count=0
-                                                                           // stco (empty)
-                    stbl.extend_from_slice(&make_box(b"stco", &0u32.to_be_bytes()));
+                    stbl.extend_from_slice(&make_box(b"stsz", &[0u8; 12]));
+                    // stco (empty)
+                    stbl.extend_from_slice(&make_box(b"stco", &[0u8; 8]));
 
                     minf.extend_from_slice(&make_box(b"stbl", &stbl));
                 }
@@ -474,15 +512,15 @@ impl Fmp4Muxer {
             buf.extend_from_slice(&make_box(b"styp", &styp_data));
         }
 
-        // Reserve space for moof (we'll write it after building mdat)
-        // We need to know sample offsets...
-
-        // Build mdat first
         let mdat_data = self.build_mdat(video, audio);
-        let moof_offset = 8 + mdat_data.len() as u32; // mdat header + data
-
-        // Now build moof knowing the absolute offsets
-        let moof = self.build_moof(seq, start_time, video, audio, moof_offset);
+        let provisional_moof = self.build_moof(seq, start_time, video, audio, 0);
+        let moof = self.build_moof(
+            seq,
+            start_time,
+            video,
+            audio,
+            provisional_moof.len() as u32 + 8,
+        );
 
         buf.extend_from_slice(&moof);
         buf.extend_from_slice(&make_box(b"mdat", &mdat_data));
@@ -496,7 +534,7 @@ impl Fmp4Muxer {
         start_time: u64,
         video: &[&Fmp4Sample],
         audio: &[&Fmp4Sample],
-        mdat_offset: u32,
+        mdat_data_offset: u32,
     ) -> BytesMut {
         let mut moof = BytesMut::new();
 
@@ -510,15 +548,17 @@ impl Fmp4Muxer {
 
         // Track 1 — video
         if !video.is_empty() {
-            let mut accum_offset: u32 = 0;
-            let traf = self.build_traf(1, start_time, video, &mut accum_offset, mdat_offset);
+            let traf = self.build_traf(1, start_time, video, mdat_data_offset);
             moof.extend_from_slice(&traf);
         }
 
         // Track 2 — audio
         if !audio.is_empty() {
-            let mut accum_offset: u32 = 0;
-            let traf = self.build_traf(2, start_time, audio, &mut accum_offset, mdat_offset);
+            let video_size = video
+                .iter()
+                .map(|sample| sample.data.len() as u32)
+                .sum::<u32>();
+            let traf = self.build_traf(2, start_time, audio, mdat_data_offset + video_size);
             moof.extend_from_slice(&traf);
         }
 
@@ -530,8 +570,7 @@ impl Fmp4Muxer {
         track_id: u32,
         start_time: u64,
         samples: &[&Fmp4Sample],
-        accum_offset: &mut u32,
-        _mdat_base: u32,
+        data_offset: u32,
     ) -> BytesMut {
         let mut traf = BytesMut::new();
         let sample_count = samples.len() as u32;
@@ -556,10 +595,10 @@ impl Fmp4Muxer {
         // trun
         {
             let mut trun = BytesMut::new();
-            let trun_flags = 0x000101u32; // data-offset | sample-duration | sample-size | sample-flags
+            let trun_flags = 0x000701u32; // data-offset | sample-duration | sample-size | sample-flags
             trun.put_u32(trun_flags);
             trun.put_u32(sample_count);
-            trun.put_u32(*accum_offset + 8); // +8 for mdat box header
+            trun.put_u32(data_offset);
 
             for s in samples {
                 trun.put_u32(s.duration);
@@ -570,7 +609,6 @@ impl Fmp4Muxer {
                     0x01010000u32
                 };
                 trun.put_u32(flags);
-                *accum_offset += s.data.len() as u32;
             }
 
             traf.extend_from_slice(&make_box(b"trun", &trun));
@@ -602,11 +640,24 @@ fn make_box(box_type: &[u8; 4], data: &[u8]) -> BytesMut {
     buf
 }
 
+fn build_trex(track_id: u32) -> BytesMut {
+    let mut trex = BytesMut::new();
+    trex.put_u32(0); // version + flags
+    trex.put_u32(track_id);
+    trex.put_u32(1); // default_sample_description_index
+    trex.put_u32(0); // default_sample_duration
+    trex.put_u32(0); // default_sample_size
+    trex.put_u32(0); // default_sample_flags
+    make_box(b"trex", &trex)
+}
+
 // ── codec-specific sample entries ────────────────────────────────────
 
 fn build_avc1_entry(config: &[u8], width: u32, height: u32) -> BytesMut {
     // AVCDecoderConfigurationRecord is directly in the config from MediaFrame
-    let avcc = if config.len() >= 5 {
+    let avcc = if config.first() == Some(&1) {
+        config
+    } else if config.len() >= 5 {
         // Config is FLV-style: [codec_id|avc_packet_type=0|comp_time|AVCDecConfigRecord...]
         &config[5..]
     } else {
@@ -625,7 +676,7 @@ fn build_avc1_entry(config: &[u8], width: u32, height: u32) -> BytesMut {
     entry.put_u32(0x00480000); // vert resolution 72dpi
     entry.put_u32(0); // reserved
     entry.put_u16(1); // frame count
-    entry.extend_from_slice(b"AVC Coding\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
+    entry.extend_from_slice(&[0u8; 32]); // compressor name
     entry.put_u16(24); // depth
     entry.put_i16(-1); // pre-defined
                        // avcC box
@@ -640,7 +691,9 @@ fn build_avc1_entry(config: &[u8], width: u32, height: u32) -> BytesMut {
 }
 
 fn build_hvc1_entry(config: &[u8], width: u32, height: u32) -> BytesMut {
-    let hvcc = if config.len() >= 5 {
+    let hvcc = if config.first() == Some(&1) {
+        config
+    } else if config.len() >= 5 {
         &config[5..]
     } else {
         config
@@ -649,14 +702,16 @@ fn build_hvc1_entry(config: &[u8], width: u32, height: u32) -> BytesMut {
     let mut entry = BytesMut::new();
     entry.extend_from_slice(&[0u8; 6]);
     entry.put_u16(1);
-    entry.extend_from_slice(&[0u8; 32]);
+    entry.put_u16(0); // pre-defined
+    entry.put_u16(0); // reserved
+    entry.extend_from_slice(&[0u8; 12]); // pre-defined
     entry.put_u16(width as u16);
     entry.put_u16(height as u16);
     entry.put_u32(0x00480000);
     entry.put_u32(0x00480000);
     entry.put_u32(0);
     entry.put_u16(1);
-    entry.extend_from_slice(b"HEVC Coding\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
+    entry.extend_from_slice(&[0u8; 32]);
     entry.put_u16(24);
     entry.put_i16(-1);
     entry.extend_from_slice(&make_box(b"hvcC", hvcc));
@@ -819,6 +874,30 @@ mod tests {
             "segment must have mdat"
         );
         assert!(seg.duration > 0);
+    }
+
+    #[test]
+    fn push_frame_strips_flv_headers_from_samples() {
+        use zlmediakit_core::PayloadFormat;
+
+        let mut muxer = Fmp4Muxer::new(90_000);
+        let frame = MediaFrame::new_video(
+            0,
+            CodecId::H264,
+            0,
+            0,
+            0,
+            Bytes::from_static(&[0x17, 1, 0, 0, 0, 0, 0, 0, 2, 0x65, 0x88]),
+            true,
+        )
+        .with_payload_format(PayloadFormat::Flv);
+        muxer.push_frame(&frame);
+
+        assert_eq!(muxer.video_samples.len(), 1);
+        assert_eq!(
+            muxer.video_samples[0].data.as_ref(),
+            &[0, 0, 0, 2, 0x65, 0x88]
+        );
     }
 
     fn h264_config_bytes() -> Vec<u8> {

@@ -47,6 +47,16 @@ impl Mp4Recorder {
             muxer.push_frame(frame);
         }
 
+        // A recorder can be started while the publisher is already active.
+        // Replay the latest cached GOP before subscribing so frames published
+        // between task creation and receiver registration are not lost.
+        let cached_gop = source.get_latest_gop_frames().await;
+        for frame in &cached_gop {
+            if !zlmediakit_core::gop_cache::is_config_frame(frame) {
+                muxer.push_frame(frame);
+            }
+        }
+
         let mut min_dts: Option<u64> = None;
         let mut max_dts: Option<u64> = None;
 

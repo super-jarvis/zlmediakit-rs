@@ -1,7 +1,7 @@
 # ZLMediaKit-RS
 
-[![CI](https://github.com/super-jarvis/zlmediakit-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/ZLMediaKit/zlmediakit-rs/actions/workflows/ci.yml)
-[![Docker Publish](https://github.com/super-jarvis/zlmediakit-rs/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/ZLMediaKit/zlmediakit-rs/actions/workflows/docker-publish.yml)
+[![CI](https://github.com/super-jarvis/zlmediakit-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/super-jarvis/zlmediakit-rs/actions/workflows/ci.yml)
+[![Docker Publish](https://github.com/super-jarvis/zlmediakit-rs/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/super-jarvis/zlmediakit-rs/actions/workflows/docker-publish.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **ZLMediaKit-RS** 是 [ZLMediaKit](https://github.com/super-jarvis/zlmediakit-rs) 的 Rust 语言实现。高性能、多协议流媒体服务器，利用 Rust 的内存安全和高性能异步运行时，提供与 ZLMediaKit 兼容的 HTTP API。
@@ -25,6 +25,23 @@
 | **SRT** | ✅ | - | libsrt 接收，自动发布到 MediaSource |
 | **GB28181** | ✅ | - | RTP/PS 推流接收，PS 解复用提取 H.264/H.265 |
 | **VOD 点播** | - | ✅ | 录制文件回放，HTTP Range 支持，35 种 MIME 类型 |
+
+### 编解码与协议互转边界
+
+所有入口协议都发布统一的 `MediaFrame`，并显式标注 FLV、AVCC/HVCC、Annex-B、AAC ASC/Raw/ADTS、Opus 等负载格式；输出协议按目标容器需要做无损转封装。因此，“协议互转”指下表中的兼容编码组合，不代表任意编码器都能无条件全互转。
+
+| 入口/出口 | 可直接承载的主要编码 | 说明 |
+|------|------|------|
+| RTMP/RTMPS | H.264、H.265；AAC、MP3、G.711A/U | 使用 FLV/RTMP 负载；不支持的 classic FLV 编码会明确返回错误 |
+| RTSP/RTSPS | H.264、H.265；AAC、Opus、PCMA、PCMU、MP3/MPA、L16 | SDP、RTP payload type 与 clock rate 按真实音频轨生成 |
+| HTTP-FLV / WebSocket-FLV | H.264、H.265；AAC、MP3、G.711A/U | Opus、L16 不能直接写入 classic FLV |
+| HLS MPEG-TS | H.264、H.265；AAC | 视频统一转 Annex-B，AAC 统一转 ADTS |
+| HLS CMAF / DASH / MP4 / fMP4 | H.264、H.265；AAC | 视频写长度前缀样本，AAC 写 raw access unit；CMAF/DASH 共享 fMP4 段 |
+| WebRTC WHIP/WHEP | H.264、Opus | WHEP 可通过 `aac-transcode` feature 把 AAC 转为 Opus；不声明 H.265 WebRTC 支持 |
+| SRT MPEG-TS 输入 | H.264、H.265；AAC/ADTS | 从 PAT/PMT、PES 读取轨道及 PTS/DTS 后发布 |
+| GB28181 输入 | PS 中的 H.264/H.265；裸 RTP G.711A/U | RTP/PS 跨包累积后发布，不把未知编码伪装为 H.264/AAC |
+
+转码能力目前限定为显式配置的 H.264 ↔ H.265，以及可选的 AAC → Opus。其他组合如果目标协议不能承载，会拒绝或不发布该轨道，不会原样写入伪合法容器。仓库中的 `protocol_conversion_matrix` 测试会由 ffmpeg 生成真实 H.264/AAC FLV，再验证 FLV、MPEG-TS、MP4、fMP4 输出可被 ffprobe 识别并由 ffmpeg 完整解码。
 
 ### 录制
 
@@ -305,8 +322,9 @@ ffplay http://localhost:8080/live/stream.mpd
 ### 环境要求
 
 - Rust 工具链（edition 2021）
-- 可选：`libsrt-gnutls-dev`（SRT 支持）
-- 可选：`ffmpeg`（视频转码运行时）
+- Linux 构建：`pkg-config`、`libsrt-gnutls-dev`
+- 测试与视频转码：`ffmpeg`/`ffprobe`
+- 可选 WebRTC AAC → Opus：`libopus-dev`、`libfdk-aac-dev`，并启用 `zlmediakit-webrtc/aac-transcode`
 
 ### 常用命令
 
@@ -314,14 +332,17 @@ ffplay http://localhost:8080/live/stream.mpd
 # 标准编译
 cargo build --release
 
-# 运行测试
-cargo test -- --test-threads=1
+# 运行工作区测试（包含真实网络 E2E 与 ffmpeg/ffprobe 转换矩阵）
+cargo test --workspace --tests
 
-# Clippy 检查
-cargo clippy
+# 验证可选 AAC → Opus 路径
+cargo test -p zlmediakit-webrtc --features aac-transcode
+
+# Clippy 检查（CI 标准）
+cargo clippy --workspace --all-targets -- -D warnings
 
 # 格式化
-cargo fmt --check
+cargo fmt --all --check
 ```
 
 ---

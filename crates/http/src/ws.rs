@@ -243,7 +243,7 @@ impl WsSession {
         };
 
         for frame in &cached {
-            let tag = muxer.write_tag(frame);
+            let tag = muxer.write_tag(frame)?;
             self.stream
                 .write_all(&WsFrame::binary(tag.to_vec()).encode_server())
                 .await?;
@@ -260,7 +260,7 @@ impl WsSession {
                             if zlmediakit_core::gop_cache::is_config_frame(&frame) {
                                 continue;
                             }
-                            let tag = muxer.write_tag(&frame);
+                            let tag = muxer.write_tag(&frame)?;
                             let ws_frame = WsFrame::binary(tag.to_vec());
                             if let Err(e) = self.stream.write_all(&ws_frame.encode_server()).await {
                                 debug!("WS write error: {}", e);

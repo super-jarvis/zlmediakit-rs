@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time::Duration;
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::hook::HookClient;
-use zlmediakit_core::media_frame::{CodecId, MediaFrame};
+use zlmediakit_core::media_frame::{CodecId, MediaFrame, PayloadFormat};
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::recorder::{RecorderCommand, RecorderControl};
 use zlmediakit_core::stream_proxy::StreamProxyControl;
@@ -151,7 +151,10 @@ async fn recording_api_start_stop_via_http() {
 
     // Publish a stream
     let source = mgr.get_or_create("__defaultVhost__", "live", "recordtest");
-    let cfg = MediaFrame::new_video(0, CodecId::H264, 0, 0, 0, h264_config_data().into(), false);
+    let mut cfg =
+        MediaFrame::new_video(0, CodecId::H264, 0, 0, 0, h264_config_data().into(), false)
+            .with_payload_format(PayloadFormat::Flv);
+    cfg.config_frame = true;
     source.publish_and_cache(cfg).await;
     let key = MediaFrame::new_video(
         0,
@@ -164,7 +167,8 @@ async fn recording_api_start_stop_via_http() {
         ]
         .into(),
         true,
-    );
+    )
+    .with_payload_format(PayloadFormat::Flv);
     source.publish_and_cache(key).await;
 
     // Verify stream exists
@@ -216,7 +220,8 @@ async fn recording_api_start_stop_via_http() {
             ]
             .into(),
             true,
-        );
+        )
+        .with_payload_format(PayloadFormat::Flv);
         source.publish_and_cache(frame).await;
     }
 

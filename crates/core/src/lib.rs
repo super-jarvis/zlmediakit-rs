@@ -8,6 +8,7 @@ pub mod hook;
 pub mod media_frame;
 pub mod media_sink;
 pub mod media_source;
+pub mod payload;
 pub mod recorder;
 pub mod session;
 pub mod signal;
@@ -23,9 +24,15 @@ pub use error::{Error, Result};
 pub use event_bus::{Event, EventBus};
 pub use ffmpeg_source::{FFmpegCmd, FFmpegEntry, FFmpegSourceControl};
 pub use hook::{HookClient, HookConfig, HookResult};
-pub use media_frame::{AudioInfo, CodecId, FrameType, MediaFrame, MediaInfo, TrackInfo, VideoInfo};
+pub use media_frame::{
+    AudioInfo, CodecId, FrameType, MediaFrame, MediaInfo, PayloadFormat, TrackInfo, VideoInfo,
+};
 pub use media_sink::MediaSink;
 pub use media_source::{MediaSource, MediaSourceManager, SourceId};
+pub use payload::{
+    aac_audio_specific_config, aac_raw_payload, flv_payload, video_config_annex_b,
+    video_decoder_config, video_sample_annex_b, video_sample_length_prefixed,
+};
 pub use recorder::{RecorderCommand, RecorderControl};
 pub use session::{SessionId, SessionManager};
 pub use stream_proxy::{ProxyCmd, ProxyEntry, StreamProxyControl};

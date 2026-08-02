@@ -16,7 +16,10 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 use zlmediakit_codec::ps::{extract_nalus_from_pes, PesPacket, PsDemuxer};
-use zlmediakit_core::{media_frame::CodecId, MediaFrame, MediaSourceManager};
+use zlmediakit_core::{
+    media_frame::{CodecId, PayloadFormat},
+    MediaFrame, MediaSourceManager,
+};
 
 /// Payload type carried inside the RTP packets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,12 +176,14 @@ impl RtpStreamReceiver {
             pts_ms,
             Bytes::copy_from_slice(nalu),
             key,
-        );
+        )
+        .with_payload_format(PayloadFormat::AnnexB);
         self.publish(frame).await;
     }
 
     async fn publish_audio(&self, data: Bytes, pts_ms: u64) {
-        let frame = MediaFrame::new_audio(1, self.audio_codec, pts_ms as u32, pts_ms, pts_ms, data);
+        let frame = MediaFrame::new_audio(1, self.audio_codec, pts_ms as u32, pts_ms, pts_ms, data)
+            .with_payload_format(PayloadFormat::Raw);
         self.publish(frame).await;
     }
 

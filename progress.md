@@ -1,5 +1,66 @@
 # 进度日志
 
+## 2026-08-02
+
+- 新增 `protocol_conversion_matrix` 真实媒体测试：ffmpeg 生成 H.264/AAC FLV，项目自身完成解复用及 FLV、MPEG-TS、MP4、fMP4 转封装，四种产物均通过 ffprobe 编码识别与 ffmpeg 全量解码。
+- FLV demuxer 现保留完整 FLV payload 并标注 `PayloadFormat::Flv`，正确设置配置帧、解析有符号 CTS 得到 PTS，并对未知视频/音频编码返回 `CodecId::Unknown`，不再伪装为 H.264/AAC；FLV 测试 13+4+2 全通过。
+- 真实播放器验证暴露并修复普通 MP4 的 VisualSampleEntry、tkhd/mvhd、dref/url、AAC esds、采样率定点数及 chunk offset 错误；MP4 改为合法的 ftyp+mdat+moov 布局，19 个库测试和 2 个 recorder E2E 通过。
+- 修复 fMP4 空 sample table、avcC/hvcC 配置截断、compressor name 长度、mvex/trex 缺失、trun flags/data_offset 及音视频 mdat 偏移；初始化段与媒体段拼接后已可被 ffprobe/ffmpeg 读取和解码。
+- FLV muxer 的 `write_tag` 改为显式返回 `Result`，不再在转换失败时原样写入无效 payload；补充 MP3 FLV 封装，Opus 等 classic FLV 不支持组合会明确返回错误。
+- 修复 H.264 SPS 边界检查：解析宽高前要求至少 7 字节，避免畸形/精简测试配置触发越界 panic。
+- 增加真实 H.265/AAC MP4 输入矩阵：项目解复用后分别转为 HLS MPEG-TS、普通 MP4、fMP4，三种输出均通过 ffprobe 的 HEVC/AAC 识别和 ffmpeg 全量解码；H.264 与 H.265 两条播放器级矩阵共 2/2 通过。
+- 外部 ffmpeg MP4 揭示 demuxer 将规范的文件绝对 chunk offset 错当作 `mdat` 内偏移，并错误地把 `stsc` 每条记录当成单个 chunk；已改为以完整文件取样并按 `first_chunk` 范围展开，MP4 19+2 回归测试继续通过。
+- 最终 WSL 门禁全部通过：`cargo fmt --all --check`、`cargo check --workspace --all-targets`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace --tests`、`cargo build --workspace --release`。
+- WebRTC 可选 `aac-transcode` feature 最终复验通过：5 个单元/转码测试和 3 个 WHIP/WHEP 网络 E2E 全绿。
+- 严格 FLV 错误返回使旧录制/VOD/WS-FLV 测试夹具缺少 `config_frame`/`PayloadFormat` 的问题可见；所有夹具已补成真实 FLV 语义，HTTP crate 全套 E2E 与最终 workspace 全量测试通过。
+- README 已增加编解码与协议互转边界矩阵、转码限制、Linux/ffmpeg/可选 AAC→Opus 依赖和 CI 等价验证命令，并修正 badge 链接仓库所有者。
+
+- 安装 WSL 验证依赖 `libopus-dev`/`libfdk-aac-dev` 后，WebRTC `aac-transcode` feature 全套通过：5 个单元/转码测试和 3 个 WHEP/WHIP 网络 E2E；默认 feature 的 3+3 测试也通过。
+
+- Core/WebRTC 首轮编译发现 `video_config_annex_b` 代码块在编辑时重复插入两次；已删除重复定义并保留单一实现，属于局部编辑失误而非设计问题。
+
+- Core 新增 decoder config→Annex-B 参数集转换，WHEP H.264 输出已用它和统一 sample 转换替换 FLV/AVCC 私有解析，因此可直接播放 RTMP/RTSP/WHIP/SRT/GB28181 来源的 H.264。
+- WebRTC AAC→Opus feature 路径已在送入解码器前规范化 ASC 和 raw AAC，避免把 FLV/ADTS 头传给 AAC decoder。
+
+- SRT/GB28181 crate 全套 18 个测试通过；新增 PES payload、PTS/DTS 与 90 kHz→ms 用例均通过，原有 SIP/PS/RTP 测试无回归。
+
+- SRT MPEG-TS demux 已改为解析 PES `PTS_DTS_flags`、header length 与 33-bit PTS/DTS，并保存到各音视频 PES 累积器；去掉按每次 `srt_recv` 固定加 40 ms 的 TS 时间轴。
+- 修复原 `extract_pes_payload` 把 PES packet length 高字节误当 optional header length（`6 + payload[4]`）的问题；现在使用规范位置 `9 + payload[8]`。
+- 去掉每个 SRT recv buffer 末尾强制 flush PES 的行为，避免跨 recv 的 PES 被拆成残帧；改为下一个 payload-unit-start 或连接关闭时 flush。
+
+- RTSP 全套验证通过：9 个单元测试、3 个 Digest 鉴权测试及 H.264/H.265 推流、拉流代理网络 E2E 全部无失败；新增 Annex-B、ADTS、Opus 与真实音频 SDP 用例均通过。
+
+- RTSP 首轮测试编译仅失败于新增 SDP 单测构造 `AudioInfo` 时遗漏 `bits_per_sample` 字段；实现代码已通过该编译阶段，测试夹具字段现已补齐。
+
+- RTSP 输出开始统一：视频先经 core 规范化为 FLV/长度前缀再进入现有 H.264/H.265 RTP packetizer；音频 packetizer 按 AAC/Opus/G.711/L16/MP3(MPA) 分流并使用对应 RTP payload type/clock rate。
+- RTSP DESCRIBE 已按真实音频 codec 生成 AAC、Opus、PCMA、PCMU、MPA、L16 SDP，不再把任意音频轨固定声明成 AAC。
+
+- 统一 FLV/RTMP 输出验证通过：core 41+9、FLV 11+3+2、RTMP 单元与全部网络 E2E（含 RTMPS/推拉流/HEVC/音视频）均无失败。
+
+- Core 新增统一 `flv_payload` 输出转换：H.264/H.265 自动生成 FLV video packet 头并转长度前缀样本，AAC 自动移除 ADTS 并生成 FLV AAC packet，G.711 A/U 可生成 FLV 音频头；已增加 Annex-B→FLV 与 ADTS→FLV 回归用例。
+
+- HLS 首轮编译定位到一个测试仍直接调用已重命名的 HEVC 配置解析 helper；已改为验证无 FLV 头的 hvcC record，并清理不再使用的 FLV 私有转换函数。
+
+- HLS 分片与 live HTTP/WS-TS 媒体路径已切到统一 payload 转换层：视频统一规范化为 Annex-B，AAC 统一为 ADTS，并避免对已有 ADTS 输入重复加头。
+- HLS 配置帧识别开始使用显式 `config_frame`/`PayloadFormat`，同时保留旧 FLV 内容识别兼容逻辑。
+
+- 用户要求建立持续目标并落实所有协议与互转能力；已创建活动目标。
+- 使用 planning-with-files-zh 技能恢复现有计划、发现和进度文件；Windows PATH 缺少 Python，`session-catchup.py` 未能执行，已改用完整读取文件与 Git 状态手动恢复。
+- 建立 codebase-memory-mcp fast 索引：2955 nodes、11778 edges。
+- 完成第一轮协议完整性审计，定位内部负载格式不统一、SRT 时间戳简化、RTSP 音频 SDP 固定 AAC、默认 WebRTC AAC→Opus 未启用、MP4/fMP4 原样写入 FLV payload 等关键断点。
+- 将旧 CI 修复计划升级为八阶段协议落实计划；当前进入阶段 1：格式契约与失败测试。
+- 检查工作区发现用户已把 CI/Release 工作流移动到 `.github/workflows_bak/`；记录为保留改动，协议实现不会撤销。
+- 为 `MediaFrame` 增加 `PayloadFormat`，新增视频 FLV/AVCC/HVCC/Annex-B 与 AAC FLV/ADTS/Raw 的集中转换模块和首批单元测试。
+- 首轮 core 测试 38/39 通过；Annex-B 三字节起始码边界已修复。针对性复验显示转换器会把三字节起始码规范化为四字节，已修正测试预期，等待再次复验。
+- Annex-B 针对性测试复验通过；core 全套测试通过：39 个单元测试、9 个集成测试，无失败。
+- `cargo fmt --all --check` 首次仅报告新增代码格式差异，已运行 `cargo fmt --all`。
+- WSL `cargo check --workspace --all-targets` 通过，确认新增 `PayloadFormat` 字段和转换模块未破坏其他协议 crate 编译。
+- 已给 RTMP/RTSP、RTMP 拉流、WHIP、SRT、GB28181、转码输出和 MP4 解封装入口标注真实负载格式；workspace 全目标检查再次通过。
+- MP4/fMP4 muxer 改为写入前集中提取 decoder config、长度前缀视频样本和 raw AAC，新增两个防止 FLV 头进入 `mdat` 的回归测试。
+- MP4 首轮测试 18/19 通过；唯一失败是旧测试仍期待 FLV 头，已更新为新的正确样本契约。
+- MP4 库测试已 19/19 通过；recorder E2E 单独运行仍失败，排除并行目录竞争。
+- 根因是 recorder 启动窗口可能错过实时广播且未回放 GOP；已加入最新 GOP 回放，并让 MP4/fMP4 对旧式 FLV 配置帧使用内容识别兼容。
+
 ## 2026-08-01
 
 - 读取项目级全局指令 `RTK.md` 与 planning-with-files-zh 技能说明。

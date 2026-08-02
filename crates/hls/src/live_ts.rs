@@ -8,10 +8,10 @@
 use zlmediakit_core::media_frame::{CodecId, FrameType, MediaFrame};
 
 use crate::muxer::{
-    build_config_pes, build_data_pes_raw, extract_aac_config, extract_video_config,
-    flv_audio_to_adts, flv_audio_to_raw, flv_video_to_annex_b, is_aac_config, is_video_config,
-    TsWriter, AUDIO_PID, VIDEO_PID,
+    aac_frame_to_adts, build_config_pes, build_data_pes_raw, extract_aac_config,
+    extract_video_config, is_aac_config, is_video_config, TsWriter, AUDIO_PID, VIDEO_PID,
 };
+use zlmediakit_core::video_sample_annex_b;
 
 /// Continuously muxes frames into MPEG-TS packets.
 pub struct TsLiveMuxer {
@@ -58,7 +58,7 @@ impl TsLiveMuxer {
                 }
             }
             FrameType::Audio if is_aac_config(frame) => {
-                self.audio_config_data = Some(extract_aac_config(&frame.data));
+                self.audio_config_data = Some(extract_aac_config(frame));
                 self.audio_config_sent = false;
             }
             _ => {}
@@ -85,7 +85,9 @@ impl TsLiveMuxer {
                     }
                 }
                 if !is_video_config(frame) {
-                    let annex_b = flv_video_to_annex_b(&frame.data);
+                    let annex_b = video_sample_annex_b(frame)
+                        .map(|data| data.to_vec())
+                        .unwrap_or_default();
                     if !annex_b.is_empty() {
                         let pes = build_data_pes_raw(0xE0, &annex_b, frame.timestamp);
                         self.writer.write_pes(
@@ -108,11 +110,7 @@ impl TsLiveMuxer {
                     }
                 }
                 if !is_aac_config(frame) {
-                    let audio = if let Some(ref cfg) = self.audio_config_data {
-                        flv_audio_to_adts(&frame.data, cfg)
-                    } else {
-                        flv_audio_to_raw(&frame.data)
-                    };
+                    let audio = aac_frame_to_adts(frame, self.audio_config_data.as_deref());
                     if !audio.is_empty() {
                         let pes = build_data_pes_raw(0xC0, &audio, frame.timestamp);
                         self.writer
@@ -136,6 +134,7 @@ impl TsLiveMuxer {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use zlmediakit_core::PayloadFormat;
 
     fn avc_config_frame() -> MediaFrame {
         let sps = [0x67, 0x42, 0xC0, 0x1F, 0xD9, 0x01, 0x01];
@@ -222,5 +221,40 @@ mod tests {
         // The first frame carries PAT+PMT (3 packets); later frames must not.
         assert_eq!(first.len(), 3 * 188);
         assert!(second.len() < first.len());
+    }
+
+    #[test]
+    fn accepts_annex_b_video_without_flv_wrapping() {
+        let mut muxer = TsLiveMuxer::new();
+        let frame = MediaFrame::new_video(
+            0,
+            CodecId::H264,
+            40,
+            40,
+            40,
+            Bytes::from_static(&[0, 0, 0, 1, 0x65, 0x88, 0x84]),
+            true,
+        )
+        .with_payload_format(PayloadFormat::AnnexB);
+
+        let out = muxer.push_frame(&frame);
+        assert!(!out.is_empty());
+        assert_eq!(out.len() % 188, 0);
+        assert!(out.windows(7).any(|bytes| bytes == frame.data.as_ref()));
+    }
+
+    #[test]
+    fn accepts_existing_adts_audio_without_double_wrapping() {
+        let mut muxer = TsLiveMuxer::new();
+        let adts = Bytes::from_static(&[
+            0xFF, 0xF1, 0x50, 0x80, 0x01, 0x7F, 0xFC, 0x11, 0x22, 0x33, 0x44,
+        ]);
+        let frame = MediaFrame::new_audio(0, CodecId::AAC, 23, 23, 23, adts.clone())
+            .with_payload_format(PayloadFormat::Adts);
+
+        let out = muxer.push_frame(&frame);
+        assert!(!out.is_empty());
+        assert_eq!(out.len() % 188, 0);
+        assert!(out.windows(adts.len()).any(|bytes| bytes == adts.as_ref()));
     }
 }

@@ -7,8 +7,9 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::event_bus::{Event, EventBus};
+use zlmediakit_core::flv_payload;
 use zlmediakit_core::hook::{HookClient, HookResult};
-use zlmediakit_core::media_frame::{CodecId, FrameType, MediaFrame};
+use zlmediakit_core::media_frame::{CodecId, FrameType, MediaFrame, PayloadFormat};
 use zlmediakit_core::media_source::{MediaSource, MediaSourceManager};
 use zlmediakit_core::transport::TransportStream;
 
@@ -215,6 +216,7 @@ impl RtmpSession {
                                 let mut meta_frame =
                                     MediaFrame::new_video(0, CodecId::H264, 0, 0, 0, data, false);
                                 meta_frame.frame_type = FrameType::Metadata;
+                                meta_frame.payload_format = PayloadFormat::Amf0;
                                 if let Some(ref source) = self.source {
                                     source.publish_and_cache(meta_frame).await;
                                 }
@@ -272,7 +274,8 @@ impl RtmpSession {
                             timestamp as u64,
                             data,
                             key_frame,
-                        );
+                        )
+                        .with_payload_format(PayloadFormat::Flv);
                         frame.config_frame = is_config;
                         source.publish_and_cache(frame).await;
                     }
@@ -312,7 +315,8 @@ impl RtmpSession {
                             timestamp as u64,
                             timestamp as u64,
                             data,
-                        );
+                        )
+                        .with_payload_format(PayloadFormat::Flv);
                         frame.config_frame = is_config;
                         source.publish_and_cache(frame).await;
                     }
@@ -711,22 +715,8 @@ impl RtmpSession {
                         let mut writer = stream;
 
                         for frame in cached {
-                            let msg = match frame.frame_type {
-                                FrameType::Video => RtmpMessage::Video {
-                                    stream_id,
-                                    timestamp: frame.timestamp,
-                                    data: frame.data,
-                                },
-                                FrameType::Audio => RtmpMessage::Audio {
-                                    stream_id,
-                                    timestamp: frame.timestamp,
-                                    data: frame.data,
-                                },
-                                FrameType::Metadata => RtmpMessage::Amf0Data {
-                                    stream_id,
-                                    timestamp: frame.timestamp,
-                                    data: frame.data,
-                                },
+                            let Some(msg) = media_frame_to_rtmp_message(frame, stream_id) else {
+                                continue;
                             };
                             let encoded = encoder.encode(&msg);
                             if writer.write_all(&encoded).await.is_err() {
@@ -738,25 +728,9 @@ impl RtmpSession {
                         loop {
                             match rx.recv().await {
                                 Ok(frame) => {
-                                    if zlmediakit_core::gop_cache::is_config_frame(&frame) {
+                                    let Some(msg) = media_frame_to_rtmp_message(frame, stream_id)
+                                    else {
                                         continue;
-                                    }
-                                    let msg = match frame.frame_type {
-                                        FrameType::Metadata => RtmpMessage::Amf0Data {
-                                            stream_id,
-                                            timestamp: frame.timestamp,
-                                            data: frame.data,
-                                        },
-                                        FrameType::Video => RtmpMessage::Video {
-                                            stream_id,
-                                            timestamp: frame.timestamp,
-                                            data: frame.data,
-                                        },
-                                        _ => RtmpMessage::Audio {
-                                            stream_id,
-                                            timestamp: frame.timestamp,
-                                            data: frame.data,
-                                        },
                                     };
                                     if writer.write_all(&encoder.encode(&msg)).await.is_err() {
                                         break;
@@ -907,6 +881,37 @@ impl RtmpSession {
             None => (name.to_string(), String::new()),
         }
     }
+}
+
+fn media_frame_to_rtmp_message(mut frame: MediaFrame, stream_id: u32) -> Option<RtmpMessage> {
+    let timestamp = frame.timestamp;
+    if frame.frame_type == FrameType::Metadata {
+        return Some(RtmpMessage::Amf0Data {
+            stream_id,
+            timestamp,
+            data: frame.data,
+        });
+    }
+
+    // Older producers were not required to set the explicit flag. Preserve
+    // compatibility while making the shared converter's contract unambiguous.
+    if zlmediakit_core::gop_cache::is_config_frame(&frame) {
+        frame.config_frame = true;
+    }
+    let data = flv_payload(&frame).ok()?;
+    Some(match frame.frame_type {
+        FrameType::Video => RtmpMessage::Video {
+            stream_id,
+            timestamp,
+            data,
+        },
+        FrameType::Audio => RtmpMessage::Audio {
+            stream_id,
+            timestamp,
+            data,
+        },
+        FrameType::Metadata => unreachable!(),
+    })
 }
 
 /// Normalizes an enhanced-RTMP (E-RTMP, `IsExHeader` bit set) HEVC video
@@ -1084,5 +1089,41 @@ mod tests {
         av1.extend_from_slice(b"av01");
         av1.push(0x00);
         assert!(normalize_enhanced_video(&Bytes::from(av1)).is_none());
+    }
+
+    #[test]
+    fn playback_normalizes_annex_b_and_adts_frames() {
+        let video = MediaFrame::new_video(
+            0,
+            CodecId::H264,
+            40,
+            40,
+            40,
+            Bytes::from_static(&[0, 0, 0, 1, 0x65, 0x88]),
+            true,
+        )
+        .with_payload_format(PayloadFormat::AnnexB);
+        match media_frame_to_rtmp_message(video, 1).unwrap() {
+            RtmpMessage::Video { data, .. } => {
+                assert_eq!(data.as_ref(), &[0x17, 1, 0, 0, 0, 0, 0, 0, 2, 0x65, 0x88]);
+            }
+            message => panic!("expected video message, got {message:?}"),
+        }
+
+        let audio = MediaFrame::new_audio(
+            0,
+            CodecId::AAC,
+            23,
+            23,
+            23,
+            Bytes::from_static(&[0xff, 0xf1, 0x50, 0x80, 0, 0, 0, 0x11, 0x22]),
+        )
+        .with_payload_format(PayloadFormat::Adts);
+        match media_frame_to_rtmp_message(audio, 1).unwrap() {
+            RtmpMessage::Audio { data, .. } => {
+                assert_eq!(data.as_ref(), &[0xaf, 1, 0x11, 0x22]);
+            }
+            message => panic!("expected audio message, got {message:?}"),
+        }
     }
 }

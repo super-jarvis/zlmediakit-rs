@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tracing::{info, warn};
-use zlmediakit_core::media_frame::{AudioInfo, MediaFrame, TrackInfo, VideoInfo};
+use zlmediakit_core::media_frame::{AudioInfo, MediaFrame, PayloadFormat, TrackInfo, VideoInfo};
 use zlmediakit_core::media_source::MediaSourceManager;
 
 #[derive(Debug)]
@@ -272,7 +272,8 @@ pub async fn start(
                         timestamp as u64,
                         data,
                         key_frame,
-                    );
+                    )
+                    .with_payload_format(PayloadFormat::Flv);
                     frame.config_frame = is_config;
                     source.publish_and_cache(frame).await;
                 }
@@ -303,7 +304,8 @@ pub async fn start(
                         timestamp as u64,
                         timestamp as u64,
                         data,
-                    );
+                    )
+                    .with_payload_format(PayloadFormat::Flv);
                     frame.config_frame = is_config;
                     source.publish_and_cache(frame).await;
                 }

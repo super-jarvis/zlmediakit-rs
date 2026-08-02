@@ -1,5 +1,8 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use zlmediakit_core::media_frame::{CodecId, FrameType, MediaFrame};
+use zlmediakit_core::{
+    aac_audio_specific_config, aac_raw_payload, video_decoder_config, video_sample_length_prefixed,
+};
 
 pub struct Mp4Muxer {
     video_codec: Option<CodecId>,
@@ -46,21 +49,33 @@ impl Mp4Muxer {
             self.base_time = Some(frame.timestamp);
         }
 
-        if frame.config_frame {
+        if frame.config_frame || zlmediakit_core::gop_cache::is_config_frame(frame) {
             match frame.frame_type {
                 FrameType::Video => {
+                    let config = match video_decoder_config(frame) {
+                        Ok(config) => config,
+                        Err(_) => return,
+                    };
                     self.video_codec = Some(frame.codec);
-                    self.video_config = Some(frame.data.clone());
-                    if let Some(info) = extract_video_info(&frame.codec, &frame.data) {
+                    self.video_config = Some(config.clone());
+                    if let Some(info) = extract_video_info(&frame.codec, &config) {
                         self.width = info.0;
                         self.height = info.1;
                         self.fps = info.2;
                     }
                 }
                 FrameType::Audio => {
+                    let config = if frame.codec == CodecId::AAC {
+                        match aac_audio_specific_config(frame) {
+                            Ok(config) => config,
+                            Err(_) => return,
+                        }
+                    } else {
+                        frame.data.clone()
+                    };
                     self.audio_codec = Some(frame.codec);
-                    self.audio_config = Some(frame.data.clone());
-                    self.sample_rate = frame.data.len() as u32;
+                    self.audio_config = Some(config.clone());
+                    self.sample_rate = config_to_sample_rate(&config);
                     self.channels = 1;
                 }
                 _ => {}
@@ -90,9 +105,21 @@ impl Mp4Muxer {
         let base = self.base_time.unwrap_or(0);
         let ts = frame.timestamp.saturating_sub(base);
 
+        let data = match frame.frame_type {
+            FrameType::Video => match video_sample_length_prefixed(frame) {
+                Ok(data) => data,
+                Err(_) => return,
+            },
+            FrameType::Audio if frame.codec == CodecId::AAC => match aac_raw_payload(frame) {
+                Ok(data) => data,
+                Err(_) => return,
+            },
+            _ => frame.data.clone(),
+        };
+
         let sample = SampleEntry {
             track_id: if is_video { 0 } else { 1 },
-            data: frame.data.clone(),
+            data,
             timestamp: ts,
             duration: 0,
             is_sync: is_video && frame.key_frame,
@@ -213,8 +240,8 @@ impl Mp4Muxer {
 
         let mut output = BytesMut::new();
         output.extend_from_slice(&ftyp);
-        output.extend_from_slice(&moov_box);
         output.extend_from_slice(&mdat_box);
+        output.extend_from_slice(&moov_box);
         output
     }
 
@@ -330,16 +357,12 @@ fn write_mvhd(buf: &mut BytesMut, duration_ms: u32, next_track_id: u32) {
         d.put_u32(0x00010000); // rate (1.0 fixed-point)
         d.put_u16(0x0100); // volume (1.0)
         d.put_u16(0); // reserved
-        d.put_u32(0); // reserved
-        d.put_u32(0); // matrix[0]
-        d.put_u32(0x00010000); // matrix[1]
-        d.put_u32(0); // matrix[2]
-        d.put_u32(0); // matrix[3]
-        d.put_u32(0x00010000); // matrix[4]
-        d.put_u32(0); // matrix[5]
-        d.put_u32(0); // matrix[6]
-        d.put_u32(0); // matrix[7]
-        d.put_u32(0x40000000); // matrix[8]
+        d.put_u32(0); // reserved[0]
+        d.put_u32(0); // reserved[1]
+        let matrix: [u32; 9] = [0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000];
+        for value in matrix {
+            d.put_u32(value);
+        }
         d.put_u32(0); // pre_defined
         d.put_u32(0);
         d.put_u32(0);
@@ -373,7 +396,7 @@ fn write_trak(
     write_tkhd(
         &mut trak,
         track_id,
-        duration / (1000 / timescale.min(1000)),
+        (duration as u64 * 1000 / timescale.max(1) as u64) as u32,
         width,
         height,
     );
@@ -415,10 +438,11 @@ fn write_tkhd(buf: &mut BytesMut, track_id: u32, duration: u32, width: u32, heig
         d.put_u32(track_id);
         d.put_u32(0); // reserved
         d.put_u32(duration);
-        d.put_u32(0); // reserved
-        d.put_u32(0); // layer
+        d.put_u32(0); // reserved[0]
+        d.put_u32(0); // reserved[1]
+        d.put_u16(0); // layer
         d.put_u16(0); // alternate_group
-        d.put_u16(if width > 0 { 0x0100 } else { 0 }); // volume
+        d.put_u16(if width == 0 { 0x0100 } else { 0 }); // volume
         d.put_u16(0); // reserved
         let m: [u32; 9] = [0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000];
         for &v in &m {
@@ -483,16 +507,13 @@ fn write_smhd(buf: &mut BytesMut) {
 }
 
 fn write_dinf(buf: &mut BytesMut) {
-    let dref_data = {
-        let mut d = BytesMut::new();
-        d.put_u32(0); // version + flags
-        d.put_u32(1); // entry_count
-        let url_data = BytesMut::new();
-        let url_box = make_box(b"url ", &url_data);
-        d.extend_from_slice(&url_box);
-        d
-    };
-    let dref_box = make_box(b"dref", &dref_data);
+    let mut url_box = BytesMut::new();
+    write_full_box(&mut url_box, b"url ", 0, 1, &[]);
+    let mut dref_data = BytesMut::new();
+    dref_data.put_u32(1); // entry_count
+    dref_data.extend_from_slice(&url_box);
+    let mut dref_box = BytesMut::new();
+    write_full_box(&mut dref_box, b"dref", 0, 0, &dref_data);
     buf.extend_from_slice(&make_box(b"dinf", &dref_box));
 }
 
@@ -534,9 +555,12 @@ fn write_stsd(
             sample.put_u32(0); // reserved
             sample.put_u16(0); // reserved
             sample.put_u16(1); // data_reference_index
-            sample.put_u16(0); // width_hi
+            sample.put_u16(0); // pre_defined
+            sample.put_u16(0); // reserved
+            sample.put_u32(0); // pre_defined[0]
+            sample.put_u32(0); // pre_defined[1]
+            sample.put_u32(0); // pre_defined[2]
             sample.put_u16(width as u16); // width
-            sample.put_u16(0); // height_hi
             sample.put_u16(height as u16); // height
             sample.put_u32(0x00480000); // horizresolution
             sample.put_u32(0x00480000); // vertresolution
@@ -560,8 +584,11 @@ fn write_stsd(
             sample.put_u16(0);
             sample.put_u16(1);
             sample.put_u16(0);
-            sample.put_u16(width as u16);
             sample.put_u16(0);
+            sample.put_u32(0);
+            sample.put_u32(0);
+            sample.put_u32(0);
+            sample.put_u16(width as u16);
             sample.put_u16(height as u16);
             sample.put_u32(0x00480000);
             sample.put_u32(0x00480000);
@@ -592,9 +619,10 @@ fn write_stsd(
             sample.put_u16(16); // sample_size
             sample.put_u16(0); // compression_id
             sample.put_u16(0); // packet_size
-            sample.put_u32(config_to_sample_rate(config)); // sample_rate
+            sample.put_u32(config_to_sample_rate(config) << 16); // sample_rate (16.16)
 
             let mut esds = BytesMut::new();
+            esds.put_u32(0); // version + flags
             let audio_config = if config.is_empty() {
                 vec![0x12, 0x10]
             } else {
@@ -694,6 +722,9 @@ fn write_stco(buf: &mut BytesMut, chunk_offset: u32) {
 }
 
 fn parse_avcc_config(data: &[u8]) -> Vec<u8> {
+    if data.first() == Some(&1) && data.len() >= 7 {
+        return data.to_vec();
+    }
     // data includes the 5-byte FLV video tag header [codec_id, packet_type, comp_time(3)],
     // so the actual AVCDecoderConfigurationRecord starts at offset 5.
     let inner = if data.len() > 5 {
@@ -737,6 +768,9 @@ fn parse_avcc_config(data: &[u8]) -> Vec<u8> {
 }
 
 fn parse_hvcc_config(data: &[u8]) -> Vec<u8> {
+    if data.first() == Some(&1) && data.len() >= 23 {
+        return data.to_vec();
+    }
     let inner = if data.len() > 5 {
         &data[5..]
     } else {
@@ -1080,6 +1114,27 @@ mod tests {
         muxer.push_frame(&h264_key_frame(66, &[0xCC]));
         muxer.finalize();
         assert_eq!(muxer.samples.len(), 3);
-        assert_eq!(&muxer.samples[0].data[..], b"\x17\x01\x00\x00\x00\xAA");
+        assert_eq!(&muxer.samples[0].data[..], b"\xAA");
+    }
+
+    #[test]
+    fn push_frame_strips_flv_headers_from_samples() {
+        use zlmediakit_core::PayloadFormat;
+
+        let mut muxer = Mp4Muxer::new();
+        let frame = MediaFrame::new_video(
+            0,
+            CodecId::H264,
+            0,
+            0,
+            0,
+            Bytes::from_static(&[0x17, 1, 0, 0, 0, 0, 0, 0, 2, 0x65, 0x88]),
+            true,
+        )
+        .with_payload_format(PayloadFormat::Flv);
+        muxer.push_frame(&frame);
+
+        assert_eq!(muxer.samples.len(), 1);
+        assert_eq!(muxer.samples[0].data.as_ref(), &[0, 0, 0, 2, 0x65, 0x88]);
     }
 }

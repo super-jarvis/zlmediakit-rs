@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{error, info, warn};
-use zlmediakit_core::media_frame::{CodecId, MediaFrame};
+use zlmediakit_core::media_frame::{CodecId, MediaFrame, PayloadFormat};
 use zlmediakit_core::media_source::MediaSourceManager;
 
 /// Configuration for the SRT server.
@@ -171,6 +171,10 @@ struct TsContext {
     video_accum: Vec<u8>,
     /// Accumulated PES payload for the current audio frame.
     audio_accum: Vec<u8>,
+    video_pts: Option<u64>,
+    video_dts: Option<u64>,
+    audio_pts: Option<u64>,
+    audio_dts: Option<u64>,
 }
 
 impl TsContext {
@@ -181,6 +185,10 @@ impl TsContext {
             pmt_pid: None,
             video_accum: Vec::new(),
             audio_accum: Vec::new(),
+            video_pts: None,
+            video_dts: None,
+            audio_pts: None,
+            audio_dts: None,
         }
     }
 }
@@ -225,8 +233,8 @@ async fn handle_srt_connection(fd: c_int, sm: Arc<MediaSourceManager>, streamid:
                 } else if data.len() >= 4 {
                     // Not TS — fall back to raw frame detection.
                     publish_raw_frame(&data, &source, &mut timestamp).await;
+                    timestamp = timestamp.wrapping_add(40);
                 }
-                timestamp += 40;
             }
             Ok(Err(0)) => {
                 info!("SRT connection closed (fd={})", fd);
@@ -243,6 +251,8 @@ async fn handle_srt_connection(fd: c_int, sm: Arc<MediaSourceManager>, streamid:
             }
         }
     }
+
+    flush_ts_context(&mut ctx, &source, &mut timestamp).await;
 
     unsafe { ffi::srt_close(fd) };
 }
@@ -299,39 +309,77 @@ async fn demux_ts_packets(
         let is_audio = pid == audio_pid;
 
         if is_video && !payload.is_empty() {
-            let pes_payload = extract_pes_payload(payload, payload_unit_start);
-            if let Some(p) = pes_payload {
+            if let Some(pes) = extract_pes_payload(payload, payload_unit_start) {
                 if payload_unit_start {
                     if !ctx.video_accum.is_empty() {
-                        publish_video(&ctx.video_accum, source, timestamp).await;
+                        publish_video(
+                            &ctx.video_accum,
+                            source,
+                            ctx.video_pts,
+                            ctx.video_dts,
+                            timestamp,
+                        )
+                        .await;
                         ctx.video_accum.clear();
                     }
-                    ctx.video_accum.extend_from_slice(p);
-                } else {
-                    ctx.video_accum.extend_from_slice(p);
+                    ctx.video_pts = pes.pts;
+                    ctx.video_dts = pes.dts.or(pes.pts);
                 }
+                ctx.video_accum.extend_from_slice(pes.data);
             }
         } else if is_audio && !payload.is_empty() {
-            let pes_payload = extract_pes_payload(payload, payload_unit_start);
-            if let Some(p) = pes_payload {
+            if let Some(pes) = extract_pes_payload(payload, payload_unit_start) {
                 if payload_unit_start && !ctx.audio_accum.is_empty() {
-                    publish_audio(&ctx.audio_accum, source, timestamp).await;
+                    publish_audio(
+                        &ctx.audio_accum,
+                        source,
+                        ctx.audio_pts,
+                        ctx.audio_dts,
+                        timestamp,
+                    )
+                    .await;
                     ctx.audio_accum.clear();
                 }
-                ctx.audio_accum.extend_from_slice(p);
+                if payload_unit_start {
+                    ctx.audio_pts = pes.pts;
+                    ctx.audio_dts = pes.dts.or(pes.pts);
+                }
+                ctx.audio_accum.extend_from_slice(pes.data);
             }
         }
 
         offset += TS_PACKET_SIZE;
     }
 
-    // Flush remaining accumulated data.
+    // A PES may span multiple SRT receive calls. It is flushed when the next
+    // payload-unit-start arrives, or when the connection closes.
+}
+
+async fn flush_ts_context(
+    ctx: &mut TsContext,
+    source: &zlmediakit_core::media_source::MediaSource,
+    timestamp: &mut u32,
+) {
     if !ctx.video_accum.is_empty() {
-        publish_video(&ctx.video_accum, source, timestamp).await;
+        publish_video(
+            &ctx.video_accum,
+            source,
+            ctx.video_pts,
+            ctx.video_dts,
+            timestamp,
+        )
+        .await;
         ctx.video_accum.clear();
     }
     if !ctx.audio_accum.is_empty() {
-        publish_audio(&ctx.audio_accum, source, timestamp).await;
+        publish_audio(
+            &ctx.audio_accum,
+            source,
+            ctx.audio_pts,
+            ctx.audio_dts,
+            timestamp,
+        )
+        .await;
         ctx.audio_accum.clear();
     }
 }
@@ -402,45 +450,93 @@ fn parse_pmt(payload: &[u8], ctx: &mut TsContext) {
     }
 }
 
-/// Extracts PES packet payload from a TS packet payload.
-fn extract_pes_payload(payload: &[u8], unit_start: bool) -> Option<&[u8]> {
+#[derive(Debug, PartialEq, Eq)]
+struct PesPayload<'a> {
+    data: &'a [u8],
+    pts: Option<u64>,
+    dts: Option<u64>,
+}
+
+/// Extracts a PES elementary-stream payload and its 90 kHz timestamps.
+fn extract_pes_payload(payload: &[u8], unit_start: bool) -> Option<PesPayload<'_>> {
     if !unit_start {
-        return Some(payload);
+        return Some(PesPayload {
+            data: payload,
+            pts: None,
+            dts: None,
+        });
     }
-    if payload.len() < 6 {
+    if payload.len() < 9 {
         return None;
     }
     // PES header: 0x00 0x00 0x01 stream_id
     if payload[0] != 0x00 || payload[1] != 0x00 || payload[2] != 0x01 {
-        return Some(payload);
+        return Some(PesPayload {
+            data: payload,
+            pts: None,
+            dts: None,
+        });
     }
-    let data_start = 6 + payload[4] as usize;
+    let pts_dts_flags = (payload[7] >> 6) & 0x03;
+    let header_len = payload[8] as usize;
+    let data_start = 9 + header_len;
     if data_start > payload.len() {
         return None;
     }
-    Some(&payload[data_start..])
+    let pts = if matches!(pts_dts_flags, 0x02 | 0x03) {
+        parse_pes_timestamp(payload.get(9..14)?)
+    } else {
+        None
+    };
+    let dts = if pts_dts_flags == 0x03 {
+        parse_pes_timestamp(payload.get(14..19)?)
+    } else {
+        None
+    };
+    Some(PesPayload {
+        data: &payload[data_start..],
+        pts,
+        dts,
+    })
+}
+
+fn parse_pes_timestamp(data: &[u8]) -> Option<u64> {
+    if data.len() < 5 {
+        return None;
+    }
+    Some(
+        (((data[0] as u64 >> 1) & 0x07) << 30)
+            | ((data[1] as u64) << 22)
+            | (((data[2] as u64 >> 1) & 0x7f) << 15)
+            | ((data[3] as u64) << 7)
+            | ((data[4] as u64 >> 1) & 0x7f),
+    )
 }
 
 /// Publishes accumulated video data as a MediaFrame.
 async fn publish_video(
     data: &[u8],
     source: &zlmediakit_core::media_source::MediaSource,
-    timestamp: &mut u32,
+    pts: Option<u64>,
+    dts: Option<u64>,
+    fallback_timestamp: &mut u32,
 ) {
     if data.len() < 4 {
         return;
     }
     let codec = detect_codec(data);
     let key_frame = is_keyframe(data, codec);
+    let (timestamp, pts_ms, dts_ms) = media_timestamps(pts, dts, fallback_timestamp);
     let frame = MediaFrame::new_video(
         0,
         codec,
-        *timestamp,
-        *timestamp as u64,
-        *timestamp as u64,
+        timestamp,
+        pts_ms,
+        dts_ms,
         bytes::Bytes::copy_from_slice(data),
         key_frame,
-    );
+    )
+    .with_payload_format(PayloadFormat::AnnexB);
     source.publish_and_cache(frame).await;
 }
 
@@ -448,22 +544,46 @@ async fn publish_video(
 async fn publish_audio(
     data: &[u8],
     source: &zlmediakit_core::media_source::MediaSource,
-    timestamp: &mut u32,
+    pts: Option<u64>,
+    dts: Option<u64>,
+    fallback_timestamp: &mut u32,
 ) {
     if data.len() < 7 {
         return;
     }
     // Check for AAC ADTS sync word (0xFFF).
     if data[0] == 0xFF && (data[1] & 0xF0) == 0xF0 {
+        let (timestamp, pts_ms, dts_ms) = media_timestamps(pts, dts, fallback_timestamp);
         let frame = MediaFrame::new_audio(
             0,
             zlmediakit_core::media_frame::CodecId::AAC,
-            *timestamp,
-            *timestamp as u64,
-            *timestamp as u64,
+            timestamp,
+            pts_ms,
+            dts_ms,
             bytes::Bytes::copy_from_slice(data),
-        );
+        )
+        .with_payload_format(PayloadFormat::Adts);
         source.publish_and_cache(frame).await;
+    }
+}
+
+fn media_timestamps(
+    pts: Option<u64>,
+    dts: Option<u64>,
+    fallback_timestamp: &mut u32,
+) -> (u32, u64, u64) {
+    let pts_ms = pts.map(|value| value.saturating_mul(1000) / 90_000);
+    let dts_ms = dts.or(pts).map(|value| value.saturating_mul(1000) / 90_000);
+    match (pts_ms, dts_ms) {
+        (Some(pts_ms), Some(dts_ms)) => {
+            *fallback_timestamp = dts_ms as u32;
+            (dts_ms as u32, pts_ms, dts_ms)
+        }
+        _ => {
+            let timestamp = *fallback_timestamp;
+            *fallback_timestamp = (*fallback_timestamp).wrapping_add(40);
+            (timestamp, timestamp as u64, timestamp as u64)
+        }
     }
 }
 
@@ -484,7 +604,8 @@ async fn publish_raw_frame(
             *timestamp as u64,
             bytes::Bytes::copy_from_slice(data),
             key_frame,
-        );
+        )
+        .with_payload_format(PayloadFormat::AnnexB);
         source.publish_and_cache(frame).await;
     }
 }
@@ -570,5 +691,58 @@ fn is_keyframe(data: &[u8], codec: CodecId) -> bool {
             false
         }
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_timestamp(prefix: u8, value: u64) -> [u8; 5] {
+        [
+            (prefix << 4) | (((value >> 30) as u8 & 0x07) << 1) | 1,
+            (value >> 22) as u8,
+            (((value >> 15) as u8 & 0x7f) << 1) | 1,
+            (value >> 7) as u8,
+            ((value as u8 & 0x7f) << 1) | 1,
+        ]
+    }
+
+    #[test]
+    fn extracts_pes_payload_and_pts_from_optional_header() {
+        let pts = 90_000u64;
+        let mut pes = vec![0, 0, 1, 0xe0, 0, 0, 0x80, 0x80, 5];
+        pes.extend_from_slice(&encode_timestamp(2, pts));
+        pes.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88]);
+
+        let parsed = extract_pes_payload(&pes, true).unwrap();
+        assert_eq!(parsed.pts, Some(pts));
+        assert_eq!(parsed.dts, None);
+        assert_eq!(parsed.data, &[0, 0, 0, 1, 0x65, 0x88]);
+    }
+
+    #[test]
+    fn extracts_distinct_pts_and_dts() {
+        let pts = 180_000u64;
+        let dts = 176_400u64;
+        let mut pes = vec![0, 0, 1, 0xe0, 0, 0, 0x80, 0xc0, 10];
+        pes.extend_from_slice(&encode_timestamp(3, pts));
+        pes.extend_from_slice(&encode_timestamp(1, dts));
+        pes.push(0xaa);
+
+        let parsed = extract_pes_payload(&pes, true).unwrap();
+        assert_eq!(parsed.pts, Some(pts));
+        assert_eq!(parsed.dts, Some(dts));
+        assert_eq!(parsed.data, &[0xaa]);
+    }
+
+    #[test]
+    fn converts_pes_clock_to_media_milliseconds() {
+        let mut fallback = 0;
+        assert_eq!(
+            media_timestamps(Some(180_000), Some(176_400), &mut fallback),
+            (1960, 2000, 1960)
+        );
+        assert_eq!(fallback, 1960);
     }
 }

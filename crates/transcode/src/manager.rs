@@ -21,7 +21,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
-use zlmediakit_core::{CodecId, FrameType, MediaFrame, MediaSource, MediaSourceManager};
+use zlmediakit_core::{
+    CodecId, FrameType, MediaFrame, MediaSource, MediaSourceManager, PayloadFormat,
+};
 
 /// Output of a streaming transcode session, exposed via the manager for API
 /// reporting.
@@ -317,7 +319,8 @@ impl TranscodeSession {
                             ts as u64,
                             Bytes::from(unit),
                             key,
-                        );
+                        )
+                        .with_payload_format(PayloadFormat::AnnexB);
                         dest.publish_and_cache(out_frame).await;
                         out_frames.fetch_add(1, Ordering::Relaxed);
                     }

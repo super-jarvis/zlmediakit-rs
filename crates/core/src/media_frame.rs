@@ -56,6 +56,41 @@ pub enum FrameType {
     Metadata,
 }
 
+/// Byte-level representation carried by [`MediaFrame::data`].
+///
+/// Network protocols frequently use different representations for the same
+/// codec. Keeping that representation explicit prevents an Annex-B frame from
+/// accidentally being treated as an FLV video payload (or an FLV payload from
+/// being written verbatim into an MP4 sample).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PayloadFormat {
+    /// Legacy callers that have not declared their representation yet.
+    #[default]
+    Unknown,
+    /// FLV tag body, including the video/audio codec header.
+    Flv,
+    /// AVCDecoderConfigurationRecord for config frames, otherwise
+    /// length-prefixed H.264 NAL units.
+    Avcc,
+    /// HEVCDecoderConfigurationRecord for config frames, otherwise
+    /// length-prefixed H.265 NAL units.
+    Hvcc,
+    /// H.264/H.265 NAL units separated by Annex-B start codes.
+    AnnexB,
+    /// AAC AudioSpecificConfig bytes.
+    AacAudioSpecificConfig,
+    /// Raw AAC access unit without ADTS or FLV headers.
+    AacRaw,
+    /// AAC access unit with an ADTS header.
+    Adts,
+    /// Raw Opus packet.
+    Opus,
+    /// Codec-specific elementary payload not covered by a more precise value.
+    Raw,
+    /// AMF0 metadata payload.
+    Amf0,
+}
+
 #[derive(Debug, Clone)]
 pub struct VideoInfo {
     pub codec: CodecId,
@@ -95,6 +130,7 @@ pub struct MediaFrame {
     pub pts: u64,
     pub dts: u64,
     pub data: Bytes,
+    pub payload_format: PayloadFormat,
     pub key_frame: bool,
     pub config_frame: bool,
     pub received_at: Instant,
@@ -118,6 +154,7 @@ impl MediaFrame {
             pts,
             dts,
             data,
+            payload_format: PayloadFormat::Unknown,
             key_frame,
             config_frame: false,
             received_at: Instant::now(),
@@ -140,6 +177,7 @@ impl MediaFrame {
             pts,
             dts,
             data,
+            payload_format: PayloadFormat::Unknown,
             key_frame: false,
             config_frame: false,
             received_at: Instant::now(),
@@ -155,9 +193,16 @@ impl MediaFrame {
             pts: timestamp as u64,
             dts: timestamp as u64,
             data,
+            payload_format: PayloadFormat::Amf0,
             key_frame: false,
             config_frame: true,
             received_at: Instant::now(),
         }
+    }
+
+    /// Declares the byte-level representation stored in [`Self::data`].
+    pub fn with_payload_format(mut self, payload_format: PayloadFormat) -> Self {
+        self.payload_format = payload_format;
+        self
     }
 }

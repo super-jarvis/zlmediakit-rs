@@ -1,4 +1,6 @@
+use anyhow::Result;
 use bytes::{BufMut, BytesMut};
+use zlmediakit_core::flv_payload;
 use zlmediakit_core::media_frame::{CodecId, FrameType, MediaFrame};
 
 pub struct FlvMuxer {
@@ -23,7 +25,7 @@ impl FlvMuxer {
         buf
     }
 
-    pub fn write_tag(&self, frame: &MediaFrame) -> BytesMut {
+    pub fn write_tag(&self, frame: &MediaFrame) -> Result<BytesMut> {
         let tag_type = match frame.frame_type {
             FrameType::Video => 0x09,
             FrameType::Audio => 0x08,
@@ -31,13 +33,14 @@ impl FlvMuxer {
         };
 
         if frame.frame_type == FrameType::Metadata {
-            return self.write_metadata_tag(frame);
+            return Ok(self.write_metadata_tag(frame));
         }
 
-        let data_size = frame.data.len() as u32;
+        let payload = flv_payload(frame)?;
+        let data_size = payload.len() as u32;
         let timestamp = frame.timestamp & 0x7FFFFFFF;
 
-        let mut buf = BytesMut::with_capacity(11 + frame.data.len() + 4);
+        let mut buf = BytesMut::with_capacity(11 + payload.len() + 4);
 
         buf.put_u8(tag_type);
         buf.put_u8(((data_size >> 16) & 0xFF) as u8);
@@ -51,11 +54,11 @@ impl FlvMuxer {
         buf.put_u8(0);
         buf.put_u8(0);
 
-        buf.extend_from_slice(&frame.data);
+        buf.extend_from_slice(&payload);
 
         buf.put_u32(11 + data_size);
 
-        buf
+        Ok(buf)
     }
 
     fn write_metadata_tag(&self, frame: &MediaFrame) -> BytesMut {

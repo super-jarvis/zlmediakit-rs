@@ -1,7 +1,7 @@
 //! Tests for `FlvMuxer` — converting `MediaFrame`s into FLV tags.
 
 use bytes::Bytes;
-use zlmediakit_core::media_frame::{CodecId, MediaFrame};
+use zlmediakit_core::media_frame::{CodecId, MediaFrame, PayloadFormat};
 use zlmediakit_flv::FlvMuxer;
 
 fn h264_config() -> MediaFrame {
@@ -38,14 +38,14 @@ fn flv_tags_emitted_for_video_audio() {
     let mut muxer = FlvMuxer::new();
     muxer.write_header();
 
-    let cfg_tag = muxer.write_tag(&h264_config());
+    let cfg_tag = muxer.write_tag(&h264_config()).unwrap();
     assert!(!cfg_tag.is_empty());
     assert_eq!(cfg_tag[0], 9, "video tag type is 9"); // TagType = video
 
-    let key_tag = muxer.write_tag(&h264_key(0));
+    let key_tag = muxer.write_tag(&h264_key(0)).unwrap();
     assert_eq!(key_tag[0], 9);
 
-    let aac_tag = muxer.write_tag(&aac_config());
+    let aac_tag = muxer.write_tag(&aac_config()).unwrap();
     assert_eq!(aac_tag[0], 8, "audio tag type is 8");
 }
 
@@ -54,4 +54,21 @@ fn flv_metadata_tag() {
     let muxer = FlvMuxer::new();
     let meta = muxer.write_metadata(1280, 720, 25.0, 48000, CodecId::H264);
     assert!(!meta.is_empty());
+}
+
+#[test]
+fn unsupported_codec_returns_error_instead_of_writing_invalid_tag() {
+    let muxer = FlvMuxer::new();
+    let frame = MediaFrame::new_audio(
+        1,
+        CodecId::Opus,
+        0,
+        0,
+        0,
+        Bytes::from_static(&[0xf8, 0xff, 0xfe]),
+    )
+    .with_payload_format(PayloadFormat::Opus);
+
+    let error = muxer.write_tag(&frame).unwrap_err();
+    assert!(error.to_string().contains("FLV audio payload for Opus"));
 }

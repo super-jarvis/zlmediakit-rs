@@ -22,7 +22,9 @@ use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
 use webrtc::rtp_transceiver::RTCRtpTransceiver;
 use webrtc::track::track_remote::TrackRemote;
 use zlmediakit_core::config::IceServer;
-use zlmediakit_core::media_frame::{AudioInfo, CodecId, MediaFrame, TrackInfo, VideoInfo};
+use zlmediakit_core::media_frame::{
+    AudioInfo, CodecId, MediaFrame, PayloadFormat, TrackInfo, VideoInfo,
+};
 use zlmediakit_core::media_source::MediaSource;
 
 use crate::datachannel::{attach_data_channels, DataMessage};
@@ -189,7 +191,8 @@ async fn receive_video(track: Arc<TrackRemote>, source: Arc<MediaSource>) {
                         ts_ms,
                         cfg,
                         true,
-                    );
+                    )
+                    .with_payload_format(PayloadFormat::Flv);
                     f.config_frame = true;
                     source.publish_and_cache(f).await;
                     config_sent = true;
@@ -207,7 +210,8 @@ async fn receive_video(track: Arc<TrackRemote>, source: Arc<MediaSource>) {
                         ts_ms,
                         cfg,
                         true,
-                    );
+                    )
+                    .with_payload_format(PayloadFormat::Flv);
                     f.config_frame = true;
                     source.publish_and_cache(f).await;
                     config_sent = true;
@@ -215,15 +219,18 @@ async fn receive_video(track: Arc<TrackRemote>, source: Arc<MediaSource>) {
             }
             if let Some(sample) = build_avcc_sample(&annexb, key) {
                 source
-                    .publish_and_cache(MediaFrame::new_video(
-                        0,
-                        CodecId::H264,
-                        ts_ms as u32,
-                        ts_ms,
-                        ts_ms,
-                        sample,
-                        key,
-                    ))
+                    .publish_and_cache(
+                        MediaFrame::new_video(
+                            0,
+                            CodecId::H264,
+                            ts_ms as u32,
+                            ts_ms,
+                            ts_ms,
+                            sample,
+                            key,
+                        )
+                        .with_payload_format(PayloadFormat::Flv),
+                    )
                     .await;
             }
         }
@@ -243,14 +250,17 @@ async fn receive_audio(track: Arc<TrackRemote>, source: Arc<MediaSource>) {
         // Opus RTP payload is the raw Opus frame(s); forward as-is so a WHEP
         // player can repacketize it.
         source
-            .publish_and_cache(MediaFrame::new_audio(
-                1,
-                CodecId::Opus,
-                ts_ms as u32,
-                ts_ms,
-                ts_ms,
-                Bytes::copy_from_slice(&pkt.payload),
-            ))
+            .publish_and_cache(
+                MediaFrame::new_audio(
+                    1,
+                    CodecId::Opus,
+                    ts_ms as u32,
+                    ts_ms,
+                    ts_ms,
+                    Bytes::copy_from_slice(&pkt.payload),
+                )
+                .with_payload_format(PayloadFormat::Opus),
+            )
             .await;
     }
     info!("webrtc: whip audio receiver ended");

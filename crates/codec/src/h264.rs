@@ -71,7 +71,7 @@ impl H264Parser {
             fps: 30.0,
         };
 
-        if data.len() > 4 {
+        if data.len() >= 7 {
             let _profile_idc = data[1];
             let width = ((data[3] as u32) << 8) | (data[4] as u32);
             let height = ((data[5] as u32) << 8) | (data[6] as u32);

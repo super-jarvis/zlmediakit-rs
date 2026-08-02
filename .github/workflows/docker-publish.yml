@@ -38,7 +38,7 @@ jobs:
       # 1. 检出代码
       # ----------------------------------------------------
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # ----------------------------------------------------
       # 2. 登录 GitHub Container Registry

@@ -12,10 +12,11 @@ use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::event_bus::{Event, EventBus};
 use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::media_frame::{
-    AudioInfo, CodecId, FrameType, MediaFrame, TrackInfo, VideoInfo,
+    AudioInfo, CodecId, FrameType, MediaFrame, PayloadFormat, TrackInfo, VideoInfo,
 };
 use zlmediakit_core::media_source::{MediaSource, MediaSourceManager};
 use zlmediakit_core::transport::TransportStream;
+use zlmediakit_core::{aac_raw_payload, flv_payload};
 
 pub struct RtspSession {
     stream: Option<TransportStream>,
@@ -253,24 +254,14 @@ impl RtspSession {
                 } else {
                     None
                 };
-                let (has_audio, audio_sample_rate, audio_channels) = {
+                let audio_track = {
                     let info = source.info.read().await;
-                    let audio_track = info.tracks.iter().find_map(|t| match t {
-                        TrackInfo::Audio(a) => Some((a.sample_rate, a.channels)),
+                    info.tracks.iter().find_map(|t| match t {
+                        TrackInfo::Audio(a) => Some(a.clone()),
                         _ => None,
-                    });
-                    match audio_track {
-                        Some((sr, ch)) => (true, sr, ch),
-                        None => (false, 44100, 1),
-                    }
+                    })
                 };
-                let sdp = self.generate_sdp(
-                    video_codec,
-                    hevc_sprop,
-                    has_audio,
-                    audio_sample_rate,
-                    audio_channels,
-                );
+                let sdp = self.generate_sdp(video_codec, hevc_sprop, audio_track.as_ref());
                 let response = RtspResponse::new(200, "OK")
                     .with_header("CSeq", &self.cseq.to_string())
                     .with_header("Content-Type", "application/sdp")
@@ -397,6 +388,21 @@ impl RtspSession {
                 let cache = source.gop_cache.read().await;
                 cache.get_latest_gop_frames()
             };
+            let audio_clock_rate = {
+                let info = source.info.read().await;
+                info.tracks
+                    .iter()
+                    .find_map(|track| match track {
+                        TrackInfo::Audio(audio) => Some(match audio.codec {
+                            CodecId::Opus => 48_000,
+                            CodecId::G711A | CodecId::G711U => 8_000,
+                            CodecId::Mp3 | CodecId::MP2A => 90_000,
+                            _ => audio.sample_rate.max(1),
+                        }),
+                        _ => None,
+                    })
+                    .unwrap_or(44_100)
+            };
 
             let mut rx = source.subscribe();
 
@@ -415,13 +421,25 @@ impl RtspSession {
                     );
 
                     for frame in &cached {
-                        let _ =
-                            Self::send_interleaved_frame(&mut writer, frame, &mut seq, ssrc).await;
+                        let _ = Self::send_interleaved_frame(
+                            &mut writer,
+                            frame,
+                            &mut seq,
+                            ssrc,
+                            audio_clock_rate,
+                        )
+                        .await;
                     }
 
                     while let Ok(frame) = rx.recv().await {
-                        let _ =
-                            Self::send_interleaved_frame(&mut writer, &frame, &mut seq, ssrc).await;
+                        let _ = Self::send_interleaved_frame(
+                            &mut writer,
+                            &frame,
+                            &mut seq,
+                            ssrc,
+                            audio_clock_rate,
+                        )
+                        .await;
                     }
                     debug!("RTSP play send task ended (tcp interleaved)");
                 });
@@ -447,6 +465,7 @@ impl RtspSession {
                                     frame,
                                     &mut video_seq,
                                     video_ssrc,
+                                    audio_clock_rate,
                                 )
                                 .await;
                             }
@@ -457,6 +476,7 @@ impl RtspSession {
                                         frame,
                                         &mut audio_seq,
                                         audio_ssrc,
+                                        audio_clock_rate,
                                     )
                                     .await;
                                 }
@@ -473,6 +493,7 @@ impl RtspSession {
                                     &frame,
                                     &mut video_seq,
                                     video_ssrc,
+                                    audio_clock_rate,
                                 )
                                 .await;
                             }
@@ -483,6 +504,7 @@ impl RtspSession {
                                         &frame,
                                         &mut audio_seq,
                                         audio_ssrc,
+                                        audio_clock_rate,
                                     )
                                     .await;
                                 }
@@ -784,9 +806,7 @@ impl RtspSession {
         &self,
         video_codec: CodecId,
         hevc_sprop: Option<(String, String, String)>,
-        has_audio: bool,
-        audio_sample_rate: u32,
-        audio_channels: u32,
+        audio: Option<&AudioInfo>,
     ) -> String {
         let (video_rtpmap, video_fmtp) = match video_codec {
             CodecId::H265 => {
@@ -819,14 +839,8 @@ impl RtspSession {
              a=control:track1\r\n",
             video_rtpmap, video_fmtp
         );
-        if has_audio {
-            sdp.push_str(&format!(
-                "m=audio 0 RTP/AVP 97\r\n\
-                 a=rtpmap:97 MPEG4-GENERIC/{}/{}\r\n\
-                 a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3\r\n\
-                 a=control:track2\r\n",
-                audio_sample_rate, audio_channels
-            ));
+        if let Some(audio) = audio {
+            sdp.push_str(&generate_audio_sdp(audio));
         }
         sdp
     }
@@ -983,9 +997,18 @@ impl RtspSession {
         ssrc: u32,
         seq: &mut u16,
     ) -> Vec<Vec<u8>> {
+        let Ok(data) = flv_payload(frame) else {
+            return Vec::new();
+        };
         match frame.codec {
-            CodecId::H265 => Self::packetize_hevc(frame, timestamp, ssrc, seq),
-            _ => Self::packetize_h264(&frame.data, timestamp, ssrc, seq),
+            CodecId::H265 => {
+                let mut normalized = frame.clone();
+                normalized.data = data;
+                normalized.payload_format = PayloadFormat::Flv;
+                Self::packetize_hevc(&normalized, timestamp, ssrc, seq)
+            }
+            CodecId::H264 => Self::packetize_h264(&data, timestamp, ssrc, seq),
+            _ => Vec::new(),
         }
     }
 
@@ -1085,28 +1108,37 @@ impl RtspSession {
         packets
     }
 
-    fn packetize_audio(data: &[u8], timestamp: u32, ssrc: u32, seq: &mut u16) -> Vec<Vec<u8>> {
+    fn packetize_audio(
+        frame: &MediaFrame,
+        timestamp: u32,
+        ssrc: u32,
+        seq: &mut u16,
+        clock_rate: u32,
+    ) -> Vec<Vec<u8>> {
         let mut packets = Vec::new();
-        if data.len() < 2 {
+        if frame.config_frame {
             return packets;
         }
-
-        let sound_format = (data[0] >> 4) & 0x0F;
-        let rtp_ts = timestamp * 44;
-        let pt = if sound_format == 10 { 97 } else { 98 };
-
-        let pos = if sound_format == 10 { 2 } else { 1 };
-        let audio_data = &data[pos..];
-
+        let (pt, audio_data, aac, mpa) = match frame.codec {
+            CodecId::AAC => {
+                let Ok(data) = aac_raw_payload(frame) else {
+                    return packets;
+                };
+                (97, data, true, false)
+            }
+            CodecId::Opus => (97, frame.data.clone(), false, false),
+            CodecId::G711U => (0, raw_audio_payload(frame), false, false),
+            CodecId::G711A => (8, raw_audio_payload(frame), false, false),
+            CodecId::Mp3 | CodecId::MP2A => (14, raw_audio_payload(frame), false, true),
+            CodecId::L16 => (97, raw_audio_payload(frame), false, false),
+            _ => return packets,
+        };
         if audio_data.is_empty() {
             return packets;
         }
+        let rtp_ts = ((timestamp as u64 * clock_rate.max(1) as u64) / 1000) as u32;
 
-        if sound_format == 10 {
-            // AAC: skip config frames (AACPacketType=0)
-            if data.len() >= 2 && data[1] == 0 {
-                return packets;
-            }
+        if aac {
             // RFC 3640 format with AU headers
             let au_size = audio_data.len();
             let hdr = Self::make_rtp_header(*seq, rtp_ts, ssrc, pt, true);
@@ -1116,15 +1148,18 @@ impl RtspSession {
             pkt.put_u16(16);
             let au_header = ((au_size as u16) << 3) & 0xFFF8;
             pkt.put_u16(au_header);
-            pkt.extend_from_slice(audio_data);
+            pkt.extend_from_slice(&audio_data);
             packets.push(pkt);
         } else {
-            // MP3 or other: raw RTP payload
             let hdr = Self::make_rtp_header(*seq, rtp_ts, ssrc, pt, true);
             *seq = seq.wrapping_add(1);
-            let mut pkt = Vec::with_capacity(12 + audio_data.len());
+            let mut pkt = Vec::with_capacity(12 + if mpa { 4 } else { 0 } + audio_data.len());
             pkt.extend_from_slice(&hdr);
-            pkt.extend_from_slice(audio_data);
+            if mpa {
+                // RFC 2250 MPEG audio header: MBZ + fragment offset.
+                pkt.extend_from_slice(&[0, 0, 0, 0]);
+            }
+            pkt.extend_from_slice(&audio_data);
             packets.push(pkt);
         }
 
@@ -1152,13 +1187,14 @@ impl RtspSession {
         frame: &MediaFrame,
         seq: &mut u16,
         ssrc: u32,
+        audio_clock_rate: u32,
     ) -> anyhow::Result<()> {
         let packets = match frame.frame_type {
             zlmediakit_core::media_frame::FrameType::Video => {
                 Self::packetize_video(frame, frame.timestamp, ssrc, seq)
             }
             zlmediakit_core::media_frame::FrameType::Audio => {
-                Self::packetize_audio(&frame.data, frame.timestamp, ssrc, seq)
+                Self::packetize_audio(frame, frame.timestamp, ssrc, seq, audio_clock_rate)
             }
             _ => return Ok(()),
         };
@@ -1174,13 +1210,14 @@ impl RtspSession {
         frame: &MediaFrame,
         seq: &mut u16,
         ssrc: u32,
+        audio_clock_rate: u32,
     ) -> anyhow::Result<()> {
         let packets = match frame.frame_type {
             zlmediakit_core::media_frame::FrameType::Video => {
                 Self::packetize_video(frame, frame.timestamp, ssrc, seq)
             }
             zlmediakit_core::media_frame::FrameType::Audio => {
-                Self::packetize_audio(&frame.data, frame.timestamp, ssrc, seq)
+                Self::packetize_audio(frame, frame.timestamp, ssrc, seq, audio_clock_rate)
             }
             _ => return Ok(()),
         };
@@ -1208,6 +1245,59 @@ impl RtspSession {
         self.udp_video = None;
         self.udp_audio = None;
         self.depak = None;
+    }
+}
+
+fn raw_audio_payload(frame: &MediaFrame) -> Bytes {
+    let is_flv = frame.payload_format == PayloadFormat::Flv
+        || (frame.payload_format == PayloadFormat::Unknown
+            && frame
+                .data
+                .first()
+                .is_some_and(|header| matches!(header >> 4, 2 | 7 | 8)));
+    if is_flv && !frame.data.is_empty() {
+        frame.data.slice(1..)
+    } else {
+        frame.data.clone()
+    }
+}
+
+fn generate_audio_sdp(audio: &AudioInfo) -> String {
+    let channels = audio.channels.max(1);
+    match audio.codec {
+        CodecId::AAC => format!(
+            "m=audio 0 RTP/AVP 97\r\n\
+             a=rtpmap:97 MPEG4-GENERIC/{}/{}\r\n\
+             a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3\r\n\
+             a=control:track2\r\n",
+            audio.sample_rate, channels
+        ),
+        CodecId::Opus => format!(
+            "m=audio 0 RTP/AVP 97\r\n\
+             a=rtpmap:97 opus/48000/{}\r\n\
+             a=fmtp:97 minptime=10;useinbandfec=1\r\n\
+             a=control:track2\r\n",
+            channels
+        ),
+        CodecId::G711A => "m=audio 0 RTP/AVP 8\r\n\
+             a=rtpmap:8 PCMA/8000/1\r\n\
+             a=control:track2\r\n"
+            .to_string(),
+        CodecId::G711U => "m=audio 0 RTP/AVP 0\r\n\
+             a=rtpmap:0 PCMU/8000/1\r\n\
+             a=control:track2\r\n"
+            .to_string(),
+        CodecId::Mp3 | CodecId::MP2A => "m=audio 0 RTP/AVP 14\r\n\
+             a=rtpmap:14 MPA/90000\r\n\
+             a=control:track2\r\n"
+            .to_string(),
+        CodecId::L16 => format!(
+            "m=audio 0 RTP/AVP 97\r\n\
+             a=rtpmap:97 L16/{}/{}\r\n\
+             a=control:track2\r\n",
+            audio.sample_rate, channels
+        ),
+        _ => String::new(),
     }
 }
 
@@ -1489,7 +1579,8 @@ impl RtpDepacketizer {
                         ms as u64,
                         Bytes::from(frame_data),
                         false,
-                    );
+                    )
+                    .with_payload_format(PayloadFormat::Flv);
                     f.config_frame = true;
                     let _ = self.source.publish_and_cache(f).await;
                     self.config_sent = true;
@@ -1526,7 +1617,8 @@ impl RtpDepacketizer {
                 ms as u64,
                 Bytes::from(frame_data),
                 self.video_key,
-            );
+            )
+            .with_payload_format(PayloadFormat::Flv);
             let _ = self.source.publish_and_cache(f).await;
             self.video_key = false;
             return;
@@ -1543,7 +1635,8 @@ impl RtpDepacketizer {
                     ms as u64,
                     Bytes::from(cfg),
                     false,
-                );
+                )
+                .with_payload_format(PayloadFormat::Flv);
                 f.config_frame = true;
                 let _ = self.source.publish_and_cache(f).await;
                 self.config_sent = true;
@@ -1573,7 +1666,8 @@ impl RtpDepacketizer {
             ms as u64,
             Bytes::from(data),
             self.video_key,
-        );
+        )
+        .with_payload_format(PayloadFormat::Flv);
         let _ = self.source.publish_and_cache(f).await;
         self.video_key = false;
     }
@@ -1600,7 +1694,8 @@ impl RtpDepacketizer {
             if let Some(cfg) = self.audio_config.clone() {
                 let mut v = vec![0xAF, 0x00];
                 v.extend_from_slice(&cfg);
-                let mut af = MediaFrame::new_audio(1, CodecId::AAC, 0, 0, 0, Bytes::from(v));
+                let mut af = MediaFrame::new_audio(1, CodecId::AAC, 0, 0, 0, Bytes::from(v))
+                    .with_payload_format(PayloadFormat::Flv);
                 af.config_frame = true;
                 let _ = self.source.publish_and_cache(af).await;
                 self.audio_config_sent = true;
@@ -1623,7 +1718,8 @@ impl RtpDepacketizer {
             v.push(0x01);
             v.extend_from_slice(&raw);
             let f =
-                MediaFrame::new_audio(1, CodecId::AAC, ms, ms as u64, ms as u64, Bytes::from(v));
+                MediaFrame::new_audio(1, CodecId::AAC, ms, ms as u64, ms as u64, Bytes::from(v))
+                    .with_payload_format(PayloadFormat::Flv);
             let _ = self.source.publish_and_cache(f).await;
             ms = ms.saturating_add(frame_ms as u32);
         }
@@ -2002,5 +2098,79 @@ mod tests {
         assert_eq!(rv, Some(vps.clone()));
         assert_eq!(rs, Some(sps.clone()));
         assert_eq!(rp, Some(pps.clone()));
+    }
+
+    #[test]
+    fn packetize_annex_b_video_uses_h264_rtp_payload() {
+        let frame = MediaFrame::new_video(
+            0,
+            CodecId::H264,
+            40,
+            40,
+            40,
+            Bytes::from_static(&[0, 0, 0, 1, 0x65, 0x88]),
+            true,
+        )
+        .with_payload_format(PayloadFormat::AnnexB);
+        let mut seq = 1;
+        let packets = RtspSession::packetize_video(&frame, 40, 0x1234, &mut seq);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(&packets[0][12..], &[0x65, 0x88]);
+        assert_eq!(packets[0][1] & 0x7f, 96);
+    }
+
+    #[test]
+    fn packetize_adts_aac_and_opus_use_codec_specific_layouts() {
+        let aac = MediaFrame::new_audio(
+            0,
+            CodecId::AAC,
+            1000,
+            1000,
+            1000,
+            Bytes::from_static(&[0xff, 0xf1, 0x50, 0x80, 0, 0, 0, 0x11, 0x22]),
+        )
+        .with_payload_format(PayloadFormat::Adts);
+        let mut seq = 1;
+        let packets = RtspSession::packetize_audio(&aac, 1000, 1, &mut seq, 48_000);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(&packets[0][16..], &[0x11, 0x22]);
+        assert_eq!(
+            u32::from_be_bytes(packets[0][4..8].try_into().unwrap()),
+            48_000
+        );
+
+        let opus = MediaFrame::new_audio(
+            0,
+            CodecId::Opus,
+            20,
+            20,
+            20,
+            Bytes::from_static(&[0xf8, 0xff, 0xfe]),
+        )
+        .with_payload_format(PayloadFormat::Opus);
+        let packets = RtspSession::packetize_audio(&opus, 20, 1, &mut seq, 48_000);
+        assert_eq!(&packets[0][12..], opus.data.as_ref());
+        assert_eq!(packets[0][1] & 0x7f, 97);
+    }
+
+    #[test]
+    fn audio_sdp_matches_actual_codec() {
+        let opus = generate_audio_sdp(&AudioInfo {
+            codec: CodecId::Opus,
+            sample_rate: 48_000,
+            channels: 2,
+            bits_per_sample: 16,
+        });
+        assert!(opus.contains("opus/48000/2"));
+        assert!(!opus.contains("MPEG4-GENERIC"));
+
+        let pcma = generate_audio_sdp(&AudioInfo {
+            codec: CodecId::G711A,
+            sample_rate: 8_000,
+            channels: 1,
+            bits_per_sample: 8,
+        });
+        assert!(pcma.contains("RTP/AVP 8"));
+        assert!(pcma.contains("PCMA/8000/1"));
     }
 }

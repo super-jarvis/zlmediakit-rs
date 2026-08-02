@@ -5,7 +5,7 @@ use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::hook::HookClient;
-use zlmediakit_core::media_frame::{CodecId, MediaFrame, TrackInfo, VideoInfo};
+use zlmediakit_core::media_frame::{CodecId, MediaFrame, PayloadFormat, TrackInfo, VideoInfo};
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::recorder::RecorderControl;
 use zlmediakit_core::stream_proxy::StreamProxyControl;
@@ -133,29 +133,25 @@ async fn wsflv_e2e_receives_flv_over_websocket() {
         })])
         .await;
 
-    source
-        .publish_and_cache(MediaFrame::new_video(
-            0,
-            CodecId::H264,
-            0,
-            0,
-            0,
-            avcc_config(),
-            true,
-        ))
-        .await;
+    let mut config = MediaFrame::new_video(0, CodecId::H264, 0, 0, 0, avcc_config(), true)
+        .with_payload_format(PayloadFormat::Flv);
+    config.config_frame = true;
+    source.publish_and_cache(config).await;
     for i in 1..=5u32 {
         let is_key = i == 1; // first sample is key frame to anchor the GOP
         source
-            .publish_and_cache(MediaFrame::new_video(
-                0,
-                CodecId::H264,
-                i * 40,
-                (i * 40) as u64,
-                (i * 40) as u64,
-                avcc_sample(is_key, i),
-                is_key,
-            ))
+            .publish_and_cache(
+                MediaFrame::new_video(
+                    0,
+                    CodecId::H264,
+                    i * 40,
+                    (i * 40) as u64,
+                    (i * 40) as u64,
+                    avcc_sample(is_key, i),
+                    is_key,
+                )
+                .with_payload_format(PayloadFormat::Flv),
+            )
             .await;
     }
 
@@ -210,15 +206,18 @@ async fn wsflv_e2e_receives_flv_over_websocket() {
                 // After cached frames are sent, publish a live frame.
                 if frames_received == 7 {
                     source
-                        .publish(MediaFrame::new_video(
-                            0,
-                            CodecId::H264,
-                            240,
-                            240,
-                            240,
-                            avcc_sample(false, 99),
-                            false,
-                        ))
+                        .publish(
+                            MediaFrame::new_video(
+                                0,
+                                CodecId::H264,
+                                240,
+                                240,
+                                240,
+                                avcc_sample(false, 99),
+                                false,
+                            )
+                            .with_payload_format(PayloadFormat::Flv),
+                        )
                         .unwrap();
                 }
 

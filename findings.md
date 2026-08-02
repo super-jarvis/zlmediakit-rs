@@ -1,5 +1,35 @@
 # 项目发现
 
+## 2026-08-02 协议完整性审计
+
+- 原 FLV demuxer 会丢弃 FLV 音视频头、忽略配置帧与 CTS，并把未知编码强行认作 H.264/AAC；这会破坏后续无损转封装。现已保留完整 payload 和语义元数据。
+- 原 MP4/fMP4 测试只检查 box/header 字节存在，不足以证明播放器可用。真实 ffprobe 首先发现普通 MP4 header 无效，随后发现 fMP4 的空表和 fragment offset 无效；两类容器现均通过真实解码。
+- classic FLV 可以承载 H.264/H.265、AAC、MP3、G.711A/U；Opus/L16 等组合不能直接写入。FLV 输出现在对不支持组合返回错误，避免把原始字节静默包装成看似合法的 FLV tag。
+- MP4 `stco`/`co64` 是文件绝对偏移，`stsc` 条目描述从 `first_chunk` 开始的一段 chunk 范围；原 demuxer 对两者的理解都只适配了宽松的自产测试数据，无法可靠读取 ffmpeg 文件。真实 HEVC 输入测试已覆盖修正后的标准语义。
+
+- WSL 当前既无 `opus` 也无 `fdk-aac` pkg-config 库，但 Ubuntu 26.04 软件源可提供 `libfdk-aac-dev`；因此 AAC→Opus 实现可验证需要安装原生开发依赖，不能仅靠打开 Cargo feature。
+
+- SRT 时间戳问题比初审更严重：除固定 40 ms 外，PES payload 起点也使用了错误字段，且每次网络接收末尾都会无条件发布未完成 PES。三者会共同造成截断、漂移和播放异常。
+
+- RTSP 音频不仅 SDP 固定 AAC，原 packetizer 也通过 FLV SoundFormat 猜测并把非 AAC 统一发到 PT98；已改为以 `CodecId` 为准，并从 source track 把实际 RTP clock rate 传入发送任务。
+
+- `FlvMuxer::write_tag` 被 HTTP-FLV、WS-FLV、FLV recorder 和 MP4-VOD remux 共用，是统一修复 FLV 输出的最佳边界；RTMP `handle_play` 另有两条直接把 `frame.data` 写入消息的 cached/live 路径，也必须接入同一转换。
+
+- HLS 旧测试直接绑定私有 `extract_hevc_config` 名称，统一转换重构后造成测试编译失败；这是测试耦合而非运行时回归，现已改为针对 hvcC record 的解析测试。
+
+- HLS segment 与 live TS 原先分别调用 FLV 专用转换函数；现已改为共享 core 规范化入口，AVC/HEVC/AAC 配置提取也可接收去掉 FLV 头的 decoder config。
+
+- 项目通过 `MediaSource` 广播 `MediaFrame` 实现协议解耦，但 `MediaFrame.data` 没有记录负载格式；当前不同入口实际发布了不同表示。
+- RTMP 输入保留 FLV Video/Audio payload；RTSP H.264/H.265/AAC 和 WHIP H.264 会主动构造成 FLV/AVCC 风格 payload；WHIP Opus 保留原始 Opus；SRT/GB28181 发布 Annex-B 视频或 ADTS/原始音频。
+- RTMP、HTTP-FLV、RTSP packetizer、HLS-TS muxer 多处默认 `MediaFrame.data` 是 FLV payload。因此 SRT/GB28181 到这些出口以及 WHIP Opus 到非 WHEP 出口没有完整实现。
+- RTSP 输出 SDP 只按 H.264/H.265 视频和 AAC 音频生成；任意存在的音频轨都会被声明为 MPEG4-GENERIC/AAC，和 Opus、MP3、G.711 数据不一致。
+- 默认 server 依赖 WebRTC crate 时没有启用 `transcode`/`aac-transcode` feature，因此默认 RTMP AAC → WHEP 没有音频。
+- MP4 与 fMP4 muxer 当前把 `frame.data` 原样写入 `mdat`。当来源是 RTMP/RTSP/WHIP H.264 时，其中仍含 FLV 视频 5 字节头；AAC 仍含 FLV 音频 2 字节头，生成样本不符合 MP4 负载要求。
+- SRT TS 解复用没有读取 PES PTS/DTS 或 PCR；连接层按每次 `srt_recv` 固定增加 40ms，时间戳与真实帧/网络包边界不一致。
+- 当前 E2E 已覆盖 RTMP→WS-FLV、RTMP→RTMP、RTMP 推拉代理、RTSP 输入/拉流、WHIP→WHEP、MP4 VOD→FLV，以及直接构造 MediaFrame→HLS/WS-TS/WS-fMP4。
+- 尚无完整入口×出口矩阵；SRT 没有网络 E2E，GB28181 主要是单元测试，CMAF/DASH 没有真实播放器/ffprobe 验证，多数录制测试只验证 box/header 而非媒体可解码性。
+- `CodecId` 虽列出 H.264/H.265/AAC/G.711/Opus/MP3/L16/VP8/VP9/AV1/JPEG/MP2V/MP2A，但枚举存在不代表协议收发链路完成。
+
 ## 初始状态
 
 - Git 分支：`master`，跟踪 `origin/master`。

@@ -324,7 +324,7 @@ impl HttpSession {
                 };
 
                 for frame in &cached {
-                    let tag = muxer.write_tag(frame);
+                    let tag = muxer.write_tag(frame)?;
                     self.stream.write_all(&tag).await?;
                 }
 
@@ -334,7 +334,7 @@ impl HttpSession {
                     if zlmediakit_core::gop_cache::is_config_frame(&frame) {
                         continue;
                     }
-                    let tag = muxer.write_tag(&frame);
+                    let tag = muxer.write_tag(&frame)?;
                     self.stream.write_all(&tag).await?;
                 }
             }
@@ -1221,7 +1221,7 @@ impl HttpSession {
         self.stream.write_all(&meta).await?;
 
         for frame in frames {
-            let tag = muxer.write_tag(&frame);
+            let tag = muxer.write_tag(&frame)?;
             self.stream.write_all(&tag).await?;
         }
 

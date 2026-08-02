@@ -45,7 +45,7 @@ impl FlvRecorder {
         let mut rx = source.subscribe();
         let gop = source.get_latest_gop_frames().await;
         for frame in &gop {
-            file.write_all(&muxer.write_tag(frame)).await?;
+            file.write_all(&muxer.write_tag(frame)?).await?;
         }
 
         let mut since_flush: usize = 0;
@@ -58,7 +58,7 @@ impl FlvRecorder {
                 result = rx.recv() => {
                     match result {
                         Ok(frame) => {
-                            file.write_all(&muxer.write_tag(&frame)).await?;
+                            file.write_all(&muxer.write_tag(&frame)?).await?;
                             since_flush += 1;
                             if since_flush >= 50 {
                                 file.flush().await?;

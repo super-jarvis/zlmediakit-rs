@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 use tokio::time::Duration;
-use zlmediakit_core::media_frame::{CodecId, MediaFrame};
+use zlmediakit_core::media_frame::{CodecId, MediaFrame, PayloadFormat};
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_flv::FlvRecorder;
 
@@ -45,7 +45,10 @@ async fn flv_recorder_writes_valid_file() {
 
     // Seed the cache with config + key frame so the recorder can build a
     // self-contained file even if it subscribes after these are published.
-    let cfg = MediaFrame::new_video(0, CodecId::H264, 0, 0, 0, h264_config_data().into(), false);
+    let mut cfg =
+        MediaFrame::new_video(0, CodecId::H264, 0, 0, 0, h264_config_data().into(), false)
+            .with_payload_format(PayloadFormat::Flv);
+    cfg.config_frame = true;
     source.publish_and_cache(cfg).await;
     let key = MediaFrame::new_video(
         0,
@@ -58,7 +61,8 @@ async fn flv_recorder_writes_valid_file() {
         ]
         .into(),
         true,
-    );
+    )
+    .with_payload_format(PayloadFormat::Flv);
     source.publish_and_cache(key).await;
 
     // A `Notify` the test never triggers; recording stops via `source.close()`.
@@ -98,7 +102,8 @@ async fn flv_recorder_writes_valid_file() {
             ]
             .into(),
             is_key,
-        );
+        )
+        .with_payload_format(PayloadFormat::Flv);
         source.publish_and_cache(frame).await;
     }
 

@@ -16,7 +16,7 @@
 //!   fly; without it the AAC track is silently skipped.
 
 use anyhow::{anyhow, Result};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{broadcast, Notify};
@@ -31,6 +31,9 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 use zlmediakit_core::config::IceServer;
 use zlmediakit_core::media_frame::{CodecId, MediaFrame, TrackInfo};
 use zlmediakit_core::media_source::MediaSource;
+#[cfg(feature = "transcode")]
+use zlmediakit_core::{aac_audio_specific_config, aac_raw_payload};
+use zlmediakit_core::{video_config_annex_b, video_sample_annex_b};
 
 use crate::datachannel::{attach_data_channels, DataMessage};
 
@@ -269,10 +272,9 @@ async fn push_frame(
     match f.codec {
         CodecId::H264 => {
             if let Some(v) = video {
-                let annexb = avcc_to_annexb(&f.data);
-                if annexb.is_empty() {
+                let Some(annexb) = h264_annex_b(f) else {
                     return;
-                }
+                };
                 let sample = webrtc::media::Sample {
                     data: annexb,
                     timestamp: ts,
@@ -338,10 +340,9 @@ async fn push_frame(
     match f.codec {
         CodecId::H264 => {
             if let Some(v) = video {
-                let annexb = avcc_to_annexb(&f.data);
-                if annexb.is_empty() {
+                let Some(annexb) = h264_annex_b(f) else {
                     return;
-                }
+                };
                 let sample = webrtc::media::Sample {
                     data: annexb,
                     timestamp: ts,
@@ -372,11 +373,19 @@ async fn push_frame(
                 let mut t = t.lock().await;
                 if f.config_frame {
                     // First AAC frame carries the AudioSpecificConfig.
-                    if let Err(e) = t.configure(&f.data) {
-                        debug!("webrtc: aac decoder config error: {}", e);
+                    match aac_audio_specific_config(f) {
+                        Ok(config) => {
+                            if let Err(e) = t.configure(&config) {
+                                debug!("webrtc: aac decoder config error: {}", e);
+                            }
+                        }
+                        Err(e) => debug!("webrtc: invalid aac config frame: {}", e),
                     }
                 } else if let Some(a) = audio {
-                    match t.transcode(&f.data) {
+                    let Ok(raw) = aac_raw_payload(f) else {
+                        return;
+                    };
+                    match t.transcode(&raw) {
                         Ok(packets) => {
                             for opus_bytes in packets {
                                 let sample = webrtc::media::Sample {
@@ -399,74 +408,12 @@ async fn push_frame(
     }
 }
 
-/// Convert an AVCC (length-prefixed) H.264 frame into Annex-B (start-code
-/// separated) NALUs, which is what the `webrtc` crate's H.264 RTP payloader
-/// expects. Handles both the normal sample (`avc_packet_type == 1`, 4-byte
-/// lengths) and the decoder-configuration record (`avc_packet_type == 0`,
-/// 2-byte lengths for SPS/PPS).
-fn avcc_to_annexb(data: &[u8]) -> Bytes {
-    if data.len() < 5 {
-        return Bytes::copy_from_slice(data);
-    }
-    let avc_packet_type = data[1] & 0x0F;
-    let mut out = BytesMut::new();
-    const START: &[u8] = &[0x00, 0x00, 0x00, 0x01];
-
-    if avc_packet_type == 0 {
-        // AVCDecoderConfigurationRecord: [5]=version [6]=profile [7]=compat
-        // [8]=level [9]=lenSizeMinusOne/reserved [10]=0xE0|numSPS
-        if data.len() < 11 {
-            return Bytes::copy_from_slice(data);
-        }
-        let num_sps = (data[10] & 0x1F) as usize;
-        let mut pos = 11;
-        for _ in 0..num_sps {
-            if pos + 2 > data.len() {
-                break;
-            }
-            let nalu_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
-            if pos + nalu_len > data.len() {
-                break;
-            }
-            out.extend_from_slice(START);
-            out.extend_from_slice(&data[pos..pos + nalu_len]);
-            pos += nalu_len;
-        }
-        if pos < data.len() {
-            let num_pps = data[pos] as usize;
-            pos += 1;
-            for _ in 0..num_pps {
-                if pos + 2 > data.len() {
-                    break;
-                }
-                let nalu_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-                pos += 2;
-                if pos + nalu_len > data.len() {
-                    break;
-                }
-                out.extend_from_slice(START);
-                out.extend_from_slice(&data[pos..pos + nalu_len]);
-                pos += nalu_len;
-            }
-        }
+fn h264_annex_b(frame: &MediaFrame) -> Option<Bytes> {
+    if frame.config_frame {
+        video_config_annex_b(frame).ok()
     } else {
-        // Normal sample: 5-byte header then 4-byte length-prefixed NALUs.
-        let mut pos = 5;
-        while pos + 4 <= data.len() {
-            let nalu_len =
-                u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                    as usize;
-            pos += 4;
-            if pos + nalu_len > data.len() {
-                break;
-            }
-            out.extend_from_slice(START);
-            out.extend_from_slice(&data[pos..pos + nalu_len]);
-            pos += nalu_len;
-        }
+        video_sample_annex_b(frame).ok()
     }
-    out.freeze()
 }
 
 /// Build a `webrtc` `RTCConfiguration` from the server's `IceServer` list so

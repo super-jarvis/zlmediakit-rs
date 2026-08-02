@@ -3,8 +3,11 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
-use zlmediakit_core::media_frame::{CodecId, FrameType, MediaFrame};
+use zlmediakit_core::media_frame::{CodecId, FrameType, MediaFrame, PayloadFormat};
 use zlmediakit_core::media_source::MediaSource;
+use zlmediakit_core::{
+    aac_audio_specific_config, aac_raw_payload, video_decoder_config, video_sample_annex_b,
+};
 
 const TS_PACKET_SIZE: usize = 188;
 const PAT_PID: u16 = 0;
@@ -218,7 +221,7 @@ impl HlsMuxer {
                     }
                 }
                 FrameType::Audio if is_aac_config(frame) => {
-                    self.audio_config_data = Some(extract_aac_config(&frame.data));
+                    self.audio_config_data = Some(extract_aac_config(frame));
                     self.audio_config_sent = false;
                 }
                 _ => {}
@@ -256,7 +259,9 @@ impl HlsMuxer {
             match frame.frame_type {
                 FrameType::Video => {
                     if !is_video_config(frame) {
-                        let annex_b = flv_video_to_annex_b(&frame.data);
+                        let annex_b = video_sample_annex_b(frame)
+                            .map(|data| data.to_vec())
+                            .unwrap_or_default();
                         if !annex_b.is_empty() {
                             info!(
                                 "  -> annex_b: {} bytes, first 12: {:02x?}",
@@ -280,11 +285,7 @@ impl HlsMuxer {
                     }
                 }
                 FrameType::Audio if !is_aac_config(frame) => {
-                    let audio_data = if let Some(ref config) = self.audio_config_data {
-                        flv_audio_to_adts(&frame.data, config)
-                    } else {
-                        flv_audio_to_raw(&frame.data)
-                    };
+                    let audio_data = aac_frame_to_adts(frame, self.audio_config_data.as_deref());
                     if !audio_data.is_empty() {
                         let pes = build_data_pes_raw(0xC0, &audio_data, frame.timestamp);
                         self.writer.write_pes(
@@ -333,43 +334,6 @@ pub(crate) fn build_data_pes_raw(stream_id: u8, data: &[u8], timestamp: u32) -> 
     pes
 }
 
-pub(crate) fn flv_video_to_annex_b(data: &[u8]) -> Vec<u8> {
-    if data.len() < 2 {
-        return Vec::new();
-    }
-    let avc_packet_type = data[1] & 0x0F;
-    if avc_packet_type != 1 {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let mut pos = 5;
-    while pos + 4 <= data.len() {
-        let nalu_len =
-            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
-        if pos + nalu_len > data.len() {
-            break;
-        }
-        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-        out.extend_from_slice(&data[pos..pos + nalu_len]);
-        pos += nalu_len;
-    }
-    out
-}
-
-pub(crate) fn flv_audio_to_raw(data: &[u8]) -> Vec<u8> {
-    if data.len() < 2 {
-        return Vec::new();
-    }
-    let sound_format = (data[0] >> 4) & 0x0F;
-    let aac_packet_type = data[1] & 0x0F;
-    if sound_format == 10 && aac_packet_type == 1 {
-        data[2..].to_vec()
-    } else {
-        Vec::new()
-    }
-}
-
 fn make_adts_header(frame_len: usize, audio_config: &[u8]) -> [u8; 7] {
     if audio_config.len() < 2 {
         return [0u8; 7];
@@ -391,13 +355,26 @@ fn make_adts_header(frame_len: usize, audio_config: &[u8]) -> [u8; 7] {
     ]
 }
 
-pub(crate) fn flv_audio_to_adts(data: &[u8], audio_config: &[u8]) -> Vec<u8> {
-    let raw = flv_audio_to_raw(data);
-    if raw.is_empty() || audio_config.len() < 2 {
-        return raw;
+/// Normalize an AAC media frame to the ADTS form required by MPEG-TS.
+///
+/// SRT/GB28181 sources may already provide ADTS, while RTMP/RTSP sources carry
+/// raw AAC behind an FLV header. Keeping this normalization here makes both
+/// inputs produce the same PES payload without double-wrapping ADTS frames.
+pub(crate) fn aac_frame_to_adts(frame: &MediaFrame, audio_config: Option<&[u8]>) -> Vec<u8> {
+    if frame.codec != CodecId::AAC || frame.config_frame {
+        return Vec::new();
     }
-    let adts = make_adts_header(raw.len(), audio_config);
-    let mut out = Vec::with_capacity(7 + raw.len());
+    if frame.payload_format == PayloadFormat::Adts {
+        return frame.data.to_vec();
+    }
+    let Ok(raw) = aac_raw_payload(frame) else {
+        return Vec::new();
+    };
+    let Some(config) = audio_config.filter(|config| config.len() >= 2) else {
+        return Vec::new();
+    };
+    let adts = make_adts_header(raw.len(), config);
+    let mut out = Vec::with_capacity(adts.len() + raw.len());
     out.extend_from_slice(&adts);
     out.extend_from_slice(&raw);
     out
@@ -580,31 +557,44 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 pub(crate) fn is_video_config(frame: &MediaFrame) -> bool {
-    frame.data.len() >= 2
-        && (frame.data[0] & 0x0F == 7 || frame.data[0] & 0x0F == 12)
-        && frame.data[1] & 0x0F == 0
+    frame.config_frame
+        || (matches!(
+            frame.payload_format,
+            PayloadFormat::Flv | PayloadFormat::Unknown
+        ) && frame.data.len() >= 2
+            && (frame.data[0] & 0x0F == 7 || frame.data[0] & 0x0F == 12)
+            && frame.data[1] & 0x0F == 0)
 }
 
 pub(crate) fn extract_video_config(frame: &MediaFrame) -> Vec<u8> {
+    let Ok(config) = video_decoder_config(frame) else {
+        return Vec::new();
+    };
     if frame.codec == CodecId::H265 {
-        extract_hevc_config(&frame.data)
+        extract_hevc_config_record(&config)
     } else {
-        extract_h264_config(&frame.data)
+        extract_h264_config_record(&config)
     }
 }
 
 pub(crate) fn is_aac_config(frame: &MediaFrame) -> bool {
-    frame.data.len() >= 2 && (frame.data[0] >> 4) == 10 && frame.data[1] & 0x0F == 0
+    frame.config_frame
+        || (matches!(
+            frame.payload_format,
+            PayloadFormat::Flv | PayloadFormat::Unknown
+        ) && frame.data.len() >= 2
+            && (frame.data[0] >> 4) == 10
+            && frame.data[1] & 0x0F == 0)
 }
 
-fn extract_h264_config(data: &[u8]) -> Vec<u8> {
+fn extract_h264_config_record(data: &[u8]) -> Vec<u8> {
     let mut config = Vec::new();
-    if data.len() < 11 {
+    if data.len() < 6 {
         return config;
     }
 
-    let num_sps = (data[10] & 0x1F) as usize;
-    let mut pos = 11;
+    let num_sps = (data[5] & 0x1F) as usize;
+    let mut pos = 6;
     for _ in 0..num_sps {
         if pos + 2 > data.len() {
             break;
@@ -638,17 +628,13 @@ fn extract_h264_config(data: &[u8]) -> Vec<u8> {
     config
 }
 
-fn extract_hevc_config(data: &[u8]) -> Vec<u8> {
-    // `data` is an FLV video tag body: byte0 = frame type | codec id (12),
-    // byte1 = packet type (0 for the HEVCDecoderConfigurationRecord), bytes
-    // 2..5 = composition time, then the HEVCDecoderConfigurationRecord.
+fn extract_hevc_config_record(data: &[u8]) -> Vec<u8> {
+    // `data` is a HEVCDecoderConfigurationRecord (hvcC) without an FLV header.
     let mut config = Vec::new();
-    if data.len() < 28 {
+    if data.len() < 23 {
         return config;
     }
-    // numOfArrays lives at offset 27 within the FLV tag (5-byte header +
-    // 22-byte fixed record header; avgFrameRate is 2 bytes).
-    let mut pos = 27;
+    let mut pos = 22;
     let num_arrays = data[pos] as usize;
     pos += 1;
     for _ in 0..num_arrays {
@@ -678,12 +664,10 @@ fn extract_hevc_config(data: &[u8]) -> Vec<u8> {
     config
 }
 
-pub(crate) fn extract_aac_config(data: &[u8]) -> Vec<u8> {
-    if data.len() >= 3 {
-        data[2..].to_vec()
-    } else {
-        Vec::new()
-    }
+pub(crate) fn extract_aac_config(frame: &MediaFrame) -> Vec<u8> {
+    aac_audio_specific_config(frame)
+        .map(|config| config.to_vec())
+        .unwrap_or_default()
 }
 
 impl Default for HlsMuxer {
@@ -805,7 +789,7 @@ mod tests {
     #[test]
     fn hevc_config_extraction() {
         let d = make_hevc_config_data();
-        let cfg = extract_hevc_config(&d);
+        let cfg = extract_hevc_config_record(&d[5..]);
         assert_eq!(
             cfg,
             vec![0, 0, 0, 1, 0xAA, 0xBB, 0, 0, 0, 1, 0xCC, 0xDD, 0, 0, 0, 1, 0xEE, 0xFF]

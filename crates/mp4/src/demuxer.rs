@@ -16,7 +16,7 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::path::Path;
-use zlmediakit_core::media_frame::{CodecId, FrameType, MediaFrame};
+use zlmediakit_core::media_frame::{CodecId, FrameType, MediaFrame, PayloadFormat};
 
 /// A single decoded sample (one encoded frame / access unit) from the file.
 #[derive(Debug, Clone)]
@@ -91,7 +91,7 @@ impl Mp4Demuxer {
         let top = parser.walk_top_boxes()?;
 
         let moov = top.get("moov").context("missing moov box")?;
-        let mdat = top.get("mdat").context("missing mdat box")?;
+        top.get("mdat").context("missing mdat box")?;
 
         let moov_boxes = BoxCursor::new(moov).walk_top_boxes_vec()?;
         let mvhd = moov_boxes
@@ -108,7 +108,7 @@ impl Mp4Demuxer {
             if name != "trak" {
                 continue;
             }
-            let trak = parse_trak(body, mdat);
+            let trak = parse_trak(body, data);
             if let Ok(Some((track, track_samples))) = trak {
                 samples.insert(track.track_id, track_samples);
                 tracks.insert(track.track_id, track);
@@ -182,7 +182,8 @@ impl Mp4Demuxer {
                 MediaFrame::new_audio(track.track_id, track.codec, 0, 0, 0, Bytes::from(cfg_data))
             }
             TrackKind::Other => return None,
-        };
+        }
+        .with_payload_format(PayloadFormat::Flv);
         frame.config_frame = true;
         Some(frame)
     }
@@ -209,7 +210,8 @@ impl Mp4Demuxer {
                 Bytes::from(data),
             ),
             TrackKind::Other => return None,
-        };
+        }
+        .with_payload_format(PayloadFormat::Flv);
         Some(frame)
     }
 
@@ -319,7 +321,7 @@ fn read_mvhd_timescale(mvhd: &[u8]) -> u32 {
     }
 }
 
-fn parse_trak(trak: &[u8], mdat: &[u8]) -> Result<Option<(DemuxedTrack, Vec<DemuxedSample>)>> {
+fn parse_trak(trak: &[u8], file_data: &[u8]) -> Result<Option<(DemuxedTrack, Vec<DemuxedSample>)>> {
     let boxes = BoxCursor::new(trak).walk_top_boxes()?;
 
     let tkhd = boxes.get("tkhd").context("missing tkhd")?;
@@ -361,7 +363,7 @@ fn parse_trak(trak: &[u8], mdat: &[u8]) -> Result<Option<(DemuxedTrack, Vec<Demu
     let durations = parse_stts(stts)?;
 
     let stsc = stbl_boxes.get("stsc").context("missing stsc")?;
-    let (chunk_samples, _) = parse_stsc(stsc)?;
+    let chunk_sample_entries = parse_stsc(stsc)?;
 
     let stsz = stbl_boxes.get("stsz").context("missing stsz")?;
     let sample_sizes = parse_stsz(stsz)?;
@@ -397,21 +399,26 @@ fn parse_trak(trak: &[u8], mdat: &[u8]) -> Result<Option<(DemuxedTrack, Vec<Demu
     // Map chunk -> sample range, then compute absolute file offsets.
     let mut samples_out = Vec::with_capacity(sample_count);
     let mut sample_idx = 0usize;
-    for (chunk_idx, &samples_in_chunk) in chunk_samples.iter().enumerate() {
-        if chunk_idx >= chunk_offsets.len() {
-            break;
-        }
-        let chunk_offset = chunk_offsets[chunk_idx] as usize;
+    for (chunk_idx, chunk_offset) in chunk_offsets.iter().copied().enumerate() {
+        let chunk_number = chunk_idx as u32 + 1;
+        let Some((_, samples_in_chunk, _)) = chunk_sample_entries
+            .iter()
+            .rev()
+            .find(|(first_chunk, _, _)| *first_chunk <= chunk_number)
+        else {
+            continue;
+        };
+        let chunk_offset = chunk_offset as usize;
         let mut running = 0usize;
-        for _ in 0..samples_in_chunk {
+        for _ in 0..*samples_in_chunk {
             if sample_idx >= sample_count {
                 break;
             }
             let size = sample_sizes[sample_idx] as usize;
             let offset = chunk_offset + running;
             running += size;
-            let data = if offset + size <= mdat.len() {
-                Bytes::copy_from_slice(&mdat[offset..offset + size])
+            let data = if offset + size <= file_data.len() {
+                Bytes::copy_from_slice(&file_data[offset..offset + size])
             } else {
                 Bytes::new()
             };
@@ -730,33 +737,32 @@ fn parse_stts(stts: &[u8]) -> Result<Vec<u32>> {
     Ok(out)
 }
 
-/// Returns (per-chunk sample counts, per-chunk description sample desc idx).
-fn parse_stsc(stsc: &[u8]) -> Result<(Vec<usize>, Vec<u32>)> {
+/// Returns `(first_chunk, samples_per_chunk, sample_description_index)` entries.
+/// Each entry applies from `first_chunk` through the chunk before the next entry.
+fn parse_stsc(stsc: &[u8]) -> Result<Vec<(u32, usize, u32)>> {
     // body = version/flags(4) + entry_count(4) + (first_chunk, samples_per,
     // sample_desc) entries
     if stsc.len() < 8 {
         bail!("truncated stsc");
     }
     let entry_count = u32::from_be_bytes([stsc[4], stsc[5], stsc[6], stsc[7]]) as usize;
-    let mut counts = Vec::new();
-    let mut desc = Vec::new();
+    let mut entries = Vec::with_capacity(entry_count);
     let mut pos = 8;
     for _ in 0..entry_count {
         if pos + 12 > stsc.len() {
             break;
         }
-        let _first_chunk =
+        let first_chunk =
             u32::from_be_bytes([stsc[pos], stsc[pos + 1], stsc[pos + 2], stsc[pos + 3]]);
         let samples_per_chunk =
             u32::from_be_bytes([stsc[pos + 4], stsc[pos + 5], stsc[pos + 6], stsc[pos + 7]])
                 as usize;
         let sample_desc =
             u32::from_be_bytes([stsc[pos + 8], stsc[pos + 9], stsc[pos + 10], stsc[pos + 11]]);
-        counts.push(samples_per_chunk);
-        desc.push(sample_desc);
+        entries.push((first_chunk, samples_per_chunk, sample_desc));
         pos += 12;
     }
-    Ok((counts, desc))
+    Ok(entries)
 }
 
 fn parse_stsz(stsz: &[u8]) -> Result<Vec<usize>> {

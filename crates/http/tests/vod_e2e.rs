@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time::Duration;
 use zlmediakit_core::auth::{generate_sign, StreamAuth};
 use zlmediakit_core::hook::HookClient;
-use zlmediakit_core::media_frame::{CodecId, MediaFrame};
+use zlmediakit_core::media_frame::{CodecId, MediaFrame, PayloadFormat};
 use zlmediakit_core::media_source::MediaSourceManager;
 use zlmediakit_core::recorder::{RecorderCommand, RecorderControl};
 use zlmediakit_core::stream_proxy::StreamProxyControl;
@@ -148,7 +148,10 @@ async fn vod_flv_playback_with_range_and_dir_listing() {
 
     // Publish a stream and record it to FLV.
     let source = mgr.get_or_create("__defaultVhost__", "live", "vodtest");
-    let cfg = MediaFrame::new_video(0, CodecId::H264, 0, 0, 0, h264_config_data().into(), false);
+    let mut cfg =
+        MediaFrame::new_video(0, CodecId::H264, 0, 0, 0, h264_config_data().into(), false)
+            .with_payload_format(PayloadFormat::Flv);
+    cfg.config_frame = true;
     source.publish_and_cache(cfg).await;
     let key = MediaFrame::new_video(
         0,
@@ -161,7 +164,8 @@ async fn vod_flv_playback_with_range_and_dir_listing() {
         ]
         .into(),
         true,
-    );
+    )
+    .with_payload_format(PayloadFormat::Flv);
     source.publish_and_cache(key).await;
 
     recorder.start("__defaultVhost__", "live", "vodtest", false, true, false);
@@ -179,7 +183,8 @@ async fn vod_flv_playback_with_range_and_dir_listing() {
             ]
             .into(),
             true,
-        );
+        )
+        .with_payload_format(PayloadFormat::Flv);
         source.publish_and_cache(frame).await;
     }
 
@@ -564,7 +569,10 @@ async fn vod_auth_rejects_without_valid_sign() {
 
     // Publish and record a stream.
     let source = mgr.get_or_create("__defaultVhost__", "live", "vodtest");
-    let cfg = MediaFrame::new_video(0, CodecId::H264, 0, 0, 0, h264_config_data().into(), false);
+    let mut cfg =
+        MediaFrame::new_video(0, CodecId::H264, 0, 0, 0, h264_config_data().into(), false)
+            .with_payload_format(PayloadFormat::Flv);
+    cfg.config_frame = true;
     source.publish_and_cache(cfg).await;
     let key = MediaFrame::new_video(
         0,
@@ -577,7 +585,8 @@ async fn vod_auth_rejects_without_valid_sign() {
         ]
         .into(),
         true,
-    );
+    )
+    .with_payload_format(PayloadFormat::Flv);
     source.publish_and_cache(key).await;
     recorder.start("__defaultVhost__", "live", "vodtest", false, true, false);
     tokio::time::sleep(Duration::from_millis(100)).await;
