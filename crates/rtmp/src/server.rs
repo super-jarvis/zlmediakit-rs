@@ -5,20 +5,26 @@ use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::event_bus::EventBus;
 use zlmediakit_core::hook::HookClient;
 use zlmediakit_core::media_source::MediaSourceManager;
-use zlmediakit_core::transport::{load_tls_config, TlsAcceptor, TransportStream};
+use zlmediakit_core::transport::{load_tls_config, ReloadableTlsAcceptor, TransportStream};
+use zlmediakit_mp4::Mp4VodLibrary;
 
 use crate::session::RtmpSession;
 
 pub struct RtmpServer {
     listener: TcpListener,
-    tls: Option<TlsAcceptor>,
+    tls: Option<Arc<ReloadableTlsAcceptor>>,
     source_manager: Arc<MediaSourceManager>,
     event_bus: Arc<EventBus>,
     auth: Arc<StreamAuth>,
     hook: Arc<HookClient>,
+    vod: Option<Arc<Mp4VodLibrary>>,
 }
 
 impl RtmpServer {
+    pub fn local_addr(&self) -> anyhow::Result<std::net::SocketAddr> {
+        Ok(self.listener.local_addr()?)
+    }
+
     pub async fn new(
         addr: &str,
         source_manager: Arc<MediaSourceManager>,
@@ -42,7 +48,13 @@ impl RtmpServer {
             event_bus,
             auth,
             hook,
+            vod: None,
         })
+    }
+
+    pub fn with_vod_library(mut self, vod: Arc<Mp4VodLibrary>) -> Self {
+        self.vod = Some(vod);
+        self
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -54,6 +66,7 @@ impl RtmpServer {
                     let event_bus = self.event_bus.clone();
                     let auth = self.auth.clone();
                     let hook = self.hook.clone();
+                    let vod = self.vod.clone();
                     let peer = peer_addr.to_string();
 
                     if let Some(ref tls) = tls {
@@ -70,7 +83,8 @@ impl RtmpServer {
                                         event_bus,
                                         auth,
                                         hook,
-                                    );
+                                    )
+                                    .with_vod_library(vod);
                                     if let Err(e) = session.run().await {
                                         error!("RTMPS session error: {}", e);
                                     }
@@ -90,7 +104,8 @@ impl RtmpServer {
                                 event_bus,
                                 auth,
                                 hook,
-                            );
+                            )
+                            .with_vod_library(vod);
                             if let Err(e) = session.run().await {
                                 error!("RTMP session error: {}", e);
                             }

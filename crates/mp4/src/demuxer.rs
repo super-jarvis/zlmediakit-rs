@@ -335,6 +335,9 @@ fn parse_trak(trak: &[u8], file_data: &[u8]) -> Result<Option<(DemuxedTrack, Vec
 
     let mdhd = mdia_boxes.get("mdhd").context("missing mdhd")?;
     let timescale = read_mdhd_timescale(mdhd);
+    if timescale == 0 {
+        bail!("mp4 track timescale must be positive");
+    }
     let duration = read_mdhd_duration(mdhd);
 
     let hdlr = mdia_boxes.get("hdlr").context("missing hdlr")?;
@@ -359,14 +362,18 @@ fn parse_trak(trak: &[u8], file_data: &[u8]) -> Result<Option<(DemuxedTrack, Vec
     let stsd = stbl_boxes.get("stsd").context("missing stsd")?;
     let (codec, config) = parse_stsd(stsd, handler)?;
 
+    let stsz = stbl_boxes.get("stsz").context("missing stsz")?;
+    let sample_sizes = parse_stsz(stsz, file_data.len())?;
+    let sample_count = sample_sizes.len();
+    if sample_count == 0 {
+        return Ok(None);
+    }
+
     let stts = stbl_boxes.get("stts").context("missing stts")?;
-    let durations = parse_stts(stts)?;
+    let durations = parse_stts(stts, sample_count)?;
 
     let stsc = stbl_boxes.get("stsc").context("missing stsc")?;
     let chunk_sample_entries = parse_stsc(stsc)?;
-
-    let stsz = stbl_boxes.get("stsz").context("missing stsz")?;
-    let sample_sizes = parse_stsz(stsz)?;
 
     let (chunk_offsets, co64) = if let Some(c) = stbl_boxes.get("co64") {
         (parse_co64(c)?, true)
@@ -383,17 +390,12 @@ fn parse_trak(trak: &[u8], file_data: &[u8]) -> Result<Option<(DemuxedTrack, Vec
         Vec::new()
     };
 
-    let sample_count = sample_sizes.len();
-    if sample_count == 0 {
-        return Ok(None);
-    }
-
     // Build per-sample absolute timestamps (in track timescale ticks).
     let mut timestamps = Vec::with_capacity(sample_count);
     let mut t = 0u64;
     for d in &durations {
         timestamps.push(t);
-        t += *d as u64;
+        t = t.saturating_add(*d as u64);
     }
 
     // Map chunk -> sample range, then compute absolute file offsets.
@@ -408,17 +410,25 @@ fn parse_trak(trak: &[u8], file_data: &[u8]) -> Result<Option<(DemuxedTrack, Vec
         else {
             continue;
         };
-        let chunk_offset = chunk_offset as usize;
+        let chunk_offset =
+            usize::try_from(chunk_offset).context("mp4 chunk offset is too large")?;
         let mut running = 0usize;
         for _ in 0..*samples_in_chunk {
             if sample_idx >= sample_count {
                 break;
             }
             let size = sample_sizes[sample_idx] as usize;
-            let offset = chunk_offset + running;
-            running += size;
-            let data = if offset + size <= file_data.len() {
-                Bytes::copy_from_slice(&file_data[offset..offset + size])
+            let Some(offset) = chunk_offset.checked_add(running) else {
+                bail!("mp4 sample offset overflow");
+            };
+            let Some(end) = offset.checked_add(size) else {
+                bail!("mp4 sample size overflow");
+            };
+            running = running
+                .checked_add(size)
+                .context("mp4 chunk sample sizes overflow")?;
+            let data = if end <= file_data.len() {
+                Bytes::copy_from_slice(&file_data[offset..end])
             } else {
                 Bytes::new()
             };
@@ -714,25 +724,49 @@ fn read_ber_len(data: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
-fn parse_stts(stts: &[u8]) -> Result<Vec<u32>> {
+fn ensure_table_entries(
+    box_name: &str,
+    body_len: usize,
+    header_len: usize,
+    entry_count: usize,
+    entry_size: usize,
+) -> Result<()> {
+    let required = entry_count
+        .checked_mul(entry_size)
+        .and_then(|entries| header_len.checked_add(entries))
+        .context("mp4 table size overflow")?;
+    if required > body_len {
+        bail!("truncated {box_name}: declares {entry_count} entries");
+    }
+    Ok(())
+}
+
+fn parse_stts(stts: &[u8], expected_samples: usize) -> Result<Vec<u32>> {
     // body = version/flags(4) + entry_count(4) + (count, delta) entries
     if stts.len() < 8 {
         bail!("truncated stts");
     }
     let entry_count = u32::from_be_bytes([stts[4], stts[5], stts[6], stts[7]]) as usize;
-    let mut out = Vec::new();
+    ensure_table_entries("stts", stts.len(), 8, entry_count, 8)?;
+    let mut out = Vec::with_capacity(expected_samples);
     let mut pos = 8;
     for _ in 0..entry_count {
-        if pos + 8 > stts.len() {
-            break;
-        }
-        let count = u32::from_be_bytes([stts[pos], stts[pos + 1], stts[pos + 2], stts[pos + 3]]);
+        let count =
+            u32::from_be_bytes([stts[pos], stts[pos + 1], stts[pos + 2], stts[pos + 3]]) as usize;
         let delta =
             u32::from_be_bytes([stts[pos + 4], stts[pos + 5], stts[pos + 6], stts[pos + 7]]);
-        for _ in 0..count {
-            out.push(delta);
+        let new_len = out
+            .len()
+            .checked_add(count)
+            .context("stts sample count overflow")?;
+        if new_len > expected_samples {
+            bail!("stts describes more samples than stsz");
         }
+        out.resize(new_len, delta);
         pos += 8;
+    }
+    if out.len() != expected_samples {
+        bail!("stts sample count does not match stsz");
     }
     Ok(out)
 }
@@ -746,12 +780,10 @@ fn parse_stsc(stsc: &[u8]) -> Result<Vec<(u32, usize, u32)>> {
         bail!("truncated stsc");
     }
     let entry_count = u32::from_be_bytes([stsc[4], stsc[5], stsc[6], stsc[7]]) as usize;
+    ensure_table_entries("stsc", stsc.len(), 8, entry_count, 12)?;
     let mut entries = Vec::with_capacity(entry_count);
     let mut pos = 8;
     for _ in 0..entry_count {
-        if pos + 12 > stsc.len() {
-            break;
-        }
         let first_chunk =
             u32::from_be_bytes([stsc[pos], stsc[pos + 1], stsc[pos + 2], stsc[pos + 3]]);
         let samples_per_chunk =
@@ -765,25 +797,24 @@ fn parse_stsc(stsc: &[u8]) -> Result<Vec<(u32, usize, u32)>> {
     Ok(entries)
 }
 
-fn parse_stsz(stsz: &[u8]) -> Result<Vec<usize>> {
+fn parse_stsz(stsz: &[u8], file_len: usize) -> Result<Vec<usize>> {
     // body = version/flags(4) + sample_size(4) + sample_count(4) + [sizes]
     if stsz.len() < 12 {
         bail!("truncated stsz");
     }
     let sample_size = u32::from_be_bytes([stsz[4], stsz[5], stsz[6], stsz[7]]);
     let sample_count = u32::from_be_bytes([stsz[8], stsz[9], stsz[10], stsz[11]]) as usize;
-    let mut out = Vec::with_capacity(sample_count);
     if sample_size != 0 {
-        for _ in 0..sample_count {
-            out.push(sample_size as usize);
+        let sample_size = sample_size as usize;
+        if sample_count > file_len / sample_size {
+            bail!("stsz sample count exceeds the containing file size");
         }
-        return Ok(out);
+        return Ok(vec![sample_size; sample_count]);
     }
+    ensure_table_entries("stsz", stsz.len(), 12, sample_count, 4)?;
+    let mut out = Vec::with_capacity(sample_count);
     let mut pos = 12;
     for _ in 0..sample_count {
-        if pos + 4 > stsz.len() {
-            break;
-        }
         let s =
             u32::from_be_bytes([stsz[pos], stsz[pos + 1], stsz[pos + 2], stsz[pos + 3]]) as usize;
         out.push(s);
@@ -798,12 +829,10 @@ fn parse_stco(stco: &[u8]) -> Result<Vec<u64>> {
         bail!("truncated stco");
     }
     let count = u32::from_be_bytes([stco[4], stco[5], stco[6], stco[7]]) as usize;
+    ensure_table_entries("stco", stco.len(), 8, count, 4)?;
     let mut out = Vec::with_capacity(count);
     let mut pos = 8;
     for _ in 0..count {
-        if pos + 4 > stco.len() {
-            break;
-        }
         let o = u32::from_be_bytes([stco[pos], stco[pos + 1], stco[pos + 2], stco[pos + 3]]) as u64;
         out.push(o);
         pos += 4;
@@ -817,12 +846,10 @@ fn parse_co64(co64: &[u8]) -> Result<Vec<u64>> {
         bail!("truncated co64");
     }
     let count = u32::from_be_bytes([co64[4], co64[5], co64[6], co64[7]]) as usize;
+    ensure_table_entries("co64", co64.len(), 8, count, 8)?;
     let mut out = Vec::with_capacity(count);
     let mut pos = 8;
     for _ in 0..count {
-        if pos + 8 > co64.len() {
-            break;
-        }
         let o = u64::from_be_bytes([
             co64[pos],
             co64[pos + 1],
@@ -845,12 +872,10 @@ fn parse_stss(stss: &[u8]) -> Result<Vec<u32>> {
         bail!("truncated stss");
     }
     let count = u32::from_be_bytes([stss[4], stss[5], stss[6], stss[7]]) as usize;
+    ensure_table_entries("stss", stss.len(), 8, count, 4)?;
     let mut out = Vec::with_capacity(count);
     let mut pos = 8;
     for _ in 0..count {
-        if pos + 4 > stss.len() {
-            break;
-        }
         let n = u32::from_be_bytes([stss[pos], stss[pos + 1], stss[pos + 2], stss[pos + 3]]);
         out.push(n);
         pos += 4;
@@ -1067,5 +1092,21 @@ mod tests {
             .find(|t| t.handler == TrackKind::Audio)
             .unwrap();
         assert!(audio.sample_rate > 0, "audio sample rate should be parsed");
+    }
+
+    #[test]
+    fn fuzz_smoke_mp4_demuxer_never_panics() {
+        let valid = build_test_mp4();
+        // MP4 parsing walks several nested sample tables. Sample at most 512
+        // truncation/mutation points so this remains a bounded CI smoke test.
+        let stride = (valid.len() / 512).max(1);
+        for len in (0..valid.len()).step_by(stride) {
+            let _ = Mp4Demuxer::from_bytes(&valid[..len]);
+        }
+        for index in (0..valid.len()).step_by(stride) {
+            let mut mutated = valid.clone();
+            mutated[index] ^= 0xff;
+            let _ = Mp4Demuxer::from_bytes(&mutated);
+        }
     }
 }

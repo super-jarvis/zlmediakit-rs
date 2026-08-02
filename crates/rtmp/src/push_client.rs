@@ -63,36 +63,8 @@ trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 type ConnectStream = Box<dyn IoStream>;
 
-/// Parses an RTMP(S) URL into (host, port, app, stream_name, use_tls).
-fn parse_url(url: &str) -> anyhow::Result<(String, u16, String, String, bool)> {
-    let (s, use_tls) = if let Some(s) = url.strip_prefix("rtmps://") {
-        (s, true)
-    } else if let Some(s) = url.strip_prefix("rtmp://") {
-        (s, false)
-    } else {
-        anyhow::bail!("not an RTMP(S) URL: {}", url);
-    };
-    let default_port = if use_tls { 443 } else { 1935 };
-    let (authority, path) = match s.find('/') {
-        Some(i) => (s[..i].to_string(), s[i + 1..].to_string()),
-        None => (s.to_string(), String::new()),
-    };
-    let (host, port) = match authority.rfind(':') {
-        Some(i) => {
-            let p = authority[i + 1..].parse::<u16>().unwrap_or(default_port);
-            (authority[..i].to_string(), p)
-        }
-        None => (authority, default_port),
-    };
-    let (app, stream) = path
-        .split_once('/')
-        .map(|(a, s)| (a.to_string(), s.to_string()))
-        .unwrap_or_else(|| (path, String::new()));
-    Ok((host, port, app, stream, use_tls))
-}
-
 async fn connect(url: &str) -> anyhow::Result<(ConnectStream, String, String)> {
-    let (host, port, remote_app, remote_stream, use_tls) = parse_url(url)?;
+    let (host, port, remote_app, remote_stream, use_tls) = crate::client_url::parse_rtmp_url(url)?;
     let tcp = TcpStream::connect((host.as_str(), port))
         .await
         .map_err(|e| anyhow::anyhow!("connect {}:{} failed: {}", host, port, e))?;

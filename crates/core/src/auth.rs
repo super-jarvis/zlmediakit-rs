@@ -1,7 +1,7 @@
 use md5::Md5;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Shared authentication settings, passed to every protocol session.
 #[derive(Debug, Clone)]
@@ -17,12 +17,14 @@ pub struct StreamAuth {
     /// `username`; if the username is unknown the shared `secret` is used as a
     /// fallback password (so single-secret deployments keep working).
     pub users: HashMap<String, String>,
+    runtime_secret: Arc<RwLock<String>>,
 }
 
 impl StreamAuth {
     pub fn new(enabled: bool, secret: String) -> Arc<Self> {
         Arc::new(Self {
             enabled,
+            runtime_secret: Arc::new(RwLock::new(secret.clone())),
             secret,
             default_realm: None,
             users: HashMap::new(),
@@ -39,10 +41,26 @@ impl StreamAuth {
     ) -> Arc<Self> {
         Arc::new(Self {
             enabled,
+            runtime_secret: Arc::new(RwLock::new(secret.clone())),
             secret,
             default_realm,
             users,
         })
+    }
+
+    /// Current shared secret. Unlike the public startup snapshot, this value
+    /// can be rotated at runtime and is shared by all existing sessions.
+    pub fn secret(&self) -> String {
+        self.runtime_secret.read().unwrap().clone()
+    }
+
+    pub fn set_secret(&self, secret: String) -> bool {
+        let mut current = self.runtime_secret.write().unwrap();
+        if *current == secret {
+            return false;
+        }
+        *current = secret;
+        true
     }
 
     /// Resolves the Digest password for a claimed `username`: the per-user
@@ -51,7 +69,7 @@ impl StreamAuth {
         self.users
             .get(username)
             .cloned()
-            .unwrap_or_else(|| self.secret.clone())
+            .unwrap_or_else(|| self.secret())
     }
 
     /// Validates a `sign` query/parameter for a publish or play request.
@@ -66,7 +84,7 @@ impl StreamAuth {
         if sign.is_empty() {
             return false;
         }
-        validate_sign(&self.secret, sign, &[vhost, app, stream, action])
+        validate_sign(&self.secret(), sign, &[vhost, app, stream, action])
     }
 
     /// Validates an RTSP `Digest` `Authorization` header (RFC 2617/2617-style).

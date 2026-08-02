@@ -85,6 +85,102 @@ mod tests {
             received
         );
     }
+
+    #[test]
+    fn origin_url_supports_base_and_template_forms() {
+        assert_eq!(
+            render_origin_url("rtmp://origin:1935/", "origin-vhost", "camera", "front"),
+            "rtmp://origin:1935/camera/front"
+        );
+        assert_eq!(
+            render_origin_url(
+                "https://origin/{vhost}/{app}/{stream}.flv",
+                "origin-vhost",
+                "camera",
+                "front"
+            ),
+            "https://origin/origin-vhost/camera/front.flv"
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_pull_fails_over_once_for_concurrent_players() {
+        let manager = Arc::new(MediaSourceManager::new(None));
+        let (proxy, _active, mut commands) = StreamProxyControl::new();
+        let proxy = Arc::new(proxy);
+        manager.set_origin_pulls(
+            proxy.clone(),
+            vec![
+                "rtmp://dead-origin:1935".to_string(),
+                "https://backup/{app}/{stream}.flv".to_string(),
+            ],
+            "origin-vhost".to_string(),
+            "upstream".to_string(),
+            Duration::from_millis(250),
+        );
+
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let supervisor = {
+            let manager = manager.clone();
+            let proxy = proxy.clone();
+            let observed = observed.clone();
+            tokio::spawn(async move {
+                while let Some(cmd) = commands.recv().await {
+                    observed.lock().unwrap().push((
+                        cmd.url.clone(),
+                        cmd.vhost.clone(),
+                        cmd.app.clone(),
+                        cmd.stream.clone(),
+                    ));
+                    if cmd.url.starts_with("rtmp://dead-origin") {
+                        proxy.remove(&cmd.vhost, &cmd.app, &cmd.stream);
+                        continue;
+                    }
+
+                    let source = manager.get_or_create(&cmd.vhost, &cmd.app, &cmd.stream);
+                    source
+                        .publish_and_cache(MediaFrame::new_video(
+                            0,
+                            crate::media_frame::CodecId::H264,
+                            0,
+                            0,
+                            0,
+                            Bytes::from_static(&[0x17, 1, 0, 0, 0]),
+                            true,
+                        ))
+                        .await;
+                }
+            })
+        };
+
+        let (first, second) = tokio::join!(
+            manager.get_or_pull("edge-vhost", "live", "camera-1"),
+            manager.get_or_pull("edge-vhost", "live", "camera-1")
+        );
+        let first = first.expect("first player should receive the failed-over source");
+        let second = second.expect("second player should share the same pull");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let observed = observed.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec![
+                (
+                    "rtmp://dead-origin:1935/upstream/camera-1".to_string(),
+                    "edge-vhost".to_string(),
+                    "live".to_string(),
+                    "camera-1".to_string(),
+                ),
+                (
+                    "https://backup/upstream/camera-1.flv".to_string(),
+                    "edge-vhost".to_string(),
+                    "live".to_string(),
+                    "camera-1".to_string(),
+                ),
+            ]
+        );
+        supervisor.abort();
+    }
 }
 
 pub type SourceId = String;
@@ -99,12 +195,55 @@ pub struct MediaSource {
     pub frame_tx: Arc<Mutex<Option<broadcast::Sender<MediaFrame>>>>,
     pub gop_cache: Arc<RwLock<GopCache>>,
     pub subscribers: Arc<RwLock<HashMap<SessionId, ()>>>,
+    /// Optional protocol-specific identity for each logical media track. WHIP
+    /// uses this to preserve simulcast RID/SSRC information without changing
+    /// the container-oriented `TrackInfo` contract shared by every protocol.
+    pub track_descriptors: Arc<RwLock<HashMap<u32, TrackDescriptor>>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub event_bus: Option<Arc<EventBus>>,
     /// Per-source traffic counters (bytes). Shared so the manager can read them
     /// when summarizing total traffic for the `on_flow_report` hook.
     pub bytes_in: Arc<std::sync::atomic::AtomicU64>,
     pub bytes_out: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackDescriptor {
+    pub rid: Option<String>,
+    pub remote_track_id: Option<String>,
+    pub stream_id: Option<String>,
+    pub ssrc: Option<u32>,
+}
+
+/// RAII registration for a live player. Protocol implementations keep this
+/// guard for as long as their send loop is alive; dropping it unregisters the
+/// player and emits `NoReader` when the last player leaves.
+#[must_use = "dropping the guard immediately unregisters the subscriber"]
+pub struct SubscriberGuard {
+    source: Arc<MediaSource>,
+    session_id: Option<SessionId>,
+}
+
+impl SubscriberGuard {
+    pub async fn close(mut self) {
+        if let Some(session_id) = self.session_id.take() {
+            self.source.remove_subscriber(&session_id).await;
+        }
+    }
+}
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        let Some(session_id) = self.session_id.take() else {
+            return;
+        };
+        let source = self.source.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                source.remove_subscriber(&session_id).await;
+            });
+        }
+    }
 }
 
 impl MediaSource {
@@ -129,6 +268,7 @@ impl MediaSource {
             frame_tx: Arc::new(Mutex::new(Some(frame_tx))),
             gop_cache: Arc::new(RwLock::new(GopCache::new())),
             subscribers: Arc::new(RwLock::new(HashMap::new())),
+            track_descriptors: Arc::new(RwLock::new(HashMap::new())),
             created_at: chrono::Utc::now(),
             event_bus,
             bytes_in: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -142,20 +282,35 @@ impl MediaSource {
 
     pub async fn update_info(&self, info: MediaInfo) {
         *self.info.write().await = info;
+        self.track_descriptors.write().await.clear();
     }
 
     pub async fn update_tracks(&self, tracks: Vec<crate::media_frame::TrackInfo>) {
         let mut info = self.info.write().await;
         info.tracks = tracks;
+        drop(info);
+        self.track_descriptors.write().await.clear();
+    }
+
+    pub async fn set_track_descriptor(&self, track_id: u32, descriptor: TrackDescriptor) {
+        self.track_descriptors
+            .write()
+            .await
+            .insert(track_id, descriptor);
+    }
+
+    pub async fn track_descriptor(&self, track_id: u32) -> Option<TrackDescriptor> {
+        self.track_descriptors.read().await.get(&track_id).cloned()
     }
 
     pub async fn add_subscriber(&self, session_id: SessionId) {
-        let was_empty = self.subscribers.read().await.is_empty();
-        self.subscribers
-            .write()
-            .await
-            .insert(session_id.clone(), ());
-        if was_empty {
+        let (was_empty, inserted) = {
+            let mut subscribers = self.subscribers.write().await;
+            let was_empty = subscribers.is_empty();
+            let inserted = subscribers.insert(session_id.clone(), ()).is_none();
+            (was_empty, inserted)
+        };
+        if was_empty && inserted {
             // First subscriber → stream changed (regist=true).
             if let Some(eb) = &self.event_bus {
                 eb.publish(Event::StreamPlay {
@@ -167,8 +322,14 @@ impl MediaSource {
     }
 
     pub async fn remove_subscriber(&self, session_id: &SessionId) {
-        self.subscribers.write().await.remove(session_id);
-        let count = self.subscribers.read().await.len();
+        let (removed, count) = {
+            let mut subscribers = self.subscribers.write().await;
+            let removed = subscribers.remove(session_id).is_some();
+            (removed, subscribers.len())
+        };
+        if !removed {
+            return;
+        }
         if let Some(eb) = &self.event_bus {
             eb.publish(Event::StreamStop {
                 source_id: self.id.clone(),
@@ -179,6 +340,14 @@ impl MediaSource {
                     source_id: self.id.clone(),
                 });
             }
+        }
+    }
+
+    pub async fn register_subscriber(self: &Arc<Self>, session_id: SessionId) -> SubscriberGuard {
+        self.add_subscriber(session_id.clone()).await;
+        SubscriberGuard {
+            source: self.clone(),
+            session_id: Some(session_id),
         }
     }
 
@@ -283,12 +452,16 @@ pub struct MediaSourceManager {
     /// origin URL (configured at runtime via `set_origin`), a play request for
     /// a missing stream triggers an automatic pull from the origin server.
     proxy: std::sync::RwLock<Option<Arc<StreamProxyControl>>>,
-    /// Origin server base URL for edge auto-pull (e.g. `rtmp://origin:1935`).
-    origin: std::sync::RwLock<Option<String>>,
-    /// Local vhost used when pulling from the origin.
+    /// Ordered origin server base URLs/templates for edge auto-pull.
+    origins: std::sync::RwLock<Vec<String>>,
+    /// Upstream vhost used in origin URL templates.
     origin_vhost: std::sync::RwLock<String>,
-    /// Local app used when pulling from the origin.
+    /// Upstream app appended to base URLs or used in templates.
     origin_app: std::sync::RwLock<String>,
+    origin_timeout: std::sync::RwLock<std::time::Duration>,
+    /// Per-stream single-flight locks prevent concurrent play requests from
+    /// racing through the origin candidate list.
+    origin_locks: DashMap<SourceId, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl MediaSourceManager {
@@ -297,9 +470,11 @@ impl MediaSourceManager {
             sources: DashMap::new(),
             event_bus,
             proxy: std::sync::RwLock::new(None),
-            origin: std::sync::RwLock::new(None),
+            origins: std::sync::RwLock::new(Vec::new()),
             origin_vhost: std::sync::RwLock::new("__defaultVhost__".to_string()),
             origin_app: std::sync::RwLock::new("live".to_string()),
+            origin_timeout: std::sync::RwLock::new(std::time::Duration::from_secs(5)),
+            origin_locks: DashMap::new(),
         }
     }
 
@@ -312,10 +487,28 @@ impl MediaSourceManager {
         vhost: String,
         app: String,
     ) {
+        self.set_origin_pulls(
+            proxy,
+            vec![origin_url],
+            vhost,
+            app,
+            std::time::Duration::from_secs(5),
+        );
+    }
+
+    pub fn set_origin_pulls(
+        &self,
+        proxy: Arc<StreamProxyControl>,
+        origins: Vec<String>,
+        vhost: String,
+        app: String,
+        timeout: std::time::Duration,
+    ) {
         *self.proxy.write().unwrap() = Some(proxy);
-        *self.origin.write().unwrap() = Some(origin_url);
+        *self.origins.write().unwrap() = origins;
         *self.origin_vhost.write().unwrap() = vhost;
         *self.origin_app.write().unwrap() = app;
+        *self.origin_timeout.write().unwrap() = timeout;
     }
 
     pub fn get_or_create(&self, vhost: &str, app: &str, stream: &str) -> Arc<MediaSource> {
@@ -374,44 +567,62 @@ impl MediaSourceManager {
         if let Some(s) = self.get(vhost, app, stream) {
             return Some(s);
         }
-        let (proxy, origin, vh, ap) = {
+        let key = format!("{}/{}/{}", vhost, app, stream);
+        let flight = self
+            .origin_locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _flight_guard = flight.lock().await;
+        if let Some(source) = self.get(vhost, app, stream) {
+            return Some(source);
+        }
+
+        let (proxy, origins, upstream_vhost, upstream_app, attempt_timeout) = {
             let guard = self.proxy.read().unwrap();
             let p = match guard.as_ref() {
                 Some(p) => p.clone(),
                 None => return None,
             };
-            let o = self.origin.read().unwrap().clone();
-            let vh = self.origin_vhost.read().unwrap().clone();
-            let ap = self.origin_app.read().unwrap().clone();
-            (p, o, vh, ap)
+            (
+                p,
+                self.origins.read().unwrap().clone(),
+                self.origin_vhost.read().unwrap().clone(),
+                self.origin_app.read().unwrap().clone(),
+                *self.origin_timeout.read().unwrap(),
+            )
         };
-        let origin = match origin {
-            Some(o) => o,
-            None => return None,
-        };
-        // Already pulling? don't start a second pull.
+
+        // A manually configured proxy may already be serving this stream.
         if proxy.is_active(vhost, app, stream) {
-            return self
-                .wait_for_source(vhost, app, stream, std::time::Duration::from_secs(5))
-                .await;
+            if let Some(source) = self
+                .wait_for_source_or_proxy_end(&proxy, vhost, app, stream, attempt_timeout)
+                .await
+            {
+                return Some(source);
+            }
         }
-        // Build the origin URL: <origin_url>/<origin_app>/<stream>
-        let origin_stream = stream;
-        let url = format!("{}/{}/{}", origin.trim_end_matches('/'), ap, origin_stream);
-        info!(
-            "edge auto-pull: {} -> {}",
-            url,
-            format!("{}/{}/{}", vhost, app, stream)
-        );
-        if !proxy.add(&url, &vh, app, stream) {
-            return None;
+
+        for origin in origins {
+            let url = render_origin_url(&origin, &upstream_vhost, &upstream_app, stream);
+            info!("edge auto-pull attempt: {url} -> {vhost}/{app}/{stream}");
+            if !proxy.add_on_demand(&url, vhost, app, stream) {
+                continue;
+            }
+            if let Some(source) = self
+                .wait_for_source_or_proxy_end(&proxy, vhost, app, stream, attempt_timeout)
+                .await
+            {
+                return Some(source);
+            }
+            proxy.remove(vhost, app, stream);
         }
-        self.wait_for_source(vhost, app, stream, std::time::Duration::from_secs(5))
-            .await
+        None
     }
 
-    async fn wait_for_source(
+    async fn wait_for_source_or_proxy_end(
         &self,
+        proxy: &StreamProxyControl,
         vhost: &str,
         app: &str,
         stream: &str,
@@ -419,16 +630,15 @@ impl MediaSourceManager {
     ) -> Option<Arc<MediaSource>> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if let Some(s) = self.get(vhost, app, stream) {
-                // Wait until at least one frame is cached so the player can start.
-                if !s.get_latest_gop_frames().await.is_empty() {
-                    return Some(s);
+            if let Some(source) = self.get(vhost, app, stream) {
+                if !source.get_latest_gop_frames().await.is_empty() {
+                    return Some(source);
                 }
             }
-            if tokio::time::Instant::now() >= deadline {
-                return self.get(vhost, app, stream);
+            if tokio::time::Instant::now() >= deadline || !proxy.is_active(vhost, app, stream) {
+                return None;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     }
 
@@ -481,6 +691,17 @@ impl MediaSourceManager {
 
     pub fn count(&self) -> usize {
         self.sources.len()
+    }
+}
+
+fn render_origin_url(origin: &str, vhost: &str, app: &str, stream: &str) -> String {
+    if origin.contains("{vhost}") || origin.contains("{app}") || origin.contains("{stream}") {
+        origin
+            .replace("{vhost}", vhost)
+            .replace("{app}", app)
+            .replace("{stream}", stream)
+    } else {
+        format!("{}/{}/{}", origin.trim_end_matches('/'), app, stream)
     }
 }
 

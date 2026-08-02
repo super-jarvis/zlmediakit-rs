@@ -171,5 +171,56 @@
 - 新增 SRT Caller 拉流、Caller MPEG-TS 推流和 Rendezvous 客户端，支持 `mode`、`localip/localport`、`latency`、`streamid`、`passphrase`，并接入统一拉流代理/推流中继 supervisor。
 - 真实 libsrt 网络验收通过：Caller→Listener H.264/AAC TS 推流、Listener→Caller 拉流、双端 Rendezvous bind/connect/message 传输；SRT 全套 32+1+1 测试、fmt 与 SRT/server 严格 Clippy 通过。
 - SRT 网络测试同时修复 TS 解复用旧缺陷：PAT program loop、PMT program_info_length 偏移，以及依据 PMT stream_type 固定 H.264/H.265，避免把 H.264 `0x41` P 帧误判为 H.265。
+- 新增共享 `Mp4VodLibrary`/`VodAsset`：RTMP、RTSP、HTTP-FLV 与 WS-FLV 使用同一安全路径解析、轨道元数据、关键帧 seek、时间戳重置和实时 pacing；`record` 之外应用、绝对路径、父目录、反斜杠及编码穿越均拒绝。
+- RTMP VOD 支持 `play.start`/`duration`，有限文件播放结束发送 `NetStream.Play.Stop` 与 StreamEOF；真实握手/AMF/视频网络测试验证 250ms 请求选择 200ms IDR、首帧归零并省略前一 GOP。
+- RTSP VOD 支持 DESCRIBE/SDP、TCP/UDP RTP 和 `Range: npt=`，响应回报实际关键帧起点；真实 TCP interleaved 测试验证 `npt=0.250-` 返回 `npt=0.200-` 并发送对应 IDR。
+- HTTP/WS-FLV VOD 支持秒单位 `start`/`duration`，按时间节奏输出并在 WS 文件末尾发送正常 close；同一真实 MP4 测试覆盖 HTTP FLV tag 与 WebSocket binary frame。
+- VOD 网络回归发现并修复 MP4 `stts` 旧偏移：sample duration 现由后继时间戳计算、末帧复用上一 cadence，MP4 全套 23+2 测试和 RTMP/RTSP/HTTP/WS VOD 网络测试通过。阶段 5 完成，进入阶段 6 集群与生命周期。
+- 阶段 5 最终门禁通过：RTMP 全套（含 RTMPS、推拉流、H.264/H.265/音频和 VOD）、RTSP 11 单元 + Digest + 六类网络 E2E、HTTP 21 单元 + 33 API/媒体网络测试全部通过；mp4/rtmp/rtsp/http/server 全目标 Clippy `-D warnings` 与 `cargo fmt --check` 通过。
+- 阶段 6 完成多上游边缘回源：兼容 `origin_url` 并新增有序 `origin_urls`、逐候选超时、基础 URL/占位模板、同一路流 single-flight；首上游失败会自动切换，两个并发播放器仅产生一组回源尝试。
+- 新增 `SubscriberGuard` 并接入 RTMP、RTSP TCP/UDP、HTTP-FLV/TS/fMP4、WS-FLV/TS/fMP4；最后播放器离开触发宽限期，仅停止按需回源，期间新播放器会取消定时关闭。发布/代理任务结束会关闭并移除媒体源，播放器能收到 channel close。
+- 修复代理快速停止/重建竞态：旧任务只可移除自己的 active entry，不会按相同 stream key 误删新任务；代理自然结束时同步清理对应媒体源。
+- 集群中继修复 vhost/app 过滤与远端 URL 重复 app 问题，新增 URL 模板、每源每节点去重、`StreamUnPublish` 取消和 1–30 秒指数退避重连。
+- 阶段 6 门禁通过：core 54+9、server 3、RTMP/RTSP/HTTP 全套协议网络测试通过；core/rtmp/rtsp/http/server 全目标 Clippy `-D warnings` 与格式检查通过。转入阶段 7 WebRTC 与多轨。
+- WebRTC 阶段首批完成：WHEP 接入 `get_or_pull`、RAII 播放者计数与 PeerConnection 失败/断开清理；WHIP 发布结束会发 `StreamUnPublish`、关闭并移除 MediaSource，DELETE 与断线路径均生效。
+- WebRTC 编解码扩展：WHIP 动态接收 H.264/VP8/VP9/Opus 多轨，WHEP 可按源轨输出 H.264/H.265/VP8/VP9/AV1/Opus；AAC→Opus 可选 feature 继续通过。WHIP H.265/AV1 因 webrtc-rs 0.12 缺少可靠分片重组暂不宣称支持。
+- WHIP 保存每轨 RID、SSRC、远端 track id 与 stream id；WHEP `?rid=` 可只播放指定 simulcast 层，未知 RID 返回 404。单元测试与真实 WHEP HTTP 媒体闭环覆盖该路径。
+- WebRTC 可靠性/拥塞反馈补齐：协商 NACK/PLI/TWCC、H.264/VP8/VP9/H.265/AV1 RTX apt，WHEP SDP 声明 REMB 并由 RTPSender 实际读取码率估值；真实 RTCP 测试验证服务器收到 750000 bit/s。
+- 新增共享 ICE UDP mux：`ice_port`、`ice_bind_ip`、`ice_lite`、`external_ips`；默认一个 UDP 端口服务所有 PeerConnection，显式绑定 IP 会约束 host candidate，避免广告不可达接口。真实 HTTP WHEP 单端口测试通过。
+- WHIP/WHEP 新增标准 resource `PATCH application/trickle-ice-sdpfrag`：按 media section 解析 MID、m-line index、ufrag、多 candidate 与 end-of-candidates；POST/OPTIONS 暴露 Accept-Patch，真实 HTTP WHEP 会话验证 PATCH=204 后媒体继续可达。
+- 阶段 7 当前门禁：core 54+9、server 3、WebRTC 8 单元 + 3 网络 E2E 通过；启用 `aac-transcode` 时 10 单元 + 3 网络 E2E 通过；相关 crates 严格 Clippy 与全工作区格式检查通过。阶段 7 仍继续处理完整 ICE restart、远端 WebRTC 客户端与底层库尚未实现的 ICE-TCP 边界。
+- 运维配置首批落实：`StreamAuth` 增加共享运行时 secret，`setServerConfig?api.secret=` 使用旧 secret 鉴权成功后会立即轮换 API、播放签名和 RTSP Digest 的后续校验；真实 HTTP 测试验证旧 secret 立即 401、新 secret 立即 200，并恢复测试实例原值。
+- `setServerConfig`/`updateConfig` 不再接受任意虚构键：未知键进入 `rejected`；当前尚未真正动态接线的已知项进入 `restartRequired`，避免只改展示快照却宣称热生效。管理前端已显示拒绝和需重启项。
+- Core 新增运行时 secret/未知配置测试，当前 core 55+10、HTTP 21 单元 + 22 API + 全部媒体/VOD/录制网络测试通过；core/http 严格 Clippy 通过，管理前端 `node --check` 通过。
+- Hook 动态配置完成：运行时快照新增全部 `hook.*` 键，`setServerConfig`/`updateConfig` 会校验 URL、正整数超时/周期和 retry；合法更新不进入 `restartRequired`，非法值进入 `rejected` 且不污染 HookClient 或全局快照。
+- Hook HTTP 客户端补齐 HTTPS 公共 CA 校验、正确 443 默认端口、IPv6 bracket authority 和 scheme/userinfo 拒绝；单元测试验证同一个 HookClient 从空配置热切换到真实拒绝回调，再清空立即恢复放行。
+- 流量上报任务改为运行期配置驱动：watch 修订通知可从未配置状态动态启用，并在周期变化时立即重置等待。
+- HTTP/RTMP/RTSP TLS 接受器改为 `ArcSwap` 的可热加载配置；新增 `reloadCertificate` 管理 API。真实三次握手测试验证证书 A→证书 B 热切换、损坏私钥 reload 失败后仍继续呈现 B。
+- 本轮验证通过：core 59+10、HTTP API E2E 22/22、RTMPS 网络 E2E、HTTP/RTMP/RTSP/server 全目标 check、相关 crates 严格 Clippy `-D warnings`。README 和示例配置已同步 Hook/TLS 热更新语义。
+- 管理后台服务器配置卡新增“重载 TLS 证书”入口，操作前确认，成功显示更新监听器数量，失败明确说明仍保留最后有效证书；使用 bundled Node `--check` 和前端资产/API E2E marker 复验通过。javascript-pro 技能促使该异步操作沿用统一 `apiGet` 错误通道，并使用空值合并处理缺失计数。
+- 完成后以 fast 模式重建代码知识图谱，当前包含 3786 个节点和 16453 条边，后续 WebRTC/IPv6 工作可继续使用最新调用关系。
+- 新增原生 WHEP 拉流客户端并接入 `addStreamProxy`：`whep://`/`wheps://` 建立 recv-only PeerConnection，经 HTTP(S) POST/Location/DELETE 管理远端 resource，将 H.264/VP8/VP9/Opus 轨道回灌统一 MediaSource；配置的 STUN/TURN 会传入客户端。
+- 抽取 WHIP/WHEP 共用远端轨接收管线；真实动态端口测试完成远端 WHEP server → ICE/DTLS/SRTP → 本地 MediaSource → H.264 GOP，并验证停止时删除 resource。
+- 完成 WHIP/WHEP 完整 ICE restart：PATCH 带新 ufrag/pwd 时串行更新远端 offer、清除旧候选、调用底层 `restart_ice`、重新生成 answer 并返回 `application/trickle-ice-sdpfrag`；真实 WHEP HTTP E2E 验证双方凭据变化且重启后媒体继续增长。
+- 新增原生 WHIP 推流客户端并接入 `addStreamPusher`：`whip://`/`whips://` 将本地 H.264/H.265/VP8/VP9/AV1/Opus 兼容轨通过远端 WHIP resource 发布；真实本地 MediaSource → 远端 WHIP server → 远端 MediaSource 网络闭环及 DELETE 清理通过。
+- IPv6 监听配置落地：顶层新增 `listen_ip`（默认 `0.0.0.0`，可设 `::`），HTTP/API、RTMP、RTSP、WebRTC 信令、SRT、GB28181 SIP/RTP 均使用解析后的 `IpAddr`/`SocketAddr`；运行时配置快照同步暴露 `general.listenIP` 并明确修改后需重启。
+- GB28181 RTP 管理器与 SIP server 支持指定绑定地址，UDP/TCP passive/active 保持地址族；真实 `::1` UDP RTP 输入成功发布 H.264 MediaFrame。
+- SRT FFI 从固定 `sockaddr_in` 升级为 IPv4/IPv6 `sockaddr_storage`，URL 支持 bracketed IPv6 Caller/Rendezvous，本地默认地址随远端地址族选择；完整 SRT 35 个单元测试及拉/推 E2E 通过，其中真实 IPv6 Caller→Listener 已传输消息。
+- RTMP 拉推客户端改用共享 IPv6 URL 解析器；原生 WHEP E2E 改为 `[::1]` HTTP 信令并继续完成 ICE/DTLS/SRTP→本地 MediaSource 回灌。相关 server/SRT/WebRTC 严格 Clippy、全工作区格式和 diff 检查通过。
+- 新增 `.github/workflows/cross-platform.yml`，保留用户已移走的旧 CI：Linux 做完整质量门禁，macOS/Windows 做 workspace 全目标类型检查；所有官方 Node action 已升级为 `checkout@v6`/`cache@v5`，消除 Node.js 20 action 警告来源。
+- core 新增 `EmbeddedMediaKit` Rust SDK：publisher 可设置轨道并发布统一 MediaFrame，subscription 先返回缓存 GOP 再接实时广播，另有事件订阅、SourceSnapshot 枚举、共享 manager 和显式 close/unpublish。闭环单测与 core 严格 Clippy、workspace `cargo check --all-targets --locked` 通过。
+- 本批次最终门禁完成：workspace `cargo test --all-targets` 全绿（含真实 ffmpeg、RTMP/RTSP/SRT/WebRTC 网络测试），`cargo build --release --locked` 成功，workspace 严格 Clippy、格式检查及 Windows Git `diff --check` 均通过。首次组合执行仅因 120 秒外层超时被终止，拆分复跑无代码失败。
+- 进入系统化验证阶段并完成首轮图谱审计：确认 retry/cancel/stop 的现有测试覆盖点，同时确认仓库尚无压力、长稳、fuzz 或 benchmark 基础设施；下一批先补 supervisor 故障恢复与媒体图并发压力，再建立解析器 fuzz-smoke 和可重复性能基线。
+- 完成代理/推流控制竞态修复：DashMap entry 原子注册保证 16 个并发同-key add 仅一项成功；supervisor receiver 已关闭时 add 返回 false 并按任务 marker 回滚 active 条目。四项定向测试和 core 全目标严格 Clippy 通过。
+- 新增 32 流 × 4 订阅者 × 200 帧媒体图压力测试，验证 25,600 次广播按序交付并在 unpublish 后零 source 泄漏；新增带每 128 帧消费者确认的 release benchmark，WSL 实测 50,000 源帧/200,000 次投递用时 33ms（约 1.49M 源帧/s），CI 最低门槛设为 20k fps 以只阻断数量级退化。
+- 本轮 WebRTC 完整门禁通过：11 项单元测试、5 项真实网络 E2E（含完整 ICE restart、原生 WHEP 拉流和 WHIP 推流）、webrtc/server 全目标严格 Clippy、全工作区 rustfmt 与 `git diff --check` 均通过。
+- 修复 MP4/fMP4 解析器的输入计数资源放大：所有普通 MP4 sample table 在分配/循环前校验 box/file 上限，`trun` 按 flags 表宽或默认样本大小限制 sample count，并对 sample offset 使用 checked arithmetic；MP4 24 项测试和严格 Clippy 通过。
+- 新增 AMF、FLV、PS、MP4、WebSocket 五类解析器 fuzz-smoke；全工作区筛选测试全部通过，单个有效变异测试均在 0.02 秒内完成。FLV 同时新增 oversized header 与 20,000 unknown tags 防 panic/防递归回归。
+- 阶段 8 的 Hook/API/TLS 热更新、IPv6、跨平台 workflow 定义和 EmbeddedMediaKit SDK 已落实，阶段状态转为完成；阶段 9 转入进行中，后续继续补真实 GitHub runner 结果、长稳/故障注入和兼容性文档。
+- 全工作区门禁暴露并修复 SRT Rendezvous 启动期测试不稳定：连接使用 libsrt 专用 `srt_rendezvous`，双 loopback IP 同端口模拟真实两端，持续 1316-byte TS 批次直到 ACK 且总时限 5 秒；连续 10 次定向测试与完整 workspace 并行测试均通过。
+- 本批次系统门禁完成：`cargo fmt --check`、workspace 全目标 Clippy `-D warnings`、workspace 全目标测试、workspace release build、管理前端 Node 语法检查和 Windows Git `diff --check` 全部通过；性能基线复测约 1.50M 源帧/s，远高于 CI 20k fps 下限。
+- 2026-08-03 继续长期目标并通过规划技能恢复上下文；GitHub 公共 API 复核确认远端仍是 `ea37fcba`，旧 CI/Docker 成功、旧 Release 的 release-plz step 失败，而本地 cross-platform workflow 尚未跟踪、从未被真实 runner 执行。
+- 图谱审计确认跨平台 workflow 的 Windows check 仍缺少强证据：SRT FFI 地址转换直接使用 Windows target 不提供的 Unix `libc::sockaddr_*` 类型；下一步改为 workspace 已有的 `socket2::SockAddr` 跨平台表示。
+- SRT FFI 地址层已改为 `socket2::SockAddr` + opaque C pointer，移除 Unix `libc::sockaddr_*` 依赖；Linux 下 SRT 35 单元测试、Caller 拉/推 E2E、全目标 check 和严格 Clippy 全部通过。
 
 ---

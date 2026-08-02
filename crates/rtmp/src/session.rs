@@ -12,6 +12,7 @@ use zlmediakit_core::hook::{HookClient, HookResult};
 use zlmediakit_core::media_frame::{CodecId, FrameType, MediaFrame, PayloadFormat};
 use zlmediakit_core::media_source::{MediaSource, MediaSourceManager};
 use zlmediakit_core::transport::TransportStream;
+use zlmediakit_mp4::{Mp4VodLibrary, VodAsset, VodPacer};
 
 pub struct RtmpSession {
     stream: Option<TransportStream>,
@@ -30,6 +31,7 @@ pub struct RtmpSession {
     total_read: u64,
     client_win_size: u32,
     last_ack_seq: u64,
+    vod: Option<Arc<Mp4VodLibrary>>,
 }
 
 impl RtmpSession {
@@ -58,7 +60,13 @@ impl RtmpSession {
             total_read: 0,
             client_win_size: 2500000,
             last_ack_seq: 0,
+            vod: None,
         }
+    }
+
+    pub fn with_vod_library(mut self, vod: Option<Arc<Mp4VodLibrary>>) -> Self {
+        self.vod = vod;
+        self
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
@@ -605,6 +613,17 @@ impl RtmpSession {
 
         let (stream_base, sign) = Self::split_stream_sign(&self.stream_name);
         self.stream_name = stream_base;
+        // RTMP play's start/duration fields are expressed in milliseconds.
+        // Negative start values select live semantics and therefore map to
+        // the beginning when the requested resource is an MP4 archive.
+        let requested_start_ms = match values.get(4) {
+            Some(AmfValue::Number(value)) if *value >= 0.0 => *value as u64,
+            _ => 0,
+        };
+        let requested_duration_ms = match values.get(5) {
+            Some(AmfValue::Number(value)) if *value > 0.0 => Some(*value as u64),
+            _ => None,
+        };
 
         // External hook callback (before built-in auth)
         if let HookResult::Deny(msg) = self
@@ -647,57 +666,10 @@ impl RtmpSession {
         match source {
             Some(source) => {
                 self.source = Some(source.clone());
-
-                let reset_status = AmfValue::Object(vec![
-                    ("level".to_string(), AmfValue::String("status".to_string())),
-                    (
-                        "code".to_string(),
-                        AmfValue::String("NetStream.Play.Reset".to_string()),
-                    ),
-                    (
-                        "description".to_string(),
-                        AmfValue::String(format!(
-                            "Playing reset of {}/{}",
-                            self.app, self.stream_name
-                        )),
-                    ),
-                ]);
-                self.send_msg(&RtmpMessage::Amf0Command {
-                    stream_id: 0,
-                    timestamp: 0,
-                    data: AmfEncoder::encode(&[
-                        AmfValue::String("onStatus".to_string()),
-                        AmfValue::Number(0.0),
-                        AmfValue::Null,
-                        reset_status,
-                    ])
-                    .freeze(),
-                })
-                .await?;
-
-                let start_status = AmfValue::Object(vec![
-                    ("level".to_string(), AmfValue::String("status".to_string())),
-                    (
-                        "code".to_string(),
-                        AmfValue::String("NetStream.Play.Start".to_string()),
-                    ),
-                    (
-                        "description".to_string(),
-                        AmfValue::String(format!("Playing {}/{}", self.app, self.stream_name)),
-                    ),
-                ]);
-                self.send_msg(&RtmpMessage::Amf0Command {
-                    stream_id: 0,
-                    timestamp: 0,
-                    data: AmfEncoder::encode(&[
-                        AmfValue::String("onStatus".to_string()),
-                        AmfValue::Number(0.0),
-                        AmfValue::Null,
-                        start_status,
-                    ])
-                    .freeze(),
-                })
-                .await?;
+                self.send_play_started(false).await?;
+                let subscriber = source
+                    .register_subscriber(format!("rtmp:{}", self.peer_addr))
+                    .await;
 
                 {
                     let cached = {
@@ -712,6 +684,7 @@ impl RtmpSession {
                     };
 
                     tokio::spawn(async move {
+                        let _subscriber = subscriber;
                         let mut writer = stream;
 
                         for frame in cached {
@@ -746,6 +719,24 @@ impl RtmpSession {
                 info!("RTMP play started: {}/{}", self.app, self.stream_name);
             }
             None => {
+                let vod = match &self.vod {
+                    Some(library) => match library.open(&self.app, &self.stream_name).await {
+                        Ok(asset) => asset,
+                        Err(error) => {
+                            warn!(
+                                "RTMP VOD open failed for {}/{}: {error:#}",
+                                self.app, self.stream_name
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                if let Some(asset) = vod {
+                    return self
+                        .start_vod_playback(asset, requested_start_ms, requested_duration_ms)
+                        .await;
+                }
                 warn!("Stream not found: {}/{}", self.app, self.stream_name);
 
                 // Fire stream-not-found hook (best-effort, fire-and-forget)
@@ -786,6 +777,109 @@ impl RtmpSession {
         Ok(())
     }
 
+    async fn send_play_started(&mut self, vod: bool) -> anyhow::Result<()> {
+        let target = format!("{}/{}", self.app, self.stream_name);
+        for (code, description) in [
+            ("NetStream.Play.Reset", format!("Playing reset of {target}")),
+            (
+                "NetStream.Play.Start",
+                if vod {
+                    format!("Playing MP4 archive {target}")
+                } else {
+                    format!("Playing {target}")
+                },
+            ),
+        ] {
+            let status = AmfValue::Object(vec![
+                ("level".to_string(), AmfValue::String("status".to_string())),
+                ("code".to_string(), AmfValue::String(code.to_string())),
+                ("description".to_string(), AmfValue::String(description)),
+            ]);
+            self.send_msg(&RtmpMessage::Amf0Command {
+                stream_id: 0,
+                timestamp: 0,
+                data: AmfEncoder::encode(&[
+                    AmfValue::String("onStatus".to_string()),
+                    AmfValue::Number(0.0),
+                    AmfValue::Null,
+                    status,
+                ])
+                .freeze(),
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn start_vod_playback(
+        &mut self,
+        asset: VodAsset,
+        requested_start_ms: u64,
+        requested_duration_ms: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let playback = asset.playback(requested_start_ms);
+        let actual_start_ms = playback.start_ms;
+        self.send_play_started(true).await?;
+
+        let encoder = self.msg_encoder.clone();
+        let stream_id = self.stream_id;
+        let mut writer = match self.stream.take() {
+            Some(stream) => stream,
+            None => return Ok(()),
+        };
+        let app = self.app.clone();
+        let stream_name = self.stream_name.clone();
+        let stop = RtmpMessage::Amf0Command {
+            stream_id: 0,
+            timestamp: 0,
+            data: AmfEncoder::encode(&[
+                AmfValue::String("onStatus".to_string()),
+                AmfValue::Number(0.0),
+                AmfValue::Null,
+                AmfValue::Object(vec![
+                    ("level".to_string(), AmfValue::String("status".to_string())),
+                    (
+                        "code".to_string(),
+                        AmfValue::String("NetStream.Play.Stop".to_string()),
+                    ),
+                    (
+                        "description".to_string(),
+                        AmfValue::String("MP4 archive playback complete".to_string()),
+                    ),
+                ]),
+            ])
+            .freeze(),
+        };
+
+        tokio::spawn(async move {
+            let pacer = VodPacer::new();
+            for frame in playback.frames {
+                if !frame.config_frame {
+                    if requested_duration_ms.is_some_and(|limit| u64::from(frame.timestamp) > limit)
+                    {
+                        break;
+                    }
+                    pacer.wait(frame.timestamp).await;
+                }
+                let Some(message) = media_frame_to_rtmp_message(frame, stream_id) else {
+                    continue;
+                };
+                if writer.write_all(&encoder.encode(&message)).await.is_err() {
+                    return;
+                }
+            }
+            let _ = writer.write_all(&encoder.encode(&stop)).await;
+            let eof = RtmpMessage::UserControl(1, stream_id.to_be_bytes().to_vec());
+            let _ = writer.write_all(&encoder.encode(&eof)).await;
+            debug!("RTMP VOD play ended: {app}/{stream_name}");
+        });
+        info!(
+            "RTMP VOD play started: {}/{} at {} ms",
+            self.app, self.stream_name, actual_start_ms
+        );
+        Ok(())
+    }
+
     async fn handle_delete_stream(&mut self) -> anyhow::Result<()> {
         debug!("RTMP deleteStream");
         self.cleanup().await;
@@ -807,6 +901,8 @@ impl RtmpSession {
                 app: self.app.clone(),
                 stream: self.stream_name.clone(),
             });
+            self.source_manager
+                .close_stream("__defaultVhost__", &self.app, &self.stream_name);
         }
         self.source = None;
     }

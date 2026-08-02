@@ -23,6 +23,8 @@ serde_json = { workspace = true }
 dashmap = { workspace = true }
 uuid = { workspace = true }
 webrtc = "0.12"
+ice = { package = "webrtc-ice", version = "0.12" }
+rtcp = "0.12"
 # Retransmission / congestion-control interceptors (NACK, TWCC, RTCP reports),
 # pulled in directly so the engine can build the interceptor `Registry` that the
 # webrtc `APIBuilder` installs per PeerConnection.
@@ -32,6 +34,8 @@ interceptor = "0.13"
 # stack) get unified into one `rustls` build, rustls refuses to auto-pick a
 # provider; we install `ring` ourselves before any peer connection is made.
 rustls = { version = "0.23", features = ["ring"], default-features = false }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
 
 # Optional, only pulled in with the `transcode` / `aac-transcode` features.
 opus = { version = "0.3", optional = true }

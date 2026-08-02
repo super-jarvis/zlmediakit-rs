@@ -7,6 +7,7 @@ edition.workspace = true
 [dependencies]
 zlmediakit-core = { path = "../core" }
 zlmediakit-codec = { path = "../codec" }
+zlmediakit-mp4 = { path = "../mp4" }
 tokio.workspace = true
 bytes.workspace = true
 anyhow.workspace = true
@@ -23,3 +24,4 @@ rustls-pki-types.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
+tempfile = "3"

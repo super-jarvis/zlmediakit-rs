@@ -919,14 +919,28 @@ pub struct RtpServerManager {
     inner: Arc<DashMap<u16, Arc<RtpStreamReceiver>>>,
     next_port: Arc<AtomicU16>,
     manager: Arc<MediaSourceManager>,
+    bind_ip: std::net::IpAddr,
 }
 
 impl RtpServerManager {
     pub fn new(manager: Arc<MediaSourceManager>, media_port_base: u16) -> Arc<Self> {
+        Self::new_with_bind_ip(
+            manager,
+            media_port_base,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        )
+    }
+
+    pub fn new_with_bind_ip(
+        manager: Arc<MediaSourceManager>,
+        media_port_base: u16,
+        bind_ip: std::net::IpAddr,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner: Arc::new(DashMap::new()),
             next_port: Arc::new(AtomicU16::new(media_port_base.max(1))),
             manager,
+            bind_ip,
         })
     }
 
@@ -976,13 +990,13 @@ impl RtpServerManager {
         if self.inner.contains_key(&port) {
             anyhow::bail!("rtp server on port {port} already exists");
         }
+        let local_addr = SocketAddr::new(self.bind_ip, port);
         let input = match tcp_mode {
-            RtpTcpMode::Udp => RtpInput::Udp(Arc::new(UdpSocket::bind(("0.0.0.0", port)).await?)),
+            RtpTcpMode::Udp => RtpInput::Udp(Arc::new(UdpSocket::bind(local_addr).await?)),
             RtpTcpMode::TcpPassive => {
-                RtpInput::TcpPassive(Arc::new(TcpListener::bind(("0.0.0.0", port)).await?))
+                RtpInput::TcpPassive(Arc::new(TcpListener::bind(local_addr).await?))
             }
             RtpTcpMode::TcpActive => {
-                let local_addr = SocketAddr::from(([0, 0, 0, 0], port));
                 let socket = RtpStreamReceiver::create_bound_tcp_socket(local_addr)?;
                 RtpInput::TcpActive(Arc::new(TcpActiveInput {
                     local_addr,
@@ -1186,6 +1200,39 @@ mod tests {
             .await
             .expect("timed out waiting for frame")
             .expect("no frame received");
+        assert_eq!(frame.codec, CodecId::H264);
+        assert!(frame.key_frame);
+        rtp.close(port);
+    }
+
+    #[tokio::test]
+    async fn test_rtp_ipv6_udp_listener_publishes_frame() {
+        let mgr = Arc::new(MediaSourceManager::new(None));
+        let rtp = RtpServerManager::new_with_bind_ip(mgr.clone(), 30050, "::1".parse().unwrap());
+        let port = rtp
+            .open(
+                0,
+                "__defaultVhost__",
+                "rtp",
+                "h264_ipv6",
+                RtpPayloadType::H264,
+                None,
+            )
+            .await
+            .unwrap();
+        let source = mgr.get_or_create("__defaultVhost__", "rtp", "h264_ipv6");
+        let mut frames = source.subscribe();
+        let mut packet = vec![
+            0x80, 0xE0, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78,
+        ];
+        packet.extend_from_slice(&[0x65, 0x01, 0x02, 0x03, 0x04]);
+        let socket = UdpSocket::bind("[::1]:0").await.unwrap();
+        socket.send_to(&packet, ("::1", port)).await.unwrap();
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("timed out waiting for IPv6 RTP frame")
+            .expect("IPv6 RTP listener closed");
         assert_eq!(frame.codec, CodecId::H264);
         assert!(frame.key_frame);
         rtp.close(port);

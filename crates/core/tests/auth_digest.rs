@@ -8,6 +8,19 @@ fn auth(secret: &str) -> Arc<StreamAuth> {
     StreamAuth::new(true, secret.to_string())
 }
 
+#[test]
+fn runtime_secret_rotation_changes_stream_sign_validation() {
+    let auth = auth("old-secret");
+    let old =
+        zlmediakit_core::auth::generate_sign("old-secret", &["vhost", "live", "camera", "play"]);
+    assert!(auth.check("vhost", "live", "camera", "play", &old));
+    assert!(auth.set_secret("new-secret".to_string()));
+    assert!(!auth.check("vhost", "live", "camera", "play", &old));
+    let new =
+        zlmediakit_core::auth::generate_sign("new-secret", &["vhost", "live", "camera", "play"]);
+    assert!(auth.check("vhost", "live", "camera", "play", &new));
+}
+
 /// Compute the client-side Digest response exactly like a real RTSP client.
 ///
 /// `HA1 = md5(username:realm:secret)`, `HA2 = md5(method:uri)`,

@@ -5,10 +5,13 @@
 //! answers and starts pumping RTP. We assert the client actually receives SRTP
 //! media packets — exercising ICE, DTLS, SRTP and the RTP payloader.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::{BufMut, Bytes};
+use rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
@@ -18,19 +21,21 @@ use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
 use webrtc::media::Sample;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::offer_answer_options::RTCOfferOptions;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecParameters;
 use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
 use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
+use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::rtp_transceiver::RTCRtpTransceiver;
 use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_remote::TrackRemote;
 use zlmediakit_core::media_frame::{CodecId, MediaFrame, TrackInfo, VideoInfo};
-use zlmediakit_core::media_source::MediaSourceManager;
-use zlmediakit_webrtc::whep_play;
+use zlmediakit_core::media_source::{MediaSourceManager, TrackDescriptor};
+use zlmediakit_webrtc::{pull_client, push_client, whep_play};
 
 fn avcc_config() -> Bytes {
     // AVCDecoderConfigurationRecord (avc_packet_type == 0): SPS(10) + PPS(4)
@@ -131,7 +136,10 @@ async fn whep_e2e_receives_media() {
                 sdp_fmtp_line:
                     "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
                         .to_string(),
-                rtcp_feedback: vec![],
+                rtcp_feedback: vec![RTCPFeedback {
+                    typ: "goog-remb".to_string(),
+                    parameter: String::new(),
+                }],
             },
             payload_type: 102,
             stats_id: String::new(),
@@ -147,14 +155,18 @@ async fn whep_e2e_receives_media() {
     );
 
     let received = Arc::new(Mutex::new(0u32));
+    let remote_ssrc = Arc::new(AtomicU32::new(0));
     {
         let received = received.clone();
+        let remote_ssrc = remote_ssrc.clone();
         client_pc.on_track(Box::new(
             move |track: Arc<TrackRemote>,
                   _recv: Arc<RTCRtpReceiver>,
                   _trans: Arc<RTCRtpTransceiver>| {
                 let received = received.clone();
+                let remote_ssrc = remote_ssrc.clone();
                 Box::pin(async move {
+                    remote_ssrc.store(track.ssrc(), Ordering::Relaxed);
                     let mut buf = vec![0u8; 1500];
                     while track.read(&mut buf).await.is_ok() {
                         let mut c = received.lock().await;
@@ -195,9 +207,10 @@ async fn whep_e2e_receives_media() {
     let offer_sdp = client_pc.local_description().await.unwrap().sdp.clone();
 
     // 3. Server answers and starts pumping.
-    let (answer_sdp, _session) = whep_play(&offer_sdp, source.clone(), "test".to_string(), vec![])
+    let (answer_sdp, session) = whep_play(&offer_sdp, source.clone(), "test".to_string(), vec![])
         .await
         .expect("whep_play should negotiate");
+    assert_eq!(source.subscriber_count().await, 1);
 
     let answer = RTCSessionDescription::answer(answer_sdp).unwrap();
     client_pc.set_remote_description(answer).await.unwrap();
@@ -240,6 +253,22 @@ async fn whep_e2e_receives_media() {
         "client should receive RTP media; got {}",
         count
     );
+    let feedback: Vec<Box<dyn rtcp::packet::Packet + Send + Sync>> =
+        vec![Box::new(ReceiverEstimatedMaximumBitrate {
+            sender_ssrc: 1,
+            bitrate: 750_000.0,
+            ssrcs: vec![remote_ssrc.load(Ordering::Relaxed)],
+        })];
+    client_pc.write_rtcp(&feedback).await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        while session.estimated_bitrate_bps() != 750_000 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("server should observe negotiated REMB feedback");
+    session.close().await;
+    assert_eq!(source.subscriber_count().await, 0);
     println!("WHEP e2e OK: received {} RTP packets", count);
 }
 
@@ -247,7 +276,7 @@ async fn whep_e2e_receives_media() {
 /// Second test: the *real* HTTP WHEP server (crates/webrtc/src/server.rs), so the
 /// request parsing / body reading path is exercised too, not just `whep_play`.
 /// ---------------------------------------------------------------------------
-use zlmediakit_webrtc::WebRtcServer;
+use zlmediakit_webrtc::{WebRtcServer, WebRtcTransportConfig};
 
 const TEST_HTTP_PORT: u16 = 19123;
 
@@ -324,19 +353,122 @@ async fn http_exchange(
     http_parse(&buf)
 }
 
+fn ice_sdp_fragment(sdp: &str) -> String {
+    let username_fragment = sdp
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("a=ice-ufrag:"))
+        .unwrap();
+    let password = sdp
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("a=ice-pwd:"))
+        .unwrap();
+    let mut output = format!("a=ice-ufrag:{username_fragment}\r\na=ice-pwd:{password}\r\n");
+    let mut in_media = false;
+    for line in sdp.lines().map(str::trim) {
+        if line.starts_with("m=") {
+            in_media = true;
+            output.push_str(line);
+            output.push_str("\r\n");
+        } else if in_media
+            && (line.starts_with("a=mid:")
+                || line.starts_with("a=candidate:")
+                || line == "a=end-of-candidates")
+        {
+            output.push_str(line);
+            output.push_str("\r\n");
+        }
+    }
+    output
+}
+
+fn apply_ice_sdp_fragment(current_sdp: &str, fragment: &str) -> String {
+    let username_fragment = fragment
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("a=ice-ufrag:"))
+        .unwrap();
+    let password = fragment
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("a=ice-pwd:"))
+        .unwrap();
+    let mut candidates = HashMap::<String, Vec<String>>::new();
+    let mut current_mid = None;
+    for line in fragment.lines().map(str::trim) {
+        if let Some(mid) = line.strip_prefix("a=mid:") {
+            current_mid = Some(mid.to_string());
+        } else if (line.starts_with("a=candidate:") || line == "a=end-of-candidates")
+            && current_mid.is_some()
+        {
+            candidates
+                .entry(current_mid.clone().unwrap())
+                .or_default()
+                .push(line.to_string());
+        }
+    }
+
+    let mut output = String::with_capacity(current_sdp.len() + fragment.len());
+    for line in current_sdp.lines().map(str::trim) {
+        if line.starts_with("a=ice-ufrag:") {
+            output.push_str(&format!("a=ice-ufrag:{username_fragment}\r\n"));
+        } else if line.starts_with("a=ice-pwd:") {
+            output.push_str(&format!("a=ice-pwd:{password}\r\n"));
+        } else if line.starts_with("a=candidate:") || line == "a=end-of-candidates" {
+            continue;
+        } else {
+            output.push_str(line);
+            output.push_str("\r\n");
+            if let Some(mid) = line.strip_prefix("a=mid:") {
+                if let Some(lines) = candidates.get(mid) {
+                    for candidate in lines {
+                        output.push_str(candidate);
+                        output.push_str("\r\n");
+                    }
+                }
+            }
+        }
+    }
+    output
+}
+
 #[tokio::test]
 async fn whep_http_e2e_receives_media() {
     zlmediakit_webrtc::init_crypto();
     let mgr = Arc::new(MediaSourceManager::new(None));
     let source = mgr.get_or_create("__defaultVhost__", "live", "webrtchttp");
     source
-        .update_tracks(vec![TrackInfo::Video(VideoInfo {
-            codec: CodecId::H264,
-            width: 1280,
-            height: 720,
-            fps: 25.0,
-            key_frame: false,
-        })])
+        .update_tracks(vec![
+            TrackInfo::Video(VideoInfo {
+                codec: CodecId::H264,
+                width: 1280,
+                height: 720,
+                fps: 25.0,
+                key_frame: false,
+            }),
+            TrackInfo::Video(VideoInfo {
+                codec: CodecId::H264,
+                width: 640,
+                height: 360,
+                fps: 15.0,
+                key_frame: false,
+            }),
+        ])
+        .await;
+    source
+        .set_track_descriptor(
+            0,
+            TrackDescriptor {
+                rid: Some("h".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+    source
+        .set_track_descriptor(
+            1,
+            TrackDescriptor {
+                rid: Some("l".to_string()),
+                ..Default::default()
+            },
+        )
         .await;
     source
         .publish_and_cache(MediaFrame::new_video(
@@ -364,10 +496,17 @@ async fn whep_http_e2e_receives_media() {
     }
 
     // Start the real WHEP HTTP server.
-    let srv = WebRtcServer::new(
+    let srv = WebRtcServer::new_with_transport(
         &format!("127.0.0.1:{}", TEST_HTTP_PORT),
         mgr.clone(),
         vec![],
+        WebRtcTransportConfig {
+            // A specific bind IP also constrains the advertised host candidate,
+            // so the SDP cannot point at an interface the mux did not bind.
+            udp_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ice_lite: false,
+            external_ips: vec![],
+        },
     )
     .await
     .unwrap();
@@ -446,17 +585,43 @@ async fn whep_http_e2e_receives_media() {
     client_gather.notified().await;
     let offer_sdp = client_pc.local_description().await.unwrap().sdp.clone();
 
+    let (missing_status, _, _) = http_exchange(
+        TEST_HTTP_PORT,
+        "POST",
+        "/webrtc/play/__defaultVhost__/live/webrtchttp?rid=missing",
+        Some(&offer_sdp),
+    )
+    .await;
+    assert_eq!(
+        missing_status, 404,
+        "unknown simulcast RID must be rejected"
+    );
+
     // POST the offer to the HTTP WHEP endpoint.
     let (status, answer_sdp, location) = http_exchange(
         TEST_HTTP_PORT,
         "POST",
-        "/webrtc/play/__defaultVhost__/live/webrtchttp",
+        "/webrtc/play/__defaultVhost__/live/webrtchttp?rid=h",
         Some(&offer_sdp),
     )
     .await;
     assert_eq!(status, 201, "WHEP POST should return 201");
     assert!(!answer_sdp.is_empty(), "answer SDP must be returned");
     assert!(!location.is_empty(), "Location header must be returned");
+
+    let remote_ufrag = offer_sdp
+        .lines()
+        .find_map(|line| line.strip_prefix("a=ice-ufrag:"))
+        .unwrap_or_default();
+    let trickle_fragment = format!(
+        "a=ice-ufrag:{remote_ufrag}\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 102\r\n\
+a=mid:0\r\n\
+a=candidate:999 1 udp 1 192.0.2.1 9 typ host\r\n"
+    );
+    let (patch_status, _, _) =
+        http_exchange(TEST_HTTP_PORT, "PATCH", &location, Some(&trickle_fragment)).await;
+    assert_eq!(patch_status, 204, "trickle ICE PATCH should be accepted");
 
     let answer = RTCSessionDescription::answer(answer_sdp).unwrap();
     client_pc.set_remote_description(answer).await.unwrap();
@@ -498,6 +663,61 @@ async fn whep_http_e2e_receives_media() {
         "HTTP WHEP client should receive RTP media; got {}",
         count
     );
+
+    // Perform a real WHEP ICE restart over PATCH. Both peers must replace
+    // their ICE credentials, complete a new offer/answer exchange, and keep
+    // the existing media session flowing afterward.
+    let old_local = client_pc.local_description().await.unwrap();
+    let old_remote = client_pc.remote_description().await.unwrap();
+    let old_username_fragment = old_local
+        .sdp
+        .lines()
+        .find_map(|line| line.strip_prefix("a=ice-ufrag:"))
+        .unwrap()
+        .to_string();
+    let restart_offer = client_pc
+        .create_offer(Some(RTCOfferOptions {
+            ice_restart: true,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let mut restart_gathering = client_pc.gathering_complete_promise().await;
+    client_pc
+        .set_local_description(restart_offer)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), restart_gathering.recv())
+        .await
+        .expect("client ICE restart gathering timed out");
+    let new_local = client_pc.local_description().await.unwrap();
+    let new_username_fragment = new_local
+        .sdp
+        .lines()
+        .find_map(|line| line.strip_prefix("a=ice-ufrag:"))
+        .unwrap();
+    assert_ne!(old_username_fragment, new_username_fragment);
+
+    let restart_fragment = ice_sdp_fragment(&new_local.sdp);
+    let (restart_status, answer_fragment, _) =
+        http_exchange(TEST_HTTP_PORT, "PATCH", &location, Some(&restart_fragment)).await;
+    assert_eq!(restart_status, 200, "ICE restart PATCH should return SDP");
+    let restarted_answer = apply_ice_sdp_fragment(&old_remote.sdp, &answer_fragment);
+    client_pc
+        .set_remote_description(RTCSessionDescription::answer(restarted_answer).unwrap())
+        .await
+        .unwrap();
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if *received.lock().await >= count + 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("media did not resume after ICE restart");
 
     // DELETE to tear down.
     let (del_status, _, _) = http_exchange(TEST_HTTP_PORT, "DELETE", &location, None).await;
@@ -620,7 +840,7 @@ async fn whip_e2e_publish_then_play() {
     pub_gather.notified().await;
     let offer_sdp = pub_pc.local_description().await.unwrap().sdp.clone();
 
-    let (pstatus, answer_sdp, _ploc) = http_exchange(
+    let (pstatus, answer_sdp, ploc) = http_exchange(
         TEST_WHIP_HTTP_PORT,
         "POST",
         &format!("/webrtc/publish/{}/{}/{}", vhost, app, stream),
@@ -759,6 +979,226 @@ async fn whip_e2e_publish_then_play() {
 
     let (del, _, _) = http_exchange(TEST_WHIP_HTTP_PORT, "DELETE", &wloc, None).await;
     assert_eq!(del, 200, "WHEP DELETE should return 200");
+    let (del, _, _) = http_exchange(TEST_WHIP_HTTP_PORT, "DELETE", &ploc, None).await;
+    assert_eq!(del, 200, "WHIP DELETE should return 200");
+    assert!(
+        mgr.get(vhost, app, stream).is_none(),
+        "WHIP DELETE should remove the published MediaSource"
+    );
 
     println!("WHIP->WHEP loopback OK: received {} RTP packets", count);
+}
+
+#[tokio::test]
+async fn native_whep_pull_republishes_remote_media() {
+    zlmediakit_webrtc::init_crypto();
+
+    let upstream_manager = Arc::new(MediaSourceManager::new(None));
+    let upstream = upstream_manager.get_or_create("__defaultVhost__", "live", "remote");
+    upstream
+        .update_tracks(vec![TrackInfo::Video(VideoInfo {
+            codec: CodecId::H264,
+            width: 1280,
+            height: 720,
+            fps: 25.0,
+            key_frame: false,
+        })])
+        .await;
+    upstream
+        .publish_and_cache(MediaFrame::new_video(
+            0,
+            CodecId::H264,
+            0,
+            0,
+            0,
+            avcc_config(),
+            true,
+        ))
+        .await;
+
+    // Exercise the native WHEP client's bracketed IPv6 authority and the
+    // signalling listener over a real IPv6 TCP connection.
+    let server = WebRtcServer::new("[::1]:0", upstream_manager, vec![])
+        .await
+        .unwrap();
+    let port = server.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move { server.run().await });
+
+    let downstream_manager = Arc::new(MediaSourceManager::new(None));
+    let stop = Arc::new(Notify::new());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let pull_task = {
+        let downstream_manager = downstream_manager.clone();
+        let stop = stop.clone();
+        let stopped = stopped.clone();
+        tokio::spawn(async move {
+            pull_client::start(
+                &format!("whep://[::1]:{port}/webrtc/play/__defaultVhost__/live/remote"),
+                "__defaultVhost__",
+                "live",
+                "local",
+                downstream_manager,
+                vec![],
+                stop,
+                stopped,
+            )
+            .await
+        })
+    };
+
+    let publisher = tokio::spawn(async move {
+        for i in 1..=100u32 {
+            upstream
+                .publish_and_cache(MediaFrame::new_video(
+                    0,
+                    CodecId::H264,
+                    i,
+                    i as u64 * 40,
+                    i as u64 * 40,
+                    avcc_sample(i.is_multiple_of(25), i),
+                    i.is_multiple_of(25),
+                ))
+                .await;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    });
+
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(source) =
+                downstream_manager.get("__defaultVhost__", "live", "local")
+            {
+                let frames = source.get_latest_gop_frames().await;
+                if frames
+                    .iter()
+                    .any(|frame| frame.codec == CodecId::H264 && !frame.config_frame)
+                {
+                    assert!(source.info.read().await.tracks.iter().any(
+                        |track| matches!(track, TrackInfo::Video(video) if video.codec == CodecId::H264)
+                    ));
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("native WHEP pull did not republish H.264 media");
+
+    stopped.store(true, Ordering::SeqCst);
+    stop.notify_waiters();
+    timeout(Duration::from_secs(10), pull_task)
+        .await
+        .expect("native WHEP pull did not stop")
+        .expect("native WHEP pull task panicked")
+        .expect("native WHEP pull failed");
+    publisher.abort();
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn native_whip_push_publishes_remote_media() {
+    zlmediakit_webrtc::init_crypto();
+
+    let remote_manager = Arc::new(MediaSourceManager::new(None));
+    let server = WebRtcServer::new("127.0.0.1:0", remote_manager.clone(), vec![])
+        .await
+        .unwrap();
+    let port = server.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move { server.run().await });
+
+    let local_manager = Arc::new(MediaSourceManager::new(None));
+    let local = local_manager.get_or_create("__defaultVhost__", "live", "local");
+    local
+        .update_tracks(vec![TrackInfo::Video(VideoInfo {
+            codec: CodecId::H264,
+            width: 1280,
+            height: 720,
+            fps: 25.0,
+            key_frame: false,
+        })])
+        .await;
+    local
+        .publish_and_cache(MediaFrame::new_video(
+            0,
+            CodecId::H264,
+            0,
+            0,
+            0,
+            avcc_config(),
+            true,
+        ))
+        .await;
+
+    let stop = Arc::new(Notify::new());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let push_task = {
+        let local_manager = local_manager.clone();
+        let stop = stop.clone();
+        let stopped = stopped.clone();
+        tokio::spawn(async move {
+            push_client::start(
+                &format!("whip://127.0.0.1:{port}/webrtc/publish/__defaultVhost__/live/remote"),
+                "__defaultVhost__",
+                "live",
+                "local",
+                local_manager,
+                vec![],
+                stop,
+                stopped,
+            )
+            .await
+        })
+    };
+
+    let publisher = tokio::spawn(async move {
+        for i in 1..=100u32 {
+            local
+                .publish_and_cache(MediaFrame::new_video(
+                    0,
+                    CodecId::H264,
+                    i,
+                    i as u64 * 40,
+                    i as u64 * 40,
+                    avcc_sample(i.is_multiple_of(25), i),
+                    i.is_multiple_of(25),
+                ))
+                .await;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    });
+
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(source) = remote_manager.get("__defaultVhost__", "live", "remote") {
+                if source
+                    .get_latest_gop_frames()
+                    .await
+                    .iter()
+                    .any(|frame| frame.codec == CodecId::H264 && !frame.config_frame)
+                {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("native WHIP push did not publish H.264 media remotely");
+
+    stopped.store(true, Ordering::SeqCst);
+    stop.notify_waiters();
+    timeout(Duration::from_secs(10), push_task)
+        .await
+        .expect("native WHIP push did not stop")
+        .expect("native WHIP push task panicked")
+        .expect("native WHIP push failed");
+    assert!(
+        remote_manager
+            .get("__defaultVhost__", "live", "remote")
+            .is_none(),
+        "WHIP DELETE should remove the remote MediaSource"
+    );
+    publisher.abort();
+    server_task.abort();
 }

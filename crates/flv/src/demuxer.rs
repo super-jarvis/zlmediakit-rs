@@ -33,111 +33,124 @@ impl FlvDemuxer {
             self.buffer[7],
             self.buffer[8],
         ]);
+        let header_size = header_size as usize;
+        if header_size < 9 || header_size > self.buffer.len() {
+            return None;
+        }
 
-        self.buffer.advance(header_size as usize);
+        self.buffer.advance(header_size);
         Some(flags & 0x01 != 0)
     }
 
     pub fn parse_tag(&mut self) -> Option<MediaFrame> {
-        if self.buffer.len() < 15 {
-            return None;
-        }
+        loop {
+            if self.buffer.len() < 15 {
+                return None;
+            }
 
-        let tag_type = self.buffer[0];
-        // Skip PreviousTagSize (all zeros) that follows the FLV header.
-        if tag_type == 0 && (self.buffer[1] | self.buffer[2] | self.buffer[3]) == 0 {
+            let tag_type = self.buffer[0];
+            // Skip PreviousTagSize (all zeros) that follows the FLV header.
+            if tag_type == 0 && (self.buffer[1] | self.buffer[2] | self.buffer[3]) == 0 {
+                self.buffer.advance(4);
+                continue;
+            }
+
+            let data_size = ((self.buffer[1] as u32) << 16)
+                | ((self.buffer[2] as u32) << 8)
+                | (self.buffer[3] as u32);
+            let timestamp = ((self.buffer[4] as u32) << 16)
+                | ((self.buffer[5] as u32) << 8)
+                | (self.buffer[6] as u32)
+                | ((self.buffer[7] as u32) << 24);
+
+            let total_len = 11 + data_size as usize + 4;
+            if self.buffer.len() < total_len {
+                return None;
+            }
+
+            self.buffer.advance(11);
+            let payload = self.buffer.split_to(data_size as usize);
             self.buffer.advance(4);
-            return self.parse_tag();
-        }
 
-        let data_size = ((self.buffer[1] as u32) << 16)
-            | ((self.buffer[2] as u32) << 8)
-            | (self.buffer[3] as u32);
-        let timestamp = ((self.buffer[4] as u32) << 16)
-            | ((self.buffer[5] as u32) << 8)
-            | (self.buffer[6] as u32)
-            | ((self.buffer[7] as u32) << 24);
+            let frame = match tag_type {
+                0x09 => {
+                    if payload.is_empty() {
+                        continue;
+                    }
 
-        let total_len = 11 + data_size as usize + 4;
-        if self.buffer.len() < total_len {
-            return None;
-        }
+                    let byte = payload[0];
+                    let frame_type = (byte >> 4) & 0x0F;
+                    let codec_id = byte & 0x0F;
 
-        self.buffer.advance(11);
-        let payload = self.buffer.split_to(data_size as usize);
-        self.buffer.advance(4);
+                    let codec = match codec_id {
+                        7 => CodecId::H264,
+                        12 => CodecId::H265,
+                        _ => CodecId::Unknown(codec_id as u32),
+                    };
 
-        let frame = match tag_type {
-            0x09 => {
-                if payload.is_empty() {
-                    return self.parse_tag();
+                    let is_key = frame_type == 1;
+                    let packet_type = payload.get(1).copied().map(|value| value & 0x0f);
+                    let composition_time = if payload.len() >= 5 && packet_type == Some(1) {
+                        signed_i24(payload[2], payload[3], payload[4])
+                    } else {
+                        0
+                    };
+                    let dts = timestamp as u64;
+                    let pts = if composition_time.is_negative() {
+                        dts.saturating_sub(composition_time.unsigned_abs() as u64)
+                    } else {
+                        dts.saturating_add(composition_time as u64)
+                    };
+
+                    let mut frame = MediaFrame::new_video(
+                        0,
+                        codec,
+                        timestamp,
+                        pts,
+                        dts,
+                        payload.freeze(),
+                        is_key,
+                    )
+                    .with_payload_format(PayloadFormat::Flv);
+                    frame.config_frame = packet_type == Some(0);
+                    frame
                 }
+                0x08 => {
+                    if payload.is_empty() {
+                        continue;
+                    }
 
-                let byte = payload[0];
-                let frame_type = (byte >> 4) & 0x0F;
-                let codec_id = byte & 0x0F;
+                    let byte = payload[0];
+                    let sound_format = (byte >> 4) & 0x0F;
 
-                let codec = match codec_id {
-                    7 => CodecId::H264,
-                    12 => CodecId::H265,
-                    _ => CodecId::Unknown(codec_id as u32),
-                };
+                    let codec = match sound_format {
+                        10 => CodecId::AAC,
+                        2 => CodecId::Mp3,
+                        7 => CodecId::G711A,
+                        8 => CodecId::G711U,
+                        _ => CodecId::Unknown(sound_format as u32),
+                    };
 
-                let is_key = frame_type == 1;
-                let packet_type = payload.get(1).copied().map(|value| value & 0x0f);
-                let composition_time = if payload.len() >= 5 && packet_type == Some(1) {
-                    signed_i24(payload[2], payload[3], payload[4])
-                } else {
-                    0
-                };
-                let dts = timestamp as u64;
-                let pts = if composition_time.is_negative() {
-                    dts.saturating_sub(composition_time.unsigned_abs() as u64)
-                } else {
-                    dts.saturating_add(composition_time as u64)
-                };
-
-                let mut frame =
-                    MediaFrame::new_video(0, codec, timestamp, pts, dts, payload.freeze(), is_key)
-                        .with_payload_format(PayloadFormat::Flv);
-                frame.config_frame = packet_type == Some(0);
-                frame
-            }
-            0x08 => {
-                if payload.is_empty() {
-                    return self.parse_tag();
+                    let is_aac_config = codec == CodecId::AAC && payload.get(1) == Some(&0);
+                    let mut frame = MediaFrame::new_audio(
+                        1,
+                        codec,
+                        timestamp,
+                        timestamp as u64,
+                        timestamp as u64,
+                        payload.freeze(),
+                    )
+                    .with_payload_format(PayloadFormat::Flv);
+                    frame.config_frame = is_aac_config;
+                    frame
                 }
+                _ => {
+                    continue;
+                }
+            };
 
-                let byte = payload[0];
-                let sound_format = (byte >> 4) & 0x0F;
-
-                let codec = match sound_format {
-                    10 => CodecId::AAC,
-                    2 => CodecId::Mp3,
-                    7 => CodecId::G711A,
-                    8 => CodecId::G711U,
-                    _ => CodecId::Unknown(sound_format as u32),
-                };
-
-                let is_aac_config = codec == CodecId::AAC && payload.get(1) == Some(&0);
-                let mut frame = MediaFrame::new_audio(
-                    1,
-                    codec,
-                    timestamp,
-                    timestamp as u64,
-                    timestamp as u64,
-                    payload.freeze(),
-                )
-                .with_payload_format(PayloadFormat::Flv);
-                frame.config_frame = is_aac_config;
-                frame
-            }
-            _ => {
-                return self.parse_tag();
-            }
-        };
-
-        Some(frame)
+            return Some(frame);
+        }
     }
 }
 
@@ -367,5 +380,48 @@ mod tests {
         let frame = d.parse_tag().unwrap();
         assert_eq!(frame.codec, CodecId::Unknown(4));
         assert_eq!(frame.payload_format, PayloadFormat::Flv);
+    }
+
+    #[test]
+    fn oversized_header_and_long_unknown_tag_run_do_not_panic() {
+        let mut oversized = FlvDemuxer::new();
+        oversized.feed(b"FLV\x01\x01\xff\xff\xff\xff\0\0\0\0");
+        assert!(oversized.parse_header().is_none());
+
+        let mut stream = flv_header(true, false);
+        for _ in 0..20_000 {
+            stream.extend_from_slice(&build_tag(0x12, b"", 0));
+        }
+        stream.extend_from_slice(&video_tag(b"\x00\x00\x01\x65", 42, true));
+        let mut demuxer = FlvDemuxer::new();
+        demuxer.feed(&stream);
+        assert!(demuxer.parse_header().is_some());
+        assert_eq!(demuxer.parse_tag().unwrap().timestamp, 42);
+    }
+
+    #[test]
+    fn fuzz_smoke_mutated_flv_never_panics() {
+        let mut valid = flv_header(true, true);
+        valid.extend_from_slice(&video_tag(b"\x00\x00\x01\x65\x88", 40, true));
+        valid.extend_from_slice(&audio_tag(b"\xaf\x01\x11\x22", 40));
+
+        for index in 0..valid.len() {
+            let mut mutated = valid.clone();
+            mutated[index] ^= 0xff;
+            let mut demuxer = FlvDemuxer::new();
+            demuxer.feed(&mutated);
+            let _ = demuxer.parse_header();
+            for _ in 0..8 {
+                if demuxer.parse_tag().is_none() {
+                    break;
+                }
+            }
+        }
+        for len in 0..valid.len() {
+            let mut demuxer = FlvDemuxer::new();
+            demuxer.feed(&valid[..len]);
+            let _ = demuxer.parse_header();
+            let _ = demuxer.parse_tag();
+        }
     }
 }

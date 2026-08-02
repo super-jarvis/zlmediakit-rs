@@ -103,14 +103,9 @@ fn run_srt_sender(port: u16, ready: mpsc::Sender<()>, payload: Vec<u8>) -> anyho
         ffi::set_sockflag_bool(listener, ffi::SRT_SOCKOPT_SENDER, true)?;
         ffi::set_sockflag_int(listener, ffi::SRT_SOCKOPT_LATENCY, 40)?;
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
-        let (sockaddr, sockaddr_len) = ffi::socket_addr_to_sockaddr(&addr)?;
-        let bind_result = unsafe {
-            ffi::srt_bind(
-                listener,
-                &sockaddr as *const libc::sockaddr_in as *const libc::sockaddr,
-                sockaddr_len as c_int,
-            )
-        };
+        let sockaddr = ffi::socket_addr_to_sockaddr(&addr);
+        let bind_result =
+            unsafe { ffi::srt_bind(listener, sockaddr.as_ptr().cast(), sockaddr.len() as c_int) };
         if bind_result != ffi::SRT_SUCCESS {
             anyhow::bail!("bind listener failed: {}", ffi::last_error());
         }

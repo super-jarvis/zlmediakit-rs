@@ -5,6 +5,10 @@
 
 # ---- 全局参数 ----
 
+# RTMP/RTSP/HTTP/API/WebRTC 信令、SRT 与 GB28181 SIP/RTP 的监听地址。
+# 使用 "::" 启用 IPv6；是否同时接受 IPv4 取决于操作系统的 dual-stack 策略。
+listen_ip = "0.0.0.0"
+
 # API 鉴权开关。开启后，推流/播放请求必须携带 `?sign=` 参数。
 # sign = sha256(secret | vhost | app | stream | action)
 # action: "pub"（推流）或 "play"（播放）
@@ -90,15 +94,27 @@ dir_root = true
 www_root = "./www"
 
 # ============================================================
-#  WebRTC (WHEP 播放) 服务器
-#  浏览器通过 POST /webrtc/play/<vhost>/<app>/<stream> 播放
-#  支持 H.264 视频 + Opus 音频
+#  WebRTC WHIP/WHEP 服务器与原生远端客户端
+#  浏览器通过 POST /webrtc/play/<vhost>/<app>/<stream> 播放，或通过
+#  /webrtc/publish/<vhost>/<app>/<stream> 发布；addStreamProxy 使用
+#  whep://(wheps://)，addStreamPusher 使用 whip://(whips://)。
 #  可选 AAC->Opus 转码需编译时特性:
 #    cargo build --features zlmediakit-webrtc/transcode,zlmediakit-webrtc/aac-transcode
 # ============================================================
 [webrtc]
 enabled = true
+# WHEP/WHIP HTTP 信令端口。
 port = 9000
+
+# 所有 PeerConnection 复用同一个 ICE UDP 端口；留空时与上面的 HTTP
+# 信令端口使用相同端口号（协议分别为 UDP/TCP，不冲突）。
+#ice_port = 9000
+# ICE UDP 监听地址。IPv6/双栈部署可按系统能力改为 "::"。
+ice_bind_ip = "0.0.0.0"
+# 仅当服务端部署拓扑明确需要 ICE-lite 时开启。
+ice_lite = false
+# 1:1 NAT 的公网地址；配置后将替换 host candidate 中的内网地址。
+external_ips = []
 
 # ICE/STUN/TURN 服务器，用于 NAT 穿透。留空 = 仅本地候选地址。
 # 公网部署时建议配置 STUN 服务器：
@@ -109,10 +125,11 @@ port = 9000
 ice_servers = []
 
 # ============================================================
-#  外部鉴权 Hook（HTTP 回调）
+#  外部鉴权 Hook（HTTP/HTTPS 回调）
 #  开启后，服务器在允许推流/播放前先 POST 到配置的 URL。
 #  外部服务返回 {"code": 0} 表示放行，{"code": -1, "msg": "原因"} 表示拒绝。
 #  未配置的 hook 直接放行。
+#  以下全部键可通过 setServerConfig?hook.<键>=... 即时更新；空 URL 表示停用。
 # ============================================================
 #[hook]
 ## 推流鉴权（POST 参数: vhost, app, stream, params）
@@ -121,6 +138,18 @@ ice_servers = []
 #on_play = "http://127.0.0.1:8080/index/hook/on_play"
 ## 流未找到通知
 #on_stream_not_found = "http://127.0.0.1:8080/index/hook/on_stream_not_found"
+## 最后一个播放者离开 / 播放者数量变化
+#on_stream_none_reader = "http://127.0.0.1:8080/index/hook/on_stream_none_reader"
+#on_stream_changed = "http://127.0.0.1:8080/index/hook/on_stream_changed"
+## 录像完成、RTSP realm、服务生命周期与 HTTP 访问控制
+#on_record_mp4 = "https://hooks.example.com/on_record_mp4"
+#on_rtsp_realm = "https://hooks.example.com/on_rtsp_realm"
+#on_server_started = "https://hooks.example.com/on_server_started"
+#on_server_exited = "https://hooks.example.com/on_server_exited"
+#on_http_access = "https://hooks.example.com/on_http_access"
+## 周期流量上报；运行中启用/停用或修改周期会立即唤醒调度器
+#on_flow_report = "https://hooks.example.com/on_flow_report"
+#flow_report_interval_sec = 30
 ## HTTP 调用超时（秒）
 #timeout_sec = 5
 ## 网络失败重试次数
@@ -168,6 +197,16 @@ ice_servers = []
 #  { url = "rtmp://192.168.1.10/live" },
 #  { url = "rtmp://192.168.1.11/live", vhost = "__defaultVhost__", app = "live" },
 #]
+## 边缘按需回源：依次尝试多个上游，支持 RTMP/RTSP/HTTP-FLV/HLS/SRT。
+## 项既可为基础 URL，也可使用 {vhost}/{app}/{stream} 占位符。
+#origin_urls = [
+#  "rtmp://origin-a:1935",
+#  "https://origin-b/live/{stream}.flv",
+#  "https://origin-c/hls/{stream}.m3u8",
+#]
+#origin_timeout_ms = 5000
+#origin_vhost = "__defaultVhost__"
+#origin_app = "live"
 
 # ============================================================
 #  拉流代理

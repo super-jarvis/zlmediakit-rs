@@ -1,0 +1,106 @@
+name: Reliability
+
+on:
+  push:
+    paths:
+      - ".github/workflows/reliability.yml"
+      - "fuzz/**"
+      - "crates/codec/src/ps.rs"
+      - "crates/flv/src/demuxer.rs"
+      - "crates/mp4/src/demuxer.rs"
+      - "crates/mp4/src/fragmented_demuxer.rs"
+      - "crates/core/src/**"
+      - "crates/core/tests/media_graph_soak.rs"
+  pull_request:
+    branches: [master, main]
+    paths:
+      - ".github/workflows/reliability.yml"
+      - "fuzz/**"
+      - "crates/codec/src/ps.rs"
+      - "crates/flv/src/demuxer.rs"
+      - "crates/mp4/src/**"
+      - "crates/core/src/**"
+      - "crates/core/tests/media_graph_soak.rs"
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reliability-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: Parser fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install nightly Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly
+
+      - name: Cache fuzz dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-fuzz
+            fuzz/target
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
+
+      - name: Install cargo-fuzz
+        run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
+
+      - name: Fuzz public media parsers
+        shell: bash
+        run: |
+          seconds=30
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            seconds=300
+          fi
+          for target in flv ps mp4; do
+            timeout "$((seconds + 30))" \
+              cargo fuzz run "$target" -- \
+              -max_total_time="$seconds" -max_len=1048576
+          done
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: parser-fuzz-crashes-${{ github.run_id }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  soak:
+    name: Media graph soak
+    runs-on: ubuntu-latest
+    env:
+      ZLM_SOAK_SECONDS: ${{ github.event_name == 'schedule' && '300' || '30' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Cache Cargo files
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-soak-${{ hashFiles('Cargo.lock') }}
+
+      - name: Run bounded publish/subscribe soak
+        run: >-
+          cargo test --locked -p zlmediakit-core
+          --test media_graph_soak -- --ignored --nocapture

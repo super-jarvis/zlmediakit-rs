@@ -1,4 +1,4 @@
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Notify};
@@ -23,6 +23,20 @@ pub struct ProxyEntry {
     pub url: String,
     stop: Arc<Notify>,
     stopped: Arc<AtomicBool>,
+    on_demand: bool,
+}
+
+impl ProxyEntry {
+    /// Returns whether this entry belongs to the indicated supervisor task.
+    /// Used to prevent an old task from removing a newer proxy with the same
+    /// local stream key after a rapid stop/start cycle.
+    pub fn belongs_to(&self, stopped: &Arc<AtomicBool>) -> bool {
+        Arc::ptr_eq(&self.stopped, stopped)
+    }
+
+    pub fn is_on_demand(&self) -> bool {
+        self.on_demand
+    }
 }
 
 /// Shared table of active proxies, handed to the server supervisor so it can
@@ -60,28 +74,45 @@ impl StreamProxyControl {
     /// Starts proxying `url` into the local stream `(vhost, app, stream)`.
     /// Returns `false` if a proxy for that stream already exists.
     pub fn add(&self, url: &str, vhost: &str, app: &str, stream: &str) -> bool {
+        self.add_inner(url, vhost, app, stream, false)
+    }
+
+    /// Starts a transient edge pull that may be stopped when its last reader
+    /// leaves. Manually configured/API-created proxies remain persistent.
+    pub fn add_on_demand(&self, url: &str, vhost: &str, app: &str, stream: &str) -> bool {
+        self.add_inner(url, vhost, app, stream, true)
+    }
+
+    fn add_inner(&self, url: &str, vhost: &str, app: &str, stream: &str, on_demand: bool) -> bool {
         let key = Self::key(vhost, app, stream);
-        if self.active.contains_key(&key) {
-            return false;
-        }
         let stop = Arc::new(Notify::new());
         let stopped = Arc::new(AtomicBool::new(false));
-        self.active.insert(
-            key,
-            ProxyEntry {
+        match self.active.entry(key.clone()) {
+            Entry::Occupied(_) => return false,
+            Entry::Vacant(entry) => entry.insert(ProxyEntry {
                 url: url.to_string(),
                 stop: stop.clone(),
                 stopped: stopped.clone(),
-            },
-        );
-        let _ = self.tx.send(ProxyCmd {
-            url: url.to_string(),
-            vhost: vhost.to_string(),
-            app: app.to_string(),
-            stream: stream.to_string(),
-            stop,
-            stopped,
-        });
+                on_demand,
+            }),
+        };
+        let task_marker = stopped.clone();
+        if self
+            .tx
+            .send(ProxyCmd {
+                url: url.to_string(),
+                vhost: vhost.to_string(),
+                app: app.to_string(),
+                stream: stream.to_string(),
+                stop,
+                stopped,
+            })
+            .is_err()
+        {
+            self.active
+                .remove_if(&key, |_, entry| entry.belongs_to(&task_marker));
+            return false;
+        }
         true
     }
 
@@ -100,6 +131,12 @@ impl StreamProxyControl {
 
     pub fn is_active(&self, vhost: &str, app: &str, stream: &str) -> bool {
         self.active.contains_key(&Self::key(vhost, app, stream))
+    }
+
+    pub fn is_on_demand(&self, vhost: &str, app: &str, stream: &str) -> bool {
+        self.active
+            .get(&Self::key(vhost, app, stream))
+            .is_some_and(|entry| entry.is_on_demand())
     }
 
     /// Returns all active proxies as `(url, vhost, app, stream)` tuples.
@@ -124,5 +161,48 @@ fn split_key(k: &str) -> (String, String, String) {
         )
     } else {
         (String::new(), String::new(), k.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+    use std::thread;
+
+    #[test]
+    fn concurrent_add_starts_exactly_one_proxy() {
+        let (control, _, mut rx) = StreamProxyControl::new();
+        let control = Arc::new(control);
+        let barrier = Arc::new(Barrier::new(17));
+        let mut workers = Vec::new();
+        for _ in 0..16 {
+            let control = control.clone();
+            let barrier = barrier.clone();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                control.add("rtmp://origin/live/camera", "v", "live", "camera")
+            }));
+        }
+        barrier.wait();
+
+        let successes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|success| *success)
+            .count();
+        assert_eq!(successes, 1);
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(control.list().len(), 1);
+    }
+
+    #[test]
+    fn add_rolls_back_when_supervisor_is_gone() {
+        let (control, _, rx) = StreamProxyControl::new();
+        drop(rx);
+
+        assert!(!control.add("rtmp://origin/live/camera", "v", "live", "camera"));
+        assert!(control.list().is_empty());
     }
 }

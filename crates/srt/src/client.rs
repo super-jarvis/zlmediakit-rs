@@ -33,7 +33,7 @@ impl SrtEndpoint {
         let (host, port) = parse_authority(authority)?;
 
         let mut mode = ConnectionMode::Caller;
-        let mut local_ip = "0.0.0.0".to_string();
+        let mut local_ip = None;
         let mut local_port: Option<u16> = None;
         let mut latency_ms = 120;
         let mut passphrase = None;
@@ -47,7 +47,7 @@ impl SrtEndpoint {
                     mode = ConnectionMode::Rendezvous
                 }
                 "mode" => bail!("unsupported SRT connection mode: {value}"),
-                "localip" | "adapter" => local_ip = value,
+                "localip" | "adapter" => local_ip = Some(value),
                 "localport" => local_port = Some(value.parse()?),
                 "latency" => latency_ms = value.parse()?,
                 "passphrase" => passphrase = Some(value),
@@ -59,7 +59,15 @@ impl SrtEndpoint {
             let port = local_port.ok_or_else(|| {
                 anyhow!("SRT rendezvous mode requires a localport query parameter")
             })?;
-            Some(format!("{local_ip}:{port}").parse()?)
+            let local_ip = local_ip
+                .as_deref()
+                .unwrap_or(if host.parse::<std::net::Ipv6Addr>().is_ok() {
+                    "::"
+                } else {
+                    "0.0.0.0"
+                })
+                .parse::<std::net::IpAddr>()?;
+            Some(SocketAddr::new(local_ip, port))
         } else {
             None
         };
@@ -75,15 +83,31 @@ impl SrtEndpoint {
     }
 
     pub fn remote_addr(&self) -> Result<SocketAddr> {
-        (self.host.as_str(), self.port)
+        let expected_ip = self.host.parse::<std::net::IpAddr>().ok();
+        let addresses = (self.host.as_str(), self.port)
             .to_socket_addrs()
             .context("failed to resolve SRT host")?
+            .collect::<Vec<_>>();
+        if let Some(expected_ip) = expected_ip {
+            return addresses
+                .into_iter()
+                .find(|address| address.ip() == expected_ip)
+                .ok_or_else(|| anyhow!("SRT peer address family did not resolve"));
+        }
+        addresses
+            .iter()
+            .copied()
             .find(SocketAddr::is_ipv4)
-            .ok_or_else(|| anyhow!("SRT currently requires an IPv4 peer address"))
+            .or_else(|| addresses.into_iter().next())
+            .ok_or_else(|| anyhow!("SRT peer did not resolve to an IP address"))
     }
 
     pub fn display_target(&self) -> String {
-        format!("srt://{}:{}", self.host, self.port)
+        if self.host.contains(':') {
+            format!("srt://[{}]:{}", self.host, self.port)
+        } else {
+            format!("srt://{}:{}", self.host, self.port)
+        }
     }
 }
 
@@ -140,17 +164,24 @@ impl SrtSocket {
         }
         let socket = Self(socket);
         socket.configure(endpoint, sender)?;
-        if let Some(local_addr) = endpoint.local_addr {
-            socket.bind(&local_addr)?;
-        }
         let remote_addr = endpoint.remote_addr()?;
-        let (remote, remote_len) = ffi::socket_addr_to_sockaddr(&remote_addr)?;
-        let result = unsafe {
-            ffi::srt_connect(
-                socket.0,
-                &remote as *const libc::sockaddr_in as *const libc::sockaddr,
-                remote_len as c_int,
-            )
+        let remote = ffi::socket_addr_to_sockaddr(&remote_addr);
+        let result = if endpoint.mode == ConnectionMode::Rendezvous {
+            let local_addr = endpoint
+                .local_addr
+                .ok_or_else(|| anyhow!("SRT rendezvous mode requires a local address"))?;
+            let local = ffi::socket_addr_to_sockaddr(&local_addr);
+            unsafe {
+                ffi::srt_rendezvous(
+                    socket.0,
+                    local.as_ptr().cast(),
+                    local.len() as c_int,
+                    remote.as_ptr().cast(),
+                    remote.len() as c_int,
+                )
+            }
+        } else {
+            unsafe { ffi::srt_connect(socket.0, remote.as_ptr().cast(), remote.len() as c_int) }
         };
         if result != ffi::SRT_SUCCESS {
             bail!(
@@ -199,21 +230,6 @@ impl SrtSocket {
         }
         if let Some(stream_id) = endpoint.stream_id.as_deref() {
             ffi::set_sockflag_str(self.0, ffi::SRT_SOCKOPT_STREAMID, stream_id)?;
-        }
-        Ok(())
-    }
-
-    fn bind(&self, addr: &SocketAddr) -> Result<()> {
-        let (local, local_len) = ffi::socket_addr_to_sockaddr(addr)?;
-        let result = unsafe {
-            ffi::srt_bind(
-                self.0,
-                &local as *const libc::sockaddr_in as *const libc::sockaddr,
-                local_len as c_int,
-            )
-        };
-        if result != ffi::SRT_SUCCESS {
-            bail!("SRT rendezvous bind({addr}) failed: {}", ffi::last_error());
         }
         Ok(())
     }
@@ -301,9 +317,18 @@ mod tests {
     use std::net::UdpSocket;
     use std::sync::{Arc, Barrier};
 
-    fn reserve_udp_port() -> u16 {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        socket.local_addr().unwrap().port()
+    fn reserve_rendezvous_port() -> u16 {
+        let first_candidate = 30_000 + (std::process::id() % 20_000) as u16;
+        for offset in 0..1_000u16 {
+            let port = 30_000 + (first_candidate - 30_000 + offset) % 20_000;
+            if let Ok(first) = UdpSocket::bind(("127.0.0.1", port)) {
+                if let Ok(second) = UdpSocket::bind(("127.0.0.2", port)) {
+                    drop((first, second));
+                    return port;
+                }
+            }
+        }
+        panic!("failed to reserve a rendezvous UDP port pair")
     }
 
     #[test]
@@ -330,41 +355,114 @@ mod tests {
     }
 
     #[test]
+    fn parses_ipv6_caller_and_rendezvous_addresses() {
+        let caller = SrtEndpoint::parse("srt://[::1]:9000/live/camera").unwrap();
+        assert_eq!(caller.remote_addr().unwrap(), "[::1]:9000".parse().unwrap());
+        assert_eq!(caller.display_target(), "srt://[::1]:9000");
+
+        let rendezvous =
+            SrtEndpoint::parse("srt://[::1]:9001?mode=rendezvous&localip=::1&localport=9002")
+                .unwrap();
+        assert_eq!(
+            rendezvous.local_addr.unwrap(),
+            "[::1]:9002".parse().unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ipv6_caller_connects_to_listener() {
+        let port = std::net::UdpSocket::bind("[::1]:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server = tokio::task::spawn_blocking(move || {
+            let manager = Arc::new(zlmediakit_core::MediaSourceManager::new(None));
+            let mut server = crate::server::SrtServer::new(crate::server::SrtServerConfig {
+                addr: format!("[::1]:{port}"),
+                latency_ms: 20,
+                passphrase: None,
+                source_manager: manager,
+            });
+            server.run_blocking(server_stop)
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let connected = tokio::task::spawn_blocking(move || {
+            let endpoint = SrtEndpoint::parse(&format!("srt://[::1]:{port}?latency=20"))?;
+            SrtSocket::connect(&endpoint, true)
+        })
+        .await
+        .unwrap();
+        let socket = connected.expect("IPv6 SRT caller failed");
+        drop(socket);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("IPv6 SRT listener did not stop")
+            .expect("IPv6 SRT listener task panicked")
+            .expect("IPv6 SRT listener failed");
+    }
+
+    #[test]
     fn rendezvous_peers_connect_and_transfer_a_message() {
-        let first_port = reserve_udp_port();
-        let second_port = reserve_udp_port();
+        let port = reserve_rendezvous_port();
         let first = SrtEndpoint::parse(&format!(
-            "srt://127.0.0.1:{second_port}?mode=rendezvous&localip=127.0.0.1&localport={first_port}&latency=20"
+            "srt://127.0.0.2:{port}?mode=rendezvous&localip=127.0.0.1&localport={port}&latency=120"
         ))
         .unwrap();
         let second = SrtEndpoint::parse(&format!(
-            "srt://127.0.0.1:{first_port}?mode=rendezvous&localip=127.0.0.1&localport={second_port}&latency=20"
+            "srt://127.0.0.1:{port}?mode=rendezvous&localip=127.0.0.2&localport={port}&latency=120"
         ))
         .unwrap();
         let barrier = Arc::new(Barrier::new(2));
         let connected = Arc::new(Barrier::new(2));
+        let (received_tx, received_rx) = std::sync::mpsc::channel();
+        let expected = vec![0x47; 7 * 188];
+        let payload = expected.clone();
         let first_barrier = barrier.clone();
         let first_connected = connected.clone();
-        let sender = std::thread::spawn(move || {
+        let sender = std::thread::spawn(move || -> Result<()> {
             first_barrier.wait();
-            let socket = SrtSocket::connect(&first, true).unwrap();
+            let socket = SrtSocket::connect(&first, true)?;
             first_connected.wait();
-            socket.send_all(b"rendezvous").unwrap();
-            std::thread::sleep(Duration::from_millis(500));
-        });
-        let receiver = std::thread::spawn(move || {
-            barrier.wait();
-            let socket = SrtSocket::connect(&second, false).unwrap();
-            connected.wait();
+            let deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                if let Some(data) = socket.recv(2048).unwrap() {
-                    if !data.is_empty() {
-                        return data;
+                socket.send_all(&payload)?;
+                match received_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if Instant::now() < deadline => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        bail!("rendezvous receiver did not acknowledge the message")
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        bail!("rendezvous receiver stopped before acknowledging the message")
                     }
                 }
             }
+            Ok(())
         });
-        sender.join().unwrap();
-        assert_eq!(receiver.join().unwrap(), b"rendezvous");
+        let receiver = std::thread::spawn(move || -> Result<Vec<u8>> {
+            barrier.wait();
+            let socket = SrtSocket::connect(&second, false)?;
+            connected.wait();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if let Some(data) = socket.recv(2048)? {
+                    if !data.is_empty() {
+                        let _ = received_tx.send(());
+                        return Ok(data);
+                    }
+                } else {
+                    bail!("rendezvous peer closed before delivering the message");
+                }
+            }
+            bail!("timed out waiting for rendezvous message")
+        });
+        sender.join().unwrap().unwrap();
+        assert_eq!(receiver.join().unwrap().unwrap(), expected);
     }
 }

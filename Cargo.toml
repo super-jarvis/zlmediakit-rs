@@ -13,6 +13,7 @@ members = [
     "crates/transcode",
     "crates/webrtc",
 ]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]

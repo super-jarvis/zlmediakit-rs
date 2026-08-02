@@ -1,4 +1,4 @@
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Notify};
@@ -65,27 +65,33 @@ impl StreamPusherControl {
 
     pub fn add(&self, dst_url: &str, vhost: &str, app: &str, stream: &str) -> bool {
         let key = Self::key(vhost, app, stream);
-        if self.active.contains_key(&key) {
-            return false;
-        }
         let stop = Arc::new(Notify::new());
         let stopped = Arc::new(AtomicBool::new(false));
-        self.active.insert(
-            key,
-            PusherEntry {
+        match self.active.entry(key.clone()) {
+            Entry::Occupied(_) => return false,
+            Entry::Vacant(entry) => entry.insert(PusherEntry {
                 dst_url: dst_url.to_string(),
                 stop: stop.clone(),
                 stopped: stopped.clone(),
-            },
-        );
-        let _ = self.tx.send(PusherCmd {
-            dst_url: dst_url.to_string(),
-            vhost: vhost.to_string(),
-            app: app.to_string(),
-            stream: stream.to_string(),
-            stop,
-            stopped,
-        });
+            }),
+        };
+        let task_marker = stopped.clone();
+        if self
+            .tx
+            .send(PusherCmd {
+                dst_url: dst_url.to_string(),
+                vhost: vhost.to_string(),
+                app: app.to_string(),
+                stream: stream.to_string(),
+                stop,
+                stopped,
+            })
+            .is_err()
+        {
+            self.active
+                .remove_if(&key, |_, entry| Arc::ptr_eq(&entry.stopped, &task_marker));
+            return false;
+        }
         true
     }
 
@@ -121,5 +127,48 @@ fn split_key(k: &str) -> (String, String, String) {
         )
     } else {
         (String::new(), String::new(), k.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+    use std::thread;
+
+    #[test]
+    fn concurrent_add_starts_exactly_one_pusher() {
+        let (control, _, mut rx) = StreamPusherControl::new();
+        let control = Arc::new(control);
+        let barrier = Arc::new(Barrier::new(17));
+        let mut workers = Vec::new();
+        for _ in 0..16 {
+            let control = control.clone();
+            let barrier = barrier.clone();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                control.add("rtmp://edge/live/camera", "v", "live", "camera")
+            }));
+        }
+        barrier.wait();
+
+        let successes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|success| *success)
+            .count();
+        assert_eq!(successes, 1);
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(control.list().len(), 1);
+    }
+
+    #[test]
+    fn add_rolls_back_when_supervisor_is_gone() {
+        let (control, _, rx) = StreamPusherControl::new();
+        drop(rx);
+
+        assert!(!control.add("rtmp://edge/live/camera", "v", "live", "camera"));
+        assert!(control.list().is_empty());
     }
 }

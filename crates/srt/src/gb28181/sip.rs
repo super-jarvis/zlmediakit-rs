@@ -404,8 +404,23 @@ impl SipServer {
         manager: Arc<MediaSourceManager>,
         media_port_base: u16,
     ) -> anyhow::Result<Arc<Self>> {
-        let socket = UdpSocket::bind(("0.0.0.0", config.sip_port)).await?;
-        let rtp = RtpServerManager::new(manager.clone(), media_port_base);
+        Self::new_with_bind_ip(
+            config,
+            manager,
+            media_port_base,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        )
+        .await
+    }
+
+    pub async fn new_with_bind_ip(
+        config: SipServerConfig,
+        manager: Arc<MediaSourceManager>,
+        media_port_base: u16,
+        bind_ip: std::net::IpAddr,
+    ) -> anyhow::Result<Arc<Self>> {
+        let socket = UdpSocket::bind(std::net::SocketAddr::new(bind_ip, config.sip_port)).await?;
+        let rtp = RtpServerManager::new_with_bind_ip(manager.clone(), media_port_base, bind_ip);
         let rtp_sender = Arc::new(RtpSenderManager::new(manager.clone()));
         Ok(Arc::new(Self {
             socket,

@@ -1148,7 +1148,7 @@ function renderServerPage() {
     <div class="stat-item"><span class="stat-value">${state.threadLoads.length}</span><span class="stat-label">工作线程</span></div>
   </div>`;
 
-  html += `<div class="card"><div class="card-header"><h3>运行时配置</h3><span class="text-secondary text-small">修改仅作用于当前进程</span></div>
+  html += `<div class="card"><div class="card-header"><h3>运行时配置</h3><div><span class="text-secondary text-small">修改仅作用于当前进程</span> <button type="button" class="btn btn-sm" onclick="reloadCertificates()">重载 TLS 证书</button></div></div>
     <form id="config-form" onsubmit="event.preventDefault();updateServerConfig();"><div class="form-row">
       <div class="form-group"><label>配置键</label><input class="code-input" name="key" list="config-keys" required placeholder="general.flowThreshold" /></div>
       <div class="form-group"><label>新值</label><input class="code-input" name="value" required /></div>
@@ -1224,9 +1224,31 @@ async function updateServerConfig() {
     return;
   }
   try {
-    await apiGet('setServerConfig', { [key]: value });
+    const result = await apiGet('setServerConfig', { [key]: value });
+    const rejected = Array.isArray(result.rejected) ? result.rejected : [];
+    if (rejected.length) {
+      alert(`配置项不受支持：${rejected.join(', ')}`);
+      return;
+    }
     await loadServerInfo();
+    const restartRequired = Array.isArray(result.restartRequired)
+      ? result.restartRequired
+      : [];
+    if (restartRequired.length) {
+      alert(`配置已保存到运行时快照，但以下项目需重启服务后生效：${restartRequired.join(', ')}`);
+    }
   } catch (e) { alert(e.message); }
+}
+
+async function reloadCertificates() {
+  if (!confirm('确认从配置的 PEM 文件重新加载所有 TLS 证书？现有连接不会中断。')) return;
+  try {
+    const result = await apiGet('reloadCertificate');
+    const count = Number(result.reloaded ?? 0);
+    alert(`TLS 证书已热加载，更新 ${count} 个监听器；新连接将使用新证书。`);
+  } catch (e) {
+    alert(`TLS 证书重载失败，服务仍保留最后一份有效证书：${e.message}`);
+  }
 }
 
 async function restartServer() {

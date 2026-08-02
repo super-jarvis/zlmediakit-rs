@@ -1,0 +1,35 @@
+[package]
+name = "zlmediakit-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zlmediakit-codec = { path = "../crates/codec" }
+zlmediakit-flv = { path = "../crates/flv" }
+zlmediakit-mp4 = { path = "../crates/mp4" }
+
+[[bin]]
+name = "flv"
+path = "fuzz_targets/flv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ps"
+path = "fuzz_targets/ps.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mp4"
+path = "fuzz_targets/mp4.rs"
+test = false
+doc = false
+bench = false

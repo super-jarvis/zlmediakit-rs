@@ -250,60 +250,63 @@ impl Mp4Muxer {
             return;
         }
         let fps = if self.fps > 0.0 { self.fps } else { 30.0 };
+        let video_default = (90_000.0 / fps) as u32;
+        let audio_timescale = if self.sample_rate > 0 {
+            self.sample_rate
+        } else {
+            44_100
+        };
+        let audio_default = (audio_timescale / 44).max(1); // ~1024 AAC samples
+        let video = self
+            .samples
+            .iter()
+            .enumerate()
+            .filter_map(|(index, sample)| (sample.track_id == 0).then_some(index))
+            .collect::<Vec<_>>();
+        let audio = self
+            .samples
+            .iter()
+            .enumerate()
+            .filter_map(|(index, sample)| (sample.track_id == 1).then_some(index))
+            .collect::<Vec<_>>();
 
-        let mut last_ts_v: Option<u32> = None;
-        let mut last_ts_a: Option<u32> = None;
+        set_track_durations(&mut self.samples, &video, 90_000, video_default.max(1));
+        set_track_durations(&mut self.samples, &audio, audio_timescale, audio_default);
+    }
+}
 
-        for s in &mut self.samples {
-            if s.track_id == 0 {
-                if let Some(prev) = last_ts_v {
-                    let d = s.timestamp.saturating_sub(prev).max(1);
-                    let d_scaled = (d as u64 * 90_000 / 1000) as u32;
-                    s.duration = d_scaled.max(1);
-                } else {
-                    let frame_dur = (90_000.0 / fps) as u32;
-                    s.duration = frame_dur.max(1);
-                }
-                last_ts_v = Some(s.timestamp);
-            } else {
-                if let Some(prev) = last_ts_a {
-                    let d = s.timestamp.saturating_sub(prev).max(1);
-                    let sr = if self.sample_rate > 0 {
-                        self.sample_rate
-                    } else {
-                        44100
-                    };
-                    let d_scaled = (d as u64 * sr as u64 / 1000) as u32;
-                    s.duration = d_scaled.max(1);
-                } else {
-                    let sr = if self.sample_rate > 0 {
-                        self.sample_rate
-                    } else {
-                        44100
-                    };
-                    let frame_dur = sr / 44; // ~23ms per AAC frame
-                    s.duration = frame_dur.max(1);
-                }
-                last_ts_a = Some(s.timestamp);
-            }
-        }
-
-        if last_ts_v.is_some() {
-            for s in self.samples.iter_mut().rev() {
-                if s.track_id == 0 {
-                    s.duration = s.duration.max(1);
-                    break;
-                }
-            }
-        }
-        if last_ts_a.is_some() {
-            for s in self.samples.iter_mut().rev() {
-                if s.track_id == 1 {
-                    s.duration = s.duration.max(1);
-                    break;
-                }
-            }
-        }
+/// MP4 `stts` describes how long the current sample remains active, so each
+/// duration must be derived from the following timestamp (not the preceding
+/// one). The last sample reuses the previous cadence.
+fn set_track_durations(
+    samples: &mut [SampleEntry],
+    indices: &[usize],
+    timescale: u32,
+    default_duration: u32,
+) {
+    for (position, index) in indices.iter().copied().enumerate() {
+        let delta_ms = indices
+            .get(position + 1)
+            .map(|next| {
+                samples[*next]
+                    .timestamp
+                    .saturating_sub(samples[index].timestamp)
+            })
+            .or_else(|| {
+                position.checked_sub(1).map(|previous| {
+                    samples[index]
+                        .timestamp
+                        .saturating_sub(samples[indices[previous]].timestamp)
+                })
+            });
+        samples[index].duration = delta_ms
+            .map(|delta| {
+                (u64::from(delta.max(1)) * u64::from(timescale) / 1000)
+                    .try_into()
+                    .unwrap_or(u32::MAX)
+            })
+            .unwrap_or(default_duration)
+            .max(1);
     }
 }
 

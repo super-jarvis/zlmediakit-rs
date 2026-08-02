@@ -24,7 +24,9 @@ use zlmediakit_transcode::{TranscodeConfig, TranscodeManager};
 use crate::ws::{upgrade_response, WsSession};
 use zlmediakit_flv::FlvMuxer;
 use zlmediakit_mp4::fmp4::Fmp4Muxer;
-use zlmediakit_mp4::{build_mpd, DashRepresentation, Fmp4Segment, Mp4Demuxer, TrackKind};
+use zlmediakit_mp4::{
+    build_mpd, DashRepresentation, Fmp4Segment, Mp4VodLibrary, TrackKind, VodPacer, VOD_APP,
+};
 
 pub static HLS_SEGMENTS: once_cell::sync::Lazy<DashMap<String, Arc<RwLock<VecDeque<HlsSegment>>>>> =
     once_cell::sync::Lazy::new(DashMap::new);
@@ -175,10 +177,12 @@ impl HttpSession {
                 self.stream.write_all(response.as_bytes()).await?;
                 let mut ws = WsSession::new(
                     self.stream,
+                    self.peer_addr.clone(),
                     self.source_manager,
                     self.auth,
                     self.hook.clone(),
-                );
+                )
+                .with_vod_library(Arc::new(Mp4VodLibrary::new(self.record_root)));
                 let route = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
                 if route.ends_with(".live.ts") {
                     return ws.run_ts(path).await;
@@ -307,6 +311,9 @@ impl HttpSession {
 
         match source {
             Some(source) => {
+                let _subscriber = source
+                    .register_subscriber(format!("http-flv:{}", self.peer_addr))
+                    .await;
                 let response = "HTTP/1.1 200 OK\r\n\
                     Content-Type: video/x-flv\r\n\
                     Connection: close\r\n\
@@ -394,6 +401,9 @@ impl HttpSession {
 
         match source {
             Some(source) => {
+                let _subscriber = source
+                    .register_subscriber(format!("http-ts:{}", self.peer_addr))
+                    .await;
                 let response = "HTTP/1.1 200 OK\r\n\
                     Content-Type: video/MP2T\r\n\
                     Connection: close\r\n\
@@ -482,6 +492,9 @@ impl HttpSession {
 
         match source {
             Some(source) => {
+                let _subscriber = source
+                    .register_subscriber(format!("http-fmp4:{}", self.peer_addr))
+                    .await;
                 let response = "HTTP/1.1 200 OK\r\n\
                     Content-Type: video/mp4\r\n\
                     Connection: close\r\n\
@@ -1157,11 +1170,21 @@ impl HttpSession {
         // existing FLV players can play MP4 archives.
         if rel.ends_with(".mp4.flv") {
             let mp4_rel = rel.trim_end_matches(".flv");
-            let mp4_target = match Self::safe_join(&self.record_root, mp4_rel) {
-                Some(t) => t,
-                None => return self.send_404().await,
-            };
-            return self.handle_mp4_vod_flv(&mp4_target).await;
+            let query = Self::parse_query(path);
+            let start_ms = query
+                .get("start")
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .map(|value| (value * 1000.0) as u64)
+                .unwrap_or(0);
+            let duration_ms = query
+                .get("duration")
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .map(|value| (value * 1000.0) as u64);
+            return self
+                .handle_mp4_vod_flv(mp4_rel, start_ms, duration_ms)
+                .await;
         }
 
         let target = match Self::safe_join(&self.record_root, rel) {
@@ -1181,28 +1204,24 @@ impl HttpSession {
 
     /// Serves an MP4 archive as an HTTP-FLV stream by demuxing it and
     /// remuxing the frames on the fly (`.mp4.flv` URL convention).
-    async fn handle_mp4_vod_flv(&mut self, file: &Path) -> anyhow::Result<()> {
-        let bytes = match tokio::fs::read(file).await {
-            Ok(b) => b,
-            Err(_) => return self.send_404().await,
-        };
-        let demuxer = match Mp4Demuxer::from_bytes(&bytes) {
-            Ok(d) => d,
+    async fn handle_mp4_vod_flv(
+        &mut self,
+        relative_path: &str,
+        start_ms: u64,
+        duration_ms: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let library = Mp4VodLibrary::new(self.record_root.clone());
+        let asset = match library.open(VOD_APP, relative_path).await {
+            Ok(Some(asset)) => asset,
+            Ok(None) => return self.send_404().await,
             Err(e) => {
-                warn!("MP4 demux failed for {:?}: {:?}", file, e);
+                warn!("MP4 VOD open failed for {}: {e:#}", relative_path);
                 return self.send_404().await;
             }
         };
 
-        let tracks = demuxer.tracks();
-        if tracks.is_empty() {
-            return self.send_404().await;
-        }
-
-        let frames = demuxer.interleaved_media_frames();
-        if frames.is_empty() {
-            return self.send_404().await;
-        }
+        let tracks = asset.tracks();
+        let playback = asset.playback(start_ms);
 
         let video = tracks.iter().find(|t| t.handler == TrackKind::Video);
         let audio = tracks.iter().find(|t| t.handler == TrackKind::Audio);
@@ -1229,7 +1248,14 @@ impl HttpSession {
         let meta = muxer.write_metadata(width, height, fps, audio_sample_rate, video_codec);
         self.stream.write_all(&meta).await?;
 
-        for frame in frames {
+        let pacer = VodPacer::new();
+        for frame in playback.frames {
+            if !frame.config_frame {
+                if duration_ms.is_some_and(|limit| u64::from(frame.timestamp) > limit) {
+                    break;
+                }
+                pacer.wait(frame.timestamp).await;
+            }
             let tag = muxer.write_tag(&frame)?;
             self.stream.write_all(&tag).await?;
         }
@@ -1591,7 +1617,7 @@ impl HttpSession {
                     };
                     entries.push(serde_json::json!({ "key": k, "value": value }));
                 }
-                let secret_configured = !self.auth.secret.is_empty();
+                let secret_configured = !self.auth.secret().is_empty();
                 self.send_json(&serde_json::json!({
                     "code": 0,
                     "server": "zlmediakit-rs",
@@ -1638,17 +1664,43 @@ impl HttpSession {
             "setServerConfig" => {
                 let q = Self::parse_query(path);
                 let mut changed = 0usize;
+                let mut restart_required = Vec::new();
+                let mut rejected = Vec::new();
                 for (k, v) in q {
                     if k == "secret" || k.is_empty() {
                         continue;
                     }
+                    if !zlmediakit_core::config::has_runtime_config_key(&k) {
+                        rejected.push(k);
+                        continue;
+                    }
+                    if k.starts_with("hook.") {
+                        match self.hook.set_config_value(&k, &v) {
+                            Ok(hook_changed) => {
+                                let snapshot_changed =
+                                    zlmediakit_core::config::set_runtime_config(&k, &v);
+                                if hook_changed || snapshot_changed {
+                                    changed += 1;
+                                }
+                            }
+                            Err(_) => rejected.push(k),
+                        }
+                        continue;
+                    }
                     if zlmediakit_core::config::set_runtime_config(&k, &v) {
                         changed += 1;
+                        if k == "api.secret" {
+                            self.auth.set_secret(v);
+                        } else {
+                            restart_required.push(k);
+                        }
                     }
                 }
                 self.send_json(&serde_json::json!({
                     "code": 0,
                     "changed": changed,
+                    "restartRequired": restart_required,
+                    "rejected": rejected,
                 }))
                 .await?;
             }
@@ -1668,16 +1720,63 @@ impl HttpSession {
                 // report how many keys changed.
                 let q = Self::parse_query(path);
                 let mut changed = 0usize;
+                let mut restart_required = Vec::new();
+                let mut rejected = Vec::new();
                 for (k, v) in q {
                     if k == "secret" || k.is_empty() {
                         continue;
                     }
+                    if !zlmediakit_core::config::has_runtime_config_key(&k) {
+                        rejected.push(k);
+                        continue;
+                    }
+                    if k.starts_with("hook.") {
+                        match self.hook.set_config_value(&k, &v) {
+                            Ok(hook_changed) => {
+                                let snapshot_changed =
+                                    zlmediakit_core::config::set_runtime_config(&k, &v);
+                                if hook_changed || snapshot_changed {
+                                    changed += 1;
+                                }
+                            }
+                            Err(_) => rejected.push(k),
+                        }
+                        continue;
+                    }
                     if zlmediakit_core::config::set_runtime_config(&k, &v) {
                         changed += 1;
+                        if k == "api.secret" {
+                            self.auth.set_secret(v);
+                        } else {
+                            restart_required.push(k);
+                        }
                     }
                 }
-                self.send_json(&serde_json::json!({ "code": 0, "changed": changed }))
+                self.send_json(&serde_json::json!({
+                    "code": 0,
+                    "changed": changed,
+                    "restartRequired": restart_required,
+                    "rejected": rejected,
+                }))
+                .await?;
+            }
+            "reloadCertificate" => {
+                let report = zlmediakit_core::transport::reload_registered_tls();
+                if report.failed.is_empty() {
+                    self.send_json(&serde_json::json!({
+                        "code": 0,
+                        "reloaded": report.reloaded,
+                    }))
                     .await?;
+                } else {
+                    self.send_json(&serde_json::json!({
+                        "code": -1,
+                        "msg": "one or more TLS certificates could not be reloaded; previous certificates remain active",
+                        "reloaded": report.reloaded,
+                        "failed": report.failed,
+                    }))
+                    .await?;
+                }
             }
             "restartServer" => {
                 // Respond first so the client sees success, then request a
@@ -1699,6 +1798,7 @@ impl HttpSession {
                     "getWorkThreadsLoad",
                     "getServerConfig",
                     "setServerConfig",
+                    "reloadCertificate",
                     "getAllSession",
                     "kick_sessions",
                     "getMediaList",
@@ -3117,7 +3217,7 @@ impl HttpSession {
     /// The dedicated request header keeps the secret out of normal URLs while
     /// the query parameter remains compatible with the upstream ZLMediaKit API.
     fn is_api_authorized(&self, path: &str, request: &str) -> bool {
-        let expected = self.auth.secret.as_str();
+        let expected = self.auth.secret();
         if expected.is_empty() {
             return true;
         }
@@ -3135,7 +3235,7 @@ impl HttpSession {
         let query = Self::parse_query(path);
         let supplied = header_secret.or_else(|| query.get("secret").map(String::as_str));
 
-        supplied.is_some_and(|candidate| Self::constant_time_eq(expected, candidate))
+        supplied.is_some_and(|candidate| Self::constant_time_eq(&expected, candidate))
     }
 
     fn constant_time_eq(expected: &str, candidate: &str) -> bool {

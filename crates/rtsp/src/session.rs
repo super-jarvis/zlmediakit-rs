@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
+use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 use zlmediakit_core::auth::StreamAuth;
 use zlmediakit_core::event_bus::{Event, EventBus};
@@ -17,6 +18,7 @@ use zlmediakit_core::media_frame::{
 use zlmediakit_core::media_source::{MediaSource, MediaSourceManager};
 use zlmediakit_core::transport::TransportStream;
 use zlmediakit_core::{aac_raw_payload, flv_payload};
+use zlmediakit_mp4::{Mp4VodLibrary, VodAsset, VodPacer};
 
 pub struct RtspSession {
     stream: Option<TransportStream>,
@@ -29,6 +31,8 @@ pub struct RtspSession {
     realm: Option<String>,
     nonce: String,
     source: Option<Arc<MediaSource>>,
+    vod_library: Option<Arc<Mp4VodLibrary>>,
+    vod_asset: Option<VodAsset>,
     cseq: u32,
     session_id: String,
     app: String,
@@ -39,6 +43,7 @@ pub struct RtspSession {
     setup_count: u32,
     udp_video: Option<Arc<UdpSocket>>,
     udp_audio: Option<Arc<UdpSocket>>,
+    play_stop: Option<Arc<Notify>>,
     buffer: BytesMut,
 
     // RTSP push (publish) support
@@ -86,6 +91,8 @@ impl RtspSession {
             realm: None,
             nonce,
             source: None,
+            vod_library: None,
+            vod_asset: None,
             cseq: 0,
             session_id,
             app: String::new(),
@@ -96,6 +103,7 @@ impl RtspSession {
             setup_count: 0,
             udp_video: None,
             udp_audio: None,
+            play_stop: None,
             buffer: BytesMut::with_capacity(4096),
 
             video_pt: 96,
@@ -110,6 +118,11 @@ impl RtspSession {
             audio_config: None,
             depak: None,
         }
+    }
+
+    pub fn with_vod_library(mut self, vod: Option<Arc<Mp4VodLibrary>>) -> Self {
+        self.vod_library = vod;
+        self
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
@@ -269,9 +282,41 @@ impl RtspSession {
                 self.send_response(&response).await
             }
             None => {
-                let response =
-                    RtspResponse::new(404, "Not Found").with_header("CSeq", &self.cseq.to_string());
-                self.send_response(&response).await
+                let asset = self.open_vod().await;
+                match asset {
+                    Some(asset) => {
+                        let info = asset.media_info();
+                        let video_codec = info
+                            .tracks
+                            .iter()
+                            .find_map(|track| match track {
+                                TrackInfo::Video(video) => Some(video.codec),
+                                _ => None,
+                            })
+                            .unwrap_or(CodecId::H264);
+                        let audio = info.tracks.iter().find_map(|track| match track {
+                            TrackInfo::Audio(audio) => Some(audio.clone()),
+                            _ => None,
+                        });
+                        let hevc_sprop = if video_codec == CodecId::H265 {
+                            extract_hevc_sprop_from_asset(&asset)
+                        } else {
+                            None
+                        };
+                        let sdp = self.generate_sdp(video_codec, hevc_sprop, audio.as_ref());
+                        self.vod_asset = Some(asset);
+                        let response = RtspResponse::new(200, "OK")
+                            .with_header("CSeq", &self.cseq.to_string())
+                            .with_header("Content-Type", "application/sdp")
+                            .with_body(sdp.into_bytes());
+                        self.send_response(&response).await
+                    }
+                    None => {
+                        let response = RtspResponse::new(404, "Not Found")
+                            .with_header("CSeq", &self.cseq.to_string());
+                        self.send_response(&response).await
+                    }
+                }
             }
         }
     }
@@ -354,6 +399,9 @@ impl RtspSession {
 
     async fn handle_play(&mut self, request: &RtspRequest) -> anyhow::Result<()> {
         self.is_publisher = false;
+        if self.app.is_empty() {
+            self.parse_uri(&request.uri);
+        }
 
         if !self.is_authenticated(request, "play").await {
             warn!(
@@ -372,6 +420,14 @@ impl RtspSession {
                 .await;
         }
 
+        if self.source.is_none() && self.vod_asset.is_none() {
+            self.vod_asset = self.open_vod().await;
+        }
+
+        if let Some(asset) = self.vod_asset.take() {
+            return self.handle_vod_play(request, asset).await;
+        }
+
         if self.source.is_none() {
             let response =
                 RtspResponse::new(404, "Not Found").with_header("CSeq", &self.cseq.to_string());
@@ -384,6 +440,13 @@ impl RtspSession {
         self.send_response(&response).await?;
 
         if let Some(ref source) = self.source {
+            let subscriber = source
+                .register_subscriber(format!("rtsp:{}", self.session_id))
+                .await;
+            let play_stop = Arc::new(Notify::new());
+            if let Some(previous) = self.play_stop.replace(play_stop.clone()) {
+                previous.notify_one();
+            }
             let cached = {
                 let cache = source.gop_cache.read().await;
                 cache.get_latest_gop_frames()
@@ -412,6 +475,7 @@ impl RtspSession {
                     None => return Ok(()),
                 };
                 let handle = tokio::spawn(async move {
+                    let _subscriber = subscriber;
                     let mut writer = stream;
                     let mut seq: u16 = 1;
                     let ssrc: u32 = rand::rng().random();
@@ -431,15 +495,28 @@ impl RtspSession {
                         .await;
                     }
 
-                    while let Ok(frame) = rx.recv().await {
-                        let _ = Self::send_interleaved_frame(
-                            &mut writer,
-                            &frame,
-                            &mut seq,
-                            ssrc,
-                            audio_clock_rate,
-                        )
-                        .await;
+                    loop {
+                        tokio::select! {
+                            _ = play_stop.notified() => break,
+                            result = rx.recv() => match result {
+                                Ok(frame) => {
+                                    if Self::send_interleaved_frame(
+                                        &mut writer,
+                                        &frame,
+                                        &mut seq,
+                                        ssrc,
+                                        audio_clock_rate,
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
                     }
                     debug!("RTSP play send task ended (tcp interleaved)");
                 });
@@ -452,6 +529,7 @@ impl RtspSession {
                 };
                 let audio_sock = self.udp_audio.take();
                 tokio::spawn(async move {
+                    let _subscriber = subscriber;
                     let mut video_seq: u16 = 1;
                     let mut audio_seq: u16 = 1;
                     let video_ssrc: u32 = rand::rng().random();
@@ -485,37 +563,180 @@ impl RtspSession {
                         }
                     }
 
-                    while let Ok(frame) = rx.recv().await {
-                        match frame.frame_type {
-                            zlmediakit_core::media_frame::FrameType::Video => {
-                                let _ = Self::send_udp_frame(
-                                    &video_sock,
-                                    &frame,
-                                    &mut video_seq,
-                                    video_ssrc,
-                                    audio_clock_rate,
-                                )
-                                .await;
-                            }
-                            zlmediakit_core::media_frame::FrameType::Audio => {
-                                if let Some(ref sock) = audio_sock {
-                                    let _ = Self::send_udp_frame(
-                                        sock,
-                                        &frame,
-                                        &mut audio_seq,
-                                        audio_ssrc,
-                                        audio_clock_rate,
-                                    )
-                                    .await;
+                    loop {
+                        tokio::select! {
+                            _ = play_stop.notified() => break,
+                            result = rx.recv() => match result {
+                                Ok(frame) => match frame.frame_type {
+                                    zlmediakit_core::media_frame::FrameType::Video => {
+                                        let _ = Self::send_udp_frame(
+                                            &video_sock,
+                                            &frame,
+                                            &mut video_seq,
+                                            video_ssrc,
+                                            audio_clock_rate,
+                                        )
+                                        .await;
+                                    }
+                                    zlmediakit_core::media_frame::FrameType::Audio => {
+                                        if let Some(ref sock) = audio_sock {
+                                            let _ = Self::send_udp_frame(
+                                                sock,
+                                                &frame,
+                                                &mut audio_seq,
+                                                audio_ssrc,
+                                                audio_clock_rate,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    _ => {}
                                 }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
-                            _ => {}
                         }
                     }
                 });
             }
         }
 
+        Ok(())
+    }
+
+    async fn open_vod(&self) -> Option<VodAsset> {
+        let library = self.vod_library.as_ref()?;
+        match library.open(&self.app, &self.stream_name).await {
+            Ok(asset) => asset,
+            Err(error) => {
+                warn!(
+                    "RTSP VOD open failed for {}/{}: {error:#}",
+                    self.app, self.stream_name
+                );
+                None
+            }
+        }
+    }
+
+    async fn handle_vod_play(
+        &mut self,
+        request: &RtspRequest,
+        asset: VodAsset,
+    ) -> anyhow::Result<()> {
+        let (requested_start_ms, requested_end_ms) = parse_npt_range(request);
+        let playback = asset.playback(requested_start_ms);
+        let actual_start_ms = playback.start_ms;
+        let limit_ms = requested_end_ms.map(|end| end.saturating_sub(actual_start_ms));
+        let audio_clock_rate = asset
+            .media_info()
+            .tracks
+            .iter()
+            .find_map(|track| match track {
+                TrackInfo::Audio(audio) => Some(match audio.codec {
+                    CodecId::Opus => 48_000,
+                    CodecId::G711A | CodecId::G711U => 8_000,
+                    CodecId::Mp3 | CodecId::MP2A => 90_000,
+                    _ => audio.sample_rate.max(1),
+                }),
+                _ => None,
+            })
+            .unwrap_or(44_100);
+        let range = format!("npt={:.3}-", actual_start_ms as f64 / 1000.0);
+        let response = RtspResponse::new(200, "OK")
+            .with_header("CSeq", &self.cseq.to_string())
+            .with_header("Session", &self.session_id)
+            .with_header("Range", &range);
+        self.send_response(&response).await?;
+
+        if self.tcp_interleaved {
+            let mut writer = match self.stream.take() {
+                Some(stream) => stream,
+                None => return Ok(()),
+            };
+            let frames = playback.frames;
+            tokio::spawn(async move {
+                let pacer = VodPacer::new();
+                let mut sequence = 1u16;
+                let ssrc = rand::rng().random();
+                for frame in frames {
+                    if !frame.config_frame {
+                        if limit_ms.is_some_and(|limit| u64::from(frame.timestamp) > limit) {
+                            break;
+                        }
+                        pacer.wait(frame.timestamp).await;
+                    }
+                    if Self::send_interleaved_frame(
+                        &mut writer,
+                        &frame,
+                        &mut sequence,
+                        ssrc,
+                        audio_clock_rate,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+                debug!("RTSP VOD TCP playback ended");
+            });
+        } else {
+            let video_socket = match self.udp_video.take() {
+                Some(socket) => socket,
+                None => return Ok(()),
+            };
+            let audio_socket = self.udp_audio.take();
+            let frames = playback.frames;
+            tokio::spawn(async move {
+                let pacer = VodPacer::new();
+                let mut video_sequence = 1u16;
+                let mut audio_sequence = 1u16;
+                let video_ssrc = rand::rng().random();
+                let audio_ssrc = rand::rng().random();
+                for frame in frames {
+                    if !frame.config_frame {
+                        if limit_ms.is_some_and(|limit| u64::from(frame.timestamp) > limit) {
+                            break;
+                        }
+                        pacer.wait(frame.timestamp).await;
+                    }
+                    let result = match frame.frame_type {
+                        FrameType::Video => {
+                            Self::send_udp_frame(
+                                &video_socket,
+                                &frame,
+                                &mut video_sequence,
+                                video_ssrc,
+                                audio_clock_rate,
+                            )
+                            .await
+                        }
+                        FrameType::Audio => match &audio_socket {
+                            Some(socket) => {
+                                Self::send_udp_frame(
+                                    socket,
+                                    &frame,
+                                    &mut audio_sequence,
+                                    audio_ssrc,
+                                    audio_clock_rate,
+                                )
+                                .await
+                            }
+                            None => Ok(()),
+                        },
+                        FrameType::Metadata => Ok(()),
+                    };
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                debug!("RTSP VOD UDP playback ended");
+            });
+        }
+        info!(
+            "RTSP VOD play started: {}/{} at {} ms",
+            self.app, self.stream_name, actual_start_ms
+        );
         Ok(())
     }
 
@@ -770,12 +991,19 @@ impl RtspSession {
     }
 
     fn parse_uri(&mut self, uri: &str) {
-        let stripped = uri.trim_start_matches("rtsp://");
+        let stripped = uri
+            .strip_prefix("rtsp://")
+            .or_else(|| uri.strip_prefix("rtsps://"))
+            .unwrap_or(uri);
         let (path, query) = match stripped.split_once('?') {
             Some((p, q)) => (p, Some(q)),
             None => (stripped, None),
         };
-        let path = path.split_once('/').map(|x| x.1).unwrap_or("");
+        let path = if path.starts_with('/') {
+            path.trim_start_matches('/')
+        } else {
+            path.split_once('/').map(|x| x.1).unwrap_or("")
+        };
         let parts: Vec<&str> = path.splitn(2, '/').collect();
         self.app = parts.first().map_or("live", |v| v).to_string();
         self.stream_name = parts.get(1).map_or("stream", |v| v).to_string();
@@ -1240,8 +1468,13 @@ impl RtspSession {
                 app: self.app.clone(),
                 stream: self.stream_name.clone(),
             });
+            self.source_manager
+                .close_stream("__defaultVhost__", &self.app, &self.stream_name);
         }
         self.source = None;
+        if let Some(stop) = self.play_stop.take() {
+            stop.notify_one();
+        }
         self.udp_video = None;
         self.udp_audio = None;
         self.depak = None;
@@ -1979,6 +2212,41 @@ async fn extract_hevc_sprop_from_source(
     None
 }
 
+fn extract_hevc_sprop_from_asset(asset: &VodAsset) -> Option<(String, String, String)> {
+    for frame in asset.playback(0).frames {
+        if frame.config_frame && frame.codec == CodecId::H265 {
+            if let (Some(vps), Some(sps), Some(pps)) = extract_hevc_nalus(&frame.data) {
+                return Some((BASE64.encode(vps), BASE64.encode(sps), BASE64.encode(pps)));
+            }
+        }
+    }
+    None
+}
+
+fn parse_npt_range(request: &RtspRequest) -> (u64, Option<u64>) {
+    let Some(value) = request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("range"))
+        .map(|(_, value)| value.trim())
+    else {
+        return (0, None);
+    };
+    let Some(value) = value.strip_prefix("npt=") else {
+        return (0, None);
+    };
+    let (start, end) = value.split_once('-').unwrap_or((value, ""));
+    let to_ms = |value: &str| {
+        value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(|value| (value * 1000.0) as u64)
+    };
+    (to_ms(start).unwrap_or(0), to_ms(end))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2016,6 +2284,20 @@ mod tests {
         assert_eq!(vps, Some(vec![0xAA, 0xBB]));
         assert_eq!(sps, Some(vec![0xCC, 0xDD]));
         assert_eq!(pps, Some(vec![0xEE, 0xFF]));
+    }
+
+    #[test]
+    fn parses_rtsp_npt_range_in_seconds() {
+        let request = RtspRequest {
+            method: "PLAY".to_string(),
+            uri: "rtsp://127.0.0.1/record/a.mp4".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: [("Range".to_string(), "npt=2.500-8.25".to_string())]
+                .into_iter()
+                .collect(),
+            body: Vec::new(),
+        };
+        assert_eq!(parse_npt_range(&request), (2500, Some(8250)));
     }
 
     #[test]

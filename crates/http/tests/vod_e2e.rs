@@ -13,6 +13,7 @@ use zlmediakit_core::recorder::{RecorderCommand, RecorderControl};
 use zlmediakit_core::stream_proxy::StreamProxyControl;
 use zlmediakit_flv::FlvRecorder;
 use zlmediakit_http::server::{HttpServer, HttpServerConfig};
+use zlmediakit_http::ws::WsFrame;
 use zlmediakit_mp4::Mp4Muxer;
 
 const TEST_PORT: u16 = 19158;
@@ -292,9 +293,9 @@ fn build_sample_mp4() -> Vec<u8> {
     );
     acfg.config_frame = true;
     muxer.push_frame(&acfg);
-    // 2 video frames.
-    for (i, ts) in [0u32, 33].iter().enumerate() {
-        let is_key = i == 0;
+    // Two GOPs so non-zero VOD seek can be verified.
+    for (i, ts) in [0u32, 100, 200, 300].iter().enumerate() {
+        let is_key = i == 0 || i == 2;
         let data = vec![
             if is_key { 0x17 } else { 0x27 },
             0x01,
@@ -334,7 +335,7 @@ fn build_sample_mp4() -> Vec<u8> {
 #[tokio::test]
 async fn mp4_vod_flv_remux_playback() {
     let port = find_free_port().await;
-    let _ = std::fs::remove_dir_all(RECORD_BASE);
+    let record_root = tempfile::tempdir().unwrap();
 
     let mgr = Arc::new(MediaSourceManager::new(None));
     let auth = StreamAuth::new(false, String::new());
@@ -353,7 +354,7 @@ async fn mp4_vod_flv_remux_playback() {
         proxy,
         pusher: Default::default(),
         ffmpeg: Default::default(),
-        record_root: std::path::PathBuf::from(RECORD_BASE),
+        record_root: record_root.path().to_path_buf(),
         www_root: None,
         ssl_cert: None,
         ssl_key: None,
@@ -371,7 +372,7 @@ async fn mp4_vod_flv_remux_playback() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Place a sample MP4 under the record root.
-    let dir = Path::new(RECORD_BASE).join("mp4vod");
+    let dir = record_root.path().join("mp4vod");
     tokio::fs::create_dir_all(&dir).await.unwrap();
     let mp4 = build_sample_mp4();
     tokio::fs::write(dir.join("sample.mp4"), &mp4)
@@ -395,8 +396,42 @@ async fn mp4_vod_flv_remux_playback() {
         body.windows(10).any(|w| w == b"onMetaData"),
         "FLV stream must carry onMetaData"
     );
-    // We expect video config + audio config + 2 video + 2 audio frames.
+    // We expect video config + audio config + 4 video + 2 audio frames.
     assert!(body.len() > 100, "FLV stream should be non-trivial");
+
+    // Query-string seek is in seconds and must report a rebased FLV timeline
+    // beginning at the preceding 200 ms keyframe (marker byte 0xAC).
+    let (code, seek_body, _) = http_request(
+        "GET /record/mp4vod/sample.mp4.flv?start=0.25&duration=0.05 HTTP/1.0\r\nHost: localhost\r\n\r\n",
+        port,
+    )
+    .await;
+    assert_eq!(code, 200);
+    let video = flv_video_data_tags(&seek_body);
+    assert_eq!(
+        video.len(),
+        1,
+        "duration should stop after selected keyframe"
+    );
+    assert_eq!(video[0].0, 0, "seeked FLV timestamp must be rebased");
+    assert_eq!(video[0].1[0] >> 4, 1, "first media tag must be keyframe");
+    assert_eq!(video[0].1.get(5), Some(&0xAC));
+
+    let ws_frames = websocket_vod(
+        port,
+        "/record/mp4vod/sample.mp4.flv?start=0.25&duration=0.05",
+    )
+    .await;
+    let ws_video = ws_frames
+        .iter()
+        .filter(|frame| frame.opcode == 2 && frame.payload.first() == Some(&9))
+        .filter(|frame| frame.payload.get(12) == Some(&1))
+        .collect::<Vec<_>>();
+    assert_eq!(ws_video.len(), 1);
+    assert_eq!(ws_video[0].payload.get(16), Some(&0xAC));
+    assert!(ws_frames
+        .iter()
+        .any(|frame| { frame.opcode == 8 && frame.payload.starts_with(&1000u16.to_be_bytes()) }));
 
     // The raw MP4 is still served as a downloadable file.
     let (code, raw, _) = http_request(
@@ -406,8 +441,76 @@ async fn mp4_vod_flv_remux_playback() {
     .await;
     assert_eq!(code, 200, "raw MP4 should be served");
     assert_eq!(&raw[4..8], b"ftyp", "raw MP4 should start with ftyp");
+}
 
-    let _ = std::fs::remove_dir_all(RECORD_BASE);
+fn flv_video_data_tags(body: &[u8]) -> Vec<(u32, &[u8])> {
+    if body.len() < 13 || &body[..3] != b"FLV" {
+        return Vec::new();
+    }
+    let mut position = 13usize;
+    let mut tags = Vec::new();
+    while position + 11 <= body.len() {
+        let tag_type = body[position];
+        let size = ((body[position + 1] as usize) << 16)
+            | ((body[position + 2] as usize) << 8)
+            | body[position + 3] as usize;
+        let timestamp = ((body[position + 7] as u32) << 24)
+            | ((body[position + 4] as u32) << 16)
+            | ((body[position + 5] as u32) << 8)
+            | body[position + 6] as u32;
+        let data_start = position + 11;
+        let data_end = data_start.saturating_add(size);
+        if data_end > body.len() {
+            break;
+        }
+        let data = &body[data_start..data_end];
+        if tag_type == 9 && data.get(1) == Some(&1) {
+            tags.push((timestamp, data));
+        }
+        position = data_end.saturating_add(4);
+    }
+    tags
+}
+
+async fn websocket_vod(port: u16, path: &str) -> Vec<WsFrame> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut pending = Vec::new();
+        let mut upgraded = false;
+        let mut frames = Vec::new();
+        loop {
+            let mut buffer = [0u8; 4096];
+            let size = stream.read(&mut buffer).await.unwrap();
+            if size == 0 {
+                return frames;
+            }
+            pending.extend_from_slice(&buffer[..size]);
+            if !upgraded {
+                let Some(header_end) = pending.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let response = String::from_utf8_lossy(&pending[..header_end + 4]);
+                assert!(response.starts_with("HTTP/1.1 101"));
+                pending.drain(..header_end + 4);
+                upgraded = true;
+            }
+            while let Some((frame, consumed)) = WsFrame::decode(&pending) {
+                let closed = frame.opcode == 8;
+                frames.push(frame);
+                pending.drain(..consumed);
+                if closed {
+                    return frames;
+                }
+            }
+        }
+    })
+    .await
+    .expect("WS-FLV VOD should finish")
 }
 
 #[tokio::test]

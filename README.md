@@ -21,12 +21,12 @@
 | **HLS (TS)** | - | ✅ | MPEG-TS 分片 + m3u8 |
 | **HLS CMAF** | - | ✅ | fMP4 分片 + EXT-X-MAP，与 DASH 共享段 |
 | **DASH** | - | ✅ | fMP4/CMAF 分片 + MPD 清单 |
-| **WebRTC** | WHIP | WHEP | H.264 + Opus，可选 AAC→Opus 转码 |
+| **WebRTC** | WHIP | WHEP | 多音视频轨、WHIP RID/SSRC 保留与 WHEP `?rid=` 选层；NACK/PLI/TWCC、RTX、REMB；单 UDP 端口 ICE mux、trickle-ICE 与完整 ICE restart；原生 WHIP 推流/WHEP 拉流客户端 |
 | **SRT** | ✅ | ✅ | Listener/Caller/Rendezvous，MPEG-TS 输入输出，可选延迟、streamid 与 AES passphrase |
 | **GB28181** | ✅ | ✅（对讲） | UDP/TCP active/passive RTP 接收；自动识别 PS/TS/ES，支持乱序恢复及 H.264/H.265/AAC/G.711/MP2/MP3；SIP 点播与 G.711A/U 语音对讲 |
 | **RTP ES/PS/TS 转推** | ✅ | - | `startSendRtp`/`startSendRtpPassive`/`stopSendRtp`/`listRtpSender`；UDP、TCP active/passive 与断线重连；`type=0/1/2`，默认 GB28181 PS-RTP |
 | **原生 HTTP 拉流** | ✅ | ✅ | HTTP/HTTPS-FLV、HTTP/HTTPS-TS、HLS MPEG-TS/CMAF；支持跳转、chunked、主/媒体清单和系统 CA 校验，接入统一拉流代理与协议互转 |
-| **VOD 点播** | - | ✅ | 录制文件回放，HTTP Range 支持，35 种 MIME 类型 |
+| **VOD 点播** | - | ✅ | MP4 经 HTTP/WS-FLV、RTMP、RTSP 回放；关键帧 seek、实时节奏、HTTP Range 与 35 种 MIME 类型 |
 
 ### 编解码与协议互转边界
 
@@ -39,7 +39,7 @@
 | HTTP-FLV / WebSocket-FLV | H.264、H.265；AAC、MP3、G.711A/U | Opus、L16 不能直接写入 classic FLV |
 | HLS MPEG-TS | H.264、H.265；AAC | 视频统一转 Annex-B，AAC 统一转 ADTS |
 | HLS CMAF / DASH / MP4 / fMP4 | H.264、H.265；AAC | 视频写长度前缀样本，AAC 写 raw access unit；CMAF/DASH 共享 fMP4 段 |
-| WebRTC WHIP/WHEP | H.264、Opus | WHEP 可通过 `aac-transcode` feature 把 AAC 转为 Opus；不声明 H.265 WebRTC 支持 |
+| WebRTC WHIP/WHEP | WHIP 输入：H.264、VP8、VP9、Opus；WHEP 输出：H.264、H.265、VP8、VP9、AV1、Opus | WHEP 可通过 `aac-transcode` feature 把 AAC 转为 Opus；H.265/AV1 是否可播取决于客户端协商能力；当前不接收 WHIP H.265/AV1 分片 |
 | SRT MPEG-TS 输入/输出 | H.264、H.265；AAC/ADTS | Listener/Caller/Rendezvous；从 PAT/PMT、PES 读取轨道及 PTS/DTS，输出按 7 个 TS packet 分组发送 |
 | GB28181 输入 | PS：H.264/H.265/AAC/G.711/MP2/MP3；TS：H.264/H.265/AAC；ES：H.264/H.265/AAC/G.711 | RTP 跨包重排/去重；自动识别 PS/TS/ES，PSM 决定轨道编码，AAC 支持 ADTS/RFC3640 |
 
@@ -68,8 +68,11 @@
 
 | 功能 | 说明 |
 |------|------|
-| 拉流代理 | RTMP(S)、RTSP(S)、SRT Caller/Rendezvous、HTTP(S)-FLV、HTTP(S)-TS、HLS TS/CMAF 远程拉流，自动发布到本地 |
-| **推流中继** | 本地流自动推送至远程 RTMP(S)、RTSP(S) 或 SRT Caller/Rendezvous 端点 |
+| 拉流代理 | RTMP(S)、RTSP(S)、SRT Caller/Rendezvous、HTTP(S)-FLV、HTTP(S)-TS、HLS TS/CMAF、WHEP 远程拉流，自动发布到本地 |
+| **边缘按需回源** | `origin_url`/`origin_urls` 按序故障转移，基础 URL 或 `{vhost}/{app}/{stream}` 模板；并发播放请求共享一次回源 |
+| **无人观看停拉** | RTMP、RTSP、HTTP/WS-FLV、TS、fMP4 播放器统一计数；按需回源在 `stream_none_reader_delay` 后自动关闭，重连会取消关闭 |
+| **推流中继** | 本地流自动推送至远程 RTMP(S)、RTSP(S)、SRT Caller/Rendezvous 或 WHIP 端点 |
+| **集群中继** | 按本地 vhost/app 筛选，目标 URL 支持模板；断线按 1–30 秒指数退避重连，源流结束立即取消 |
 | FFmpeg 拉流源 | 通过 API 添加任意格式的 ffmpeg 拉流源 |
 
 ### 鉴权
@@ -77,7 +80,7 @@
 | 方式 | 说明 |
 |------|------|
 | Token 鉴权 | SHA256 URL 签名（`?sign=`） |
-| **外部 Hook** | HTTP 回调鉴权（on_publish/on_play/on_stream_not_found） |
+| **外部 Hook** | HTTP/HTTPS 回调鉴权与生命周期通知；URL、超时、重试和流量上报周期可热更新 |
 
 ### 其他
 
@@ -85,6 +88,7 @@
 - **Web 管理面板**：内置监控仪表盘
 - **静态文件服务**：www_root 提供 HTML/CSS/JS 等静态文件
 - **TOML 配置**：丰富的配置项，支持命令行覆盖
+- **IPv6**：全局 `listen_ip = "::"` 可统一切换信令/媒体监听；HTTP(S)、RTMP(S)、RTSP(S)、SRT、WHIP/WHEP 客户端接受带方括号的 IPv6 URL
 - **Docker 支持**：多阶段构建镜像 + docker-compose 一键部署
 
 ---
@@ -123,6 +127,29 @@ cargo build --release
 RUST_LOG=debug ./target/release/zlmediakit
 ```
 
+### 嵌入到 Rust 服务
+
+`zlmediakit-core` 提供与协议服务器共用的进程内媒体图。宿主程序可发布编码帧、订阅缓存 GOP 与实时帧、枚举运行流，并把同一个 manager 交给需要的 RTMP/RTSP/HTTP/SRT/WebRTC listener：
+
+```rust
+use bytes::Bytes;
+use zlmediakit_core::{CodecId, EmbeddedMediaKit, MediaFrame};
+
+let kit = EmbeddedMediaKit::default();
+let publisher = kit.publisher("__defaultVhost__", "live", "camera");
+publisher
+    .publish(MediaFrame::new_video(
+        0, CodecId::H264, 0, 0, 0, Bytes::from_static(b"encoded-frame"), true,
+    ))
+    .await;
+
+let mut player = kit.subscribe("__defaultVhost__", "live", "camera").await.unwrap();
+let frame = player.recv().await.unwrap();
+assert_eq!(frame.codec, CodecId::H264);
+```
+
+`EmbeddedPublisher::unpublish`/`EmbeddedMediaKit::close_stream` 会关闭订阅并从媒体图移除流；仅丢弃 publisher handle 不会误关可能被多个协议共享的源。
+
 ### 推流
 
 ```bash
@@ -156,7 +183,18 @@ ffplay http://localhost:8080/live/stream.cmav.m3u8
 
 # DASH
 ffplay http://localhost:8080/live/stream.mpd
+
+# MP4 归档（实际路径位于 record/live/stream/20260802_120000.mp4）
+ffplay http://localhost:8080/record/live/stream/20260802_120000.mp4
+ffplay "http://localhost:8080/record/live/stream/20260802_120000.mp4.flv?start=12.5&duration=30"
+ffplay rtmp://localhost:1935/record/live/stream/20260802_120000.mp4
+ffplay rtsp://localhost:8554/record/live/stream/20260802_120000.mp4
 ```
+
+MP4 点播的 RTSP `Range: npt=<秒>-`、HTTP/WS-FLV `start=<秒>` 与 RTMP
+`play.start`（毫秒）都会回退到目标时间之前最近的关键帧，并把输出时间轴重置为
+0；`duration` 可限制 HTTP/WS-FLV 与 RTMP 的播放区间。鉴权开启时，以上 URL
+同样需要携带按 `record` 应用和完整相对文件路径生成的 `sign`。
 
 ### 管理面板
 
@@ -169,7 +207,7 @@ ffplay http://localhost:8080/live/stream.mpd
 后台已接入流与播放者详情、截图、连接会话、拉流代理、推流转发、FFmpeg
 源、HLS/FLV/MP4 录制与归档、GB28181 设备/目录/点播、RTP 服务、实时转码、
 运行时配置、线程负载和协议地址。浏览器播放器支持 HLS、HTTP/WS-FLV 和
-WebRTC WHEP；SRT 提供推流地址与运行状态。登录 secret 仅保存在当前标签页的
+WebRTC WHEP；WHEP URL 可用 `rid` 查询参数选择 WHIP simulcast 层。SRT 提供推流地址与运行状态。登录 secret 仅保存在当前标签页的
 `sessionStorage` 中，退出登录会立即清除。
 
 ---
@@ -217,13 +255,13 @@ WebRTC WHEP；SRT 提供推流地址与运行状态。登录 secret 仅保存在
 
 | 配置段 | 说明 |
 |--------|------|
-| **全局** | `auth_enabled`、`secret`、各协议端口 |
+| **全局** | `listen_ip`、`auth_enabled`、`secret`、各协议端口 |
 | `[general]` | 流量阈值、无播放者延时 |
 | `[rtmp]` / `[rtsp]` / `[http]` | 协议开关、端口、SSL |
-| `[webrtc]` | WebRTC WHEP 端口、ICE 服务器 |
-| `[hook]` | 外部鉴权回调 URL（可选） |
+| `[webrtc]` | WHIP/WHEP 信令端口、共享 ICE UDP 端口/绑定地址、ICE-lite、1:1 NAT 公网 IP、STUN/TURN |
+| `[hook]` | 外部鉴权/生命周期 HTTP(S) 回调 URL、超时、重试和流量上报周期（均可经 API 热更新） |
 | `[srt]` | SRT 接收端口、延迟、加密（可选） |
-| `[cluster]` | 集群推流中继目标列表（可选） |
+| `[cluster]` | 集群推流目标、多上游边缘回源、单上游超时（可选） |
 | `[proxy]` | 启动时自动拉流列表（可选） |
 | `[record]` | 录制开关（hls/mp4/flv）、存储路径 |
 
@@ -263,7 +301,8 @@ curl 'http://localhost:8080/index/api/getMediaList?secret=<secret>'
 | `getMediaPlayerList` | 列出指定流的播放者 |
 | `isMediaOnline` | 查询流是否在线（`?stream=`） |
 | `getServerConfig` | 获取服务器运行时配置 |
-| `setServerConfig` | 修改运行时配置（如 `?general.flowThreshold=2048`） |
+| `setServerConfig` | 修改已知运行时配置；`api.secret` 与全部 `hook.*` 键立即热生效，未热接线的配置返回 `restartRequired`，未知或非法值返回 `rejected` |
+| `reloadCertificate` | 从启动时配置的 PEM 路径重新加载 HTTP(S)/RTMP(S)/RTSP(S) 证书；新 TLS 握手立即使用新证书，失败时保留最后一份有效配置 |
 | `getStatistic` | 获取服务器统计 |
 | `closeStream` | 关闭指定流 |
 | `close_streams` | 按 `vhost`/`app`/`stream` 批量关闭流 |
@@ -299,7 +338,7 @@ curl 'http://localhost:8080/index/api/getMediaList?secret=<secret>'
 
 | 端点 | 说明 |
 |------|------|
-| `addStreamProxy` | 添加远程拉流代理；原生支持 RTMP(S)、RTSP(S)、SRT Caller/Rendezvous、HTTP(S)-FLV、HTTP(S)-TS 和 HLS TS/CMAF |
+| `addStreamProxy` | 添加远程拉流代理；原生支持 RTMP(S)、RTSP(S)、SRT Caller/Rendezvous、HTTP(S)-FLV、HTTP(S)-TS、HLS TS/CMAF，以及 `whep://`/`wheps://` WebRTC 拉流 |
 | `delStreamProxy` | 删除拉流代理 |
 | `getStreamProxyList` | 列出拉流代理 |
 
@@ -307,7 +346,7 @@ curl 'http://localhost:8080/index/api/getMediaList?secret=<secret>'
 
 | 端点 | 说明 |
 |------|------|
-| `addStreamPusher` | 将本地流推送至远程 RTMP(S)、RTSP(S) 或 SRT 端点；RTSP 使用 ANNOUNCE/SETUP/RECORD、Digest 与 TCP interleaved RTP，SRT 使用 MPEG-TS Caller/Rendezvous |
+| `addStreamPusher` | 将本地流推送至远程 RTMP(S)、RTSP(S)、SRT 或 `whip://`/`whips://` 端点；RTSP 使用 ANNOUNCE/SETUP/RECORD、Digest 与 TCP interleaved RTP，SRT 使用 MPEG-TS Caller/Rendezvous |
 | `delStreamPusher` | 停止推流 |
 | `getStreamPusherList` | 列出推流任务 |
 
@@ -359,6 +398,16 @@ cargo build --release
 
 # 运行工作区测试（包含真实网络 E2E 与 ffmpeg/ffprobe 转换矩阵）
 cargo test --workspace --tests
+
+# 快速解析器模糊冒烟（AMF/FLV/PS/MP4/WebSocket）
+cargo test --workspace fuzz_smoke
+
+# 媒体图并发压力回归
+cargo test -p zlmediakit-core --test media_graph_stress
+
+# 无丢帧端到端吞吐基线；CI 仅在低于 20k 源帧/s 时失败
+cargo run --release --locked -p zlmediakit-core --example media_graph_bench -- \
+  --frames 50000 --subscribers 4 --min-fps 20000
 
 # 验证可选 AAC → Opus 路径
 cargo test -p zlmediakit-webrtc --features aac-transcode

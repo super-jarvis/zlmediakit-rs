@@ -72,14 +72,8 @@ impl SrtServer {
         }
 
         // Bind
-        let (sockaddr, sockaddr_len) = ffi::socket_addr_to_sockaddr(&addr)?;
-        let ret = unsafe {
-            ffi::srt_bind(
-                sock,
-                &sockaddr as *const libc::sockaddr_in as *const libc::sockaddr,
-                sockaddr_len as c_int,
-            )
-        };
+        let sockaddr = ffi::socket_addr_to_sockaddr(&addr);
+        let ret = unsafe { ffi::srt_bind(sock, sockaddr.as_ptr().cast(), sockaddr.len() as c_int) };
         if ret != ffi::SRT_SUCCESS {
             let err = ffi::last_error();
             unsafe { ffi::srt_close(sock) };

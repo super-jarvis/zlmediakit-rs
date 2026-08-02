@@ -402,6 +402,28 @@ impl Fmp4Demuxer {
             } else {
                 None
             };
+            let per_sample_fields = [0x000100, 0x000200, 0x000400, 0x000800]
+                .into_iter()
+                .filter(|flag| trun_flags & flag != 0)
+                .count();
+            let per_sample_bytes = per_sample_fields * 4;
+            if per_sample_bytes > 0 {
+                let available = trun_data
+                    .len()
+                    .checked_sub(offset)
+                    .ok_or_else(|| anyhow!("CMAF trun sample table is truncated"))?;
+                if sample_count > available.checked_div(per_sample_bytes).unwrap_or(0) {
+                    bail!("CMAF trun sample count exceeds its table");
+                }
+            } else if sample_count > 0 {
+                if default_size == 0 {
+                    bail!("CMAF trun samples have no size information");
+                }
+                let available = data.len().saturating_sub(sample_offset);
+                if sample_count > available / usize::try_from(default_size)? {
+                    bail!("CMAF trun sample count exceeds available media data");
+                }
+            }
             for index in 0..sample_count {
                 let duration = if trun_flags & 0x000100 != 0 {
                     let value = read_u32(trun_data, offset)?;
@@ -437,8 +459,11 @@ impl Fmp4Demuxer {
                 } else {
                     0
                 };
+                let sample_end = sample_offset
+                    .checked_add(size)
+                    .ok_or_else(|| anyhow!("CMAF sample offset overflow"))?;
                 let sample = data
-                    .get(sample_offset..sample_offset + size)
+                    .get(sample_offset..sample_end)
                     .ok_or_else(|| anyhow!("CMAF sample data is truncated"))?;
                 let dts_ms = decode_time.saturating_mul(1000) / u64::from(track.timescale);
                 let pts_ticks = if composition_offset.is_negative() {
@@ -476,7 +501,7 @@ impl Fmp4Demuxer {
                 };
                 output.push(frame);
                 decode_time = decode_time.saturating_add(u64::from(duration));
-                sample_offset += size;
+                sample_offset = sample_end;
             }
             implicit_data_offset = sample_offset;
         }
@@ -530,6 +555,14 @@ mod tests {
         assert!(frames[0].key_frame);
         assert_eq!(frames[0].payload_format, PayloadFormat::Avcc);
         assert_eq!(&frames[0].data[..], &[0, 0, 0, 4, 0x65, 1, 2, 3]);
+
+        let mut malformed = segment.data.to_vec();
+        let trun_kind = malformed
+            .windows(4)
+            .position(|window| window == b"trun")
+            .unwrap();
+        malformed[trun_kind + 8..trun_kind + 12].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(demuxer.demux_fragment(&malformed).is_err());
     }
 
     #[test]

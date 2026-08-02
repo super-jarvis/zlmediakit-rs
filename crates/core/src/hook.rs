@@ -10,10 +10,13 @@
 //! behaviour is **fail-open** (allow).
 
 use serde::Deserialize;
-use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::{Arc, LazyLock, RwLock};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio::time::{timeout, Duration};
+use tokio_rustls::rustls;
+use tokio_rustls::TlsConnector;
 
 pub use crate::config::HookConfig;
 
@@ -38,15 +41,21 @@ pub struct HttpAccessParams<'a> {
     pub url: &'a str,
 }
 
-/// Stateless HTTP client that calls external hook URLs.
+/// HTTP client that calls external hook URLs. Its configuration is shared by
+/// all protocol sessions and can be replaced without restarting listeners.
 pub struct HookClient {
-    config: HookConfig,
+    config: RwLock<HookConfig>,
+    config_revision: watch::Sender<u64>,
 }
 
 impl HookClient {
     /// Builds a client from a `HookConfig` (typically from config file).
     pub fn new(config: HookConfig) -> Arc<Self> {
-        Arc::new(Self { config })
+        let (config_revision, _) = watch::channel(0);
+        Arc::new(Self {
+            config: RwLock::new(config),
+            config_revision,
+        })
     }
 
     /// Returns a client with no hooks configured — always allows.
@@ -55,19 +64,91 @@ impl HookClient {
         Self::new(HookConfig::default())
     }
 
+    /// Returns a point-in-time config copy. No lock guard is ever held across
+    /// a network await.
+    pub fn config_snapshot(&self) -> HookConfig {
+        self.config.read().unwrap().clone()
+    }
+
+    /// Subscribes to config revisions. Long-running schedulers use this to
+    /// wake immediately when their URL or interval changes.
+    pub fn subscribe_config_changes(&self) -> watch::Receiver<u64> {
+        self.config_revision.subscribe()
+    }
+
+    /// Applies one dotted `hook.*` key atomically. Empty hook URLs disable the
+    /// corresponding callback. URL and numeric validation happens before the
+    /// runtime config snapshot is committed by the management API.
+    pub fn set_config_value(&self, key: &str, value: &str) -> anyhow::Result<bool> {
+        macro_rules! set_url {
+            ($config:ident, $field:ident) => {{
+                let next = parse_hook_url(value)?;
+                if $config.$field == next {
+                    false
+                } else {
+                    $config.$field = next;
+                    true
+                }
+            }};
+        }
+
+        let mut config = self.config.write().unwrap();
+        let changed = match key {
+            "hook.on_publish" => set_url!(config, on_publish),
+            "hook.on_play" => set_url!(config, on_play),
+            "hook.on_stream_not_found" => set_url!(config, on_stream_not_found),
+            "hook.on_stream_none_reader" => set_url!(config, on_stream_none_reader),
+            "hook.on_stream_changed" => set_url!(config, on_stream_changed),
+            "hook.on_record_mp4" => set_url!(config, on_record_mp4),
+            "hook.on_rtsp_realm" => set_url!(config, on_rtsp_realm),
+            "hook.on_server_started" => set_url!(config, on_server_started),
+            "hook.on_server_exited" => set_url!(config, on_server_exited),
+            "hook.on_http_access" => set_url!(config, on_http_access),
+            "hook.on_flow_report" => set_url!(config, on_flow_report),
+            "hook.flow_report_interval_sec" => {
+                let next = parse_positive_u64(key, value)?;
+                let changed = config.flow_report_interval_sec != next;
+                config.flow_report_interval_sec = next;
+                changed
+            }
+            "hook.timeout_sec" => {
+                let next = parse_positive_u64(key, value)?;
+                let changed = config.timeout_sec != next;
+                config.timeout_sec = next;
+                changed
+            }
+            "hook.retry" => {
+                let next = value
+                    .parse::<u32>()
+                    .map_err(|_| anyhow::anyhow!("{key} must be an unsigned integer"))?;
+                let changed = config.retry != next;
+                config.retry = next;
+                changed
+            }
+            _ => anyhow::bail!("unsupported dynamic hook key: {key}"),
+        };
+        drop(config);
+        if changed {
+            self.config_revision
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+        Ok(changed)
+    }
+
     /// Returns `true` when no hook URLs are configured.
     pub fn is_empty(&self) -> bool {
-        self.config.on_publish.is_none()
-            && self.config.on_play.is_none()
-            && self.config.on_stream_not_found.is_none()
-            && self.config.on_stream_none_reader.is_none()
-            && self.config.on_stream_changed.is_none()
-            && self.config.on_record_mp4.is_none()
-            && self.config.on_rtsp_realm.is_none()
-            && self.config.on_server_started.is_none()
-            && self.config.on_server_exited.is_none()
-            && self.config.on_http_access.is_none()
-            && self.config.on_flow_report.is_none()
+        let config = self.config_snapshot();
+        config.on_publish.is_none()
+            && config.on_play.is_none()
+            && config.on_stream_not_found.is_none()
+            && config.on_stream_none_reader.is_none()
+            && config.on_stream_changed.is_none()
+            && config.on_record_mp4.is_none()
+            && config.on_rtsp_realm.is_none()
+            && config.on_server_started.is_none()
+            && config.on_server_exited.is_none()
+            && config.on_http_access.is_none()
+            && config.on_flow_report.is_none()
     }
 
     // ── public hook entry-points ──────────────────────────────────────
@@ -82,31 +163,34 @@ impl HookClient {
         stream: &str,
         params: &str,
     ) -> HookResult {
-        let url = match &self.config.on_publish {
+        let config = self.config_snapshot();
+        let url = match &config.on_publish {
             Some(u) => u,
             None => return HookResult::Allow,
         };
-        self.call_hook(url, vhost, app, stream, &[("params", params)])
+        self.call_hook(&config, url, vhost, app, stream, &[("params", params)])
             .await
     }
 
     /// Called before a player starts consuming a stream.
     pub async fn on_play(&self, vhost: &str, app: &str, stream: &str, params: &str) -> HookResult {
-        let url = match &self.config.on_play {
+        let config = self.config_snapshot();
+        let url = match &config.on_play {
             Some(u) => u,
             None => return HookResult::Allow,
         };
-        self.call_hook(url, vhost, app, stream, &[("params", params)])
+        self.call_hook(&config, url, vhost, app, stream, &[("params", params)])
             .await
     }
 
     /// Called when a player requests a stream that does not exist.
     pub async fn on_stream_not_found(&self, vhost: &str, app: &str, stream: &str) -> HookResult {
-        let url = match &self.config.on_stream_not_found {
+        let config = self.config_snapshot();
+        let url = match &config.on_stream_not_found {
             Some(u) => u,
             None => return HookResult::Allow,
         };
-        self.call_hook(url, vhost, app, stream, &[]).await
+        self.call_hook(&config, url, vhost, app, stream, &[]).await
     }
 
     /// Called when a published stream loses its last reader (no players).
@@ -119,11 +203,13 @@ impl HookClient {
         stream: &str,
         total_reader_count: usize,
     ) -> HookResult {
-        let url = match &self.config.on_stream_none_reader {
+        let config = self.config_snapshot();
+        let url = match &config.on_stream_none_reader {
             Some(u) => u,
             None => return HookResult::Allow,
         };
         self.call_hook(
+            &config,
             url,
             vhost,
             app,
@@ -146,11 +232,13 @@ impl HookClient {
         regist: bool,
         total_reader_count: usize,
     ) -> HookResult {
-        let url = match &self.config.on_stream_changed {
+        let config = self.config_snapshot();
+        let url = match &config.on_stream_changed {
             Some(u) => u,
             None => return HookResult::Allow,
         };
         self.call_hook(
+            &config,
             url,
             vhost,
             app,
@@ -173,11 +261,13 @@ impl HookClient {
         file_size: u64,
         time_len: f64,
     ) -> HookResult {
-        let url = match &self.config.on_record_mp4 {
+        let config = self.config_snapshot();
+        let url = match &config.on_record_mp4 {
             Some(u) => u,
             None => return HookResult::Allow,
         };
         self.call_hook(
+            &config,
             url,
             vhost,
             app,
@@ -201,21 +291,25 @@ impl HookClient {
         stream: &str,
         ip: &str,
     ) -> Option<String> {
-        let url = match &self.config.on_rtsp_realm {
+        let config = self.config_snapshot();
+        let url = match &config.on_rtsp_realm {
             Some(u) => u,
             None => return None,
         };
-        for attempt in 0..=self.config.retry {
+        for attempt in 0..=config.retry {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            match self.try_call_realm(url, vhost, app, stream, ip).await {
+            match self
+                .try_call_realm(&config, url, vhost, app, stream, ip)
+                .await
+            {
                 Ok(realm) => return realm,
                 Err(e) => {
                     tracing::warn!(
                         "Hook call attempt {}/{} to {} failed: {}",
                         attempt + 1,
-                        self.config.retry + 1,
+                        config.retry + 1,
                         url,
                         e
                     );
@@ -228,9 +322,11 @@ impl HookClient {
     /// Called once after the media server finishes starting up.
     /// `server_id` is the configured `media_server_id` (defaults to hostname).
     pub async fn on_server_started(&self, server_id: &str) {
-        if let Some(url) = &self.config.on_server_started {
+        let config = self.config_snapshot();
+        if let Some(url) = &config.on_server_started {
             let _ = self
                 .call_hook(
+                    &config,
                     url,
                     "__defaultVhost__",
                     "",
@@ -243,9 +339,11 @@ impl HookClient {
 
     /// Called once just before the media server process exits.
     pub async fn on_server_exited(&self, server_id: &str) {
-        if let Some(url) = &self.config.on_server_exited {
+        let config = self.config_snapshot();
+        if let Some(url) = &config.on_server_exited {
             let _ = self
                 .call_hook(
+                    &config,
                     url,
                     "__defaultVhost__",
                     "",
@@ -261,7 +359,8 @@ impl HookClient {
     /// `is_play` indicates a playback (FLV/HLS) request vs. a static/file
     /// request.
     pub async fn on_http_access(&self, p: HttpAccessParams<'_>) -> HookResult {
-        let hook_url = match &self.config.on_http_access {
+        let config = self.config_snapshot();
+        let hook_url = match &config.on_http_access {
             Some(u) => u,
             None => return HookResult::Allow,
         };
@@ -269,6 +368,7 @@ impl HookClient {
         // denies the request. Pass an explicit `code` expectation via extra
         // params is not needed — the server simply checks the returned code.
         self.call_hook(
+            &config,
             hook_url,
             p.vhost,
             p.app,
@@ -295,9 +395,11 @@ impl HookClient {
         readable: usize,
         writable: usize,
     ) {
-        if let Some(url) = &self.config.on_flow_report {
+        let config = self.config_snapshot();
+        if let Some(url) = &config.on_flow_report {
             let _ = self
                 .call_hook(
+                    &config,
                     url,
                     "__defaultVhost__",
                     "",
@@ -320,23 +422,24 @@ impl HookClient {
     /// persistent errors (fail-open).
     async fn call_hook(
         &self,
+        config: &HookConfig,
         url: &str,
         vhost: &str,
         app: &str,
         stream: &str,
         extra: &[(&str, &str)],
     ) -> HookResult {
-        for attempt in 0..=self.config.retry {
+        for attempt in 0..=config.retry {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            match self.try_call(url, vhost, app, stream, extra).await {
+            match self.try_call(config, url, vhost, app, stream, extra).await {
                 Ok(result) => return result,
                 Err(e) => {
                     tracing::warn!(
                         "Hook call attempt {}/{} to {} failed: {}",
                         attempt + 1,
-                        self.config.retry + 1,
+                        config.retry + 1,
                         url,
                         e
                     );
@@ -353,6 +456,7 @@ impl HookClient {
     /// Single hook attempt: connect, POST, read response, parse JSON.
     async fn try_call(
         &self,
+        config: &HookConfig,
         url: &str,
         vhost: &str,
         app: &str,
@@ -384,8 +488,8 @@ impl HookClient {
             body
         );
 
-        let dur = Duration::from_secs(self.config.timeout_sec);
-        let mut stream = timeout(dur, TcpStream::connect(parsed.addr.as_str())).await??;
+        let dur = Duration::from_secs(config.timeout_sec);
+        let mut stream = connect_hook(&parsed, dur).await?;
         timeout(dur, stream.write_all(request.as_bytes())).await??;
 
         let mut response = Vec::new();
@@ -438,6 +542,7 @@ impl HookClient {
     /// response, `None` if the hook produced no realm (use default).
     async fn try_call_realm(
         &self,
+        config: &HookConfig,
         url: &str,
         vhost: &str,
         app: &str,
@@ -465,8 +570,8 @@ impl HookClient {
             body.len(),
             body
         );
-        let dur = Duration::from_secs(self.config.timeout_sec);
-        let mut stream = timeout(dur, TcpStream::connect(parsed.addr.as_str())).await??;
+        let dur = Duration::from_secs(config.timeout_sec);
+        let mut stream = connect_hook(&parsed, dur).await?;
         timeout(dur, stream.write_all(request.as_bytes())).await??;
         let mut response = Vec::new();
         timeout(dur, stream.read_to_end(&mut response)).await??;
@@ -498,22 +603,110 @@ struct ParsedUrl {
     host: String,
     addr: String,
     path: String,
+    server_name: String,
+    tls: bool,
 }
 
 fn parse_url(url: &str) -> anyhow::Result<ParsedUrl> {
-    let url = url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://");
-    let (host_port, path) = url.split_once('/').unwrap_or((url, "/"));
-    let (host, port) = match host_port.split_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(80)),
-        None => (host_port.to_string(), 80),
+    let (tls, rest) = if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest)
+    } else if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest)
+    } else {
+        anyhow::bail!("hook URL must use http:// or https://");
+    };
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() || authority.contains('@') {
+        anyhow::bail!("hook URL must contain a host and must not contain userinfo");
+    }
+    let path = match rest.get(authority_end..) {
+        Some(value) if value.starts_with('/') => value.to_string(),
+        Some(value) if value.starts_with('?') => format!("/{value}"),
+        _ => "/".to_string(),
+    };
+    let default_port = if tls { 443 } else { 80 };
+    let (server_name, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let close = bracketed
+            .find(']')
+            .ok_or_else(|| anyhow::anyhow!("invalid bracketed IPv6 hook host"))?;
+        let host = &bracketed[..close];
+        let suffix = &bracketed[close + 1..];
+        let port = if suffix.is_empty() {
+            default_port
+        } else {
+            suffix
+                .strip_prefix(':')
+                .ok_or_else(|| anyhow::anyhow!("invalid hook URL authority"))?
+                .parse::<u16>()?
+        };
+        (host.to_string(), port)
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.contains(':') {
+            anyhow::bail!("IPv6 hook hosts must be enclosed in brackets");
+        }
+        (host.to_string(), port.parse::<u16>()?)
+    } else {
+        (authority.to_string(), default_port)
+    };
+    if server_name.is_empty() {
+        anyhow::bail!("hook URL host is empty");
+    }
+    let addr = if server_name.contains(':') {
+        format!("[{server_name}]:{port}")
+    } else {
+        format!("{server_name}:{port}")
     };
     Ok(ParsedUrl {
-        host: host_port.to_string(),
-        addr: format!("{}:{}", host, port),
-        path: format!("/{}", path),
+        host: authority.to_string(),
+        addr,
+        path,
+        server_name,
+        tls,
     })
+}
+
+fn parse_hook_url(value: &str) -> anyhow::Result<Option<String>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    parse_url(value)?;
+    Ok(Some(value.to_string()))
+}
+
+fn parse_positive_u64(key: &str, value: &str) -> anyhow::Result<u64> {
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("{key} must be a positive integer"))?;
+    if value == 0 {
+        anyhow::bail!("{key} must be greater than zero");
+    }
+    Ok(value)
+}
+
+trait HookIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T> HookIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+static HOOK_TLS_CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+});
+
+async fn connect_hook(parsed: &ParsedUrl, dur: Duration) -> anyhow::Result<Box<dyn HookIo>> {
+    let tcp = timeout(dur, TcpStream::connect(parsed.addr.as_str())).await??;
+    if !parsed.tls {
+        return Ok(Box::new(tcp));
+    }
+    let server_name = rustls::pki_types::ServerName::try_from(parsed.server_name.clone())?;
+    let connector = TlsConnector::from(HOOK_TLS_CONFIG.clone());
+    let stream = timeout(dur, connector.connect(server_name, tcp)).await??;
+    Ok(Box::new(stream))
 }
 
 // ── URL encoding ─────────────────────────────────────────────────────
@@ -569,6 +762,24 @@ mod tests {
         assert_eq!(parsed.addr, "localhost:80");
         assert_eq!(parsed.host, "localhost");
         assert_eq!(parsed.path, "/hook");
+        assert!(!parsed.tls);
+    }
+
+    #[test]
+    fn parse_https_and_ipv6_url() {
+        let parsed = parse_url("https://example.com/hook?token=one").unwrap();
+        assert_eq!(parsed.addr, "example.com:443");
+        assert_eq!(parsed.server_name, "example.com");
+        assert_eq!(parsed.path, "/hook?token=one");
+        assert!(parsed.tls);
+
+        let parsed = parse_url("http://[::1]:8080/hook").unwrap();
+        assert_eq!(parsed.addr, "[::1]:8080");
+        assert_eq!(parsed.server_name, "::1");
+        assert_eq!(parsed.host, "[::1]:8080");
+        assert!(!parsed.tls);
+
+        assert!(parse_url("ftp://example.com/hook").is_err());
     }
 
     #[test]
@@ -624,6 +835,49 @@ mod tests {
             rt.block_on(client.on_rtsp_realm("v", "a", "s", "1.2.3.4")),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn hook_config_updates_take_effect_without_recreating_client() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 2048];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST /play HTTP/1.0"));
+            let body = r#"{"code":-1,"msg":"rotated deny"}"#;
+            let response = format!(
+                "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let client = HookClient::empty();
+        let mut revision = client.subscribe_config_changes();
+        let url = format!("http://{addr}/play");
+        assert!(client.set_config_value("hook.on_play", &url).unwrap());
+        revision.changed().await.unwrap();
+        assert_eq!(
+            client.config_snapshot().on_play.as_deref(),
+            Some(url.as_str())
+        );
+        assert_eq!(
+            client.on_play("v", "a", "s", "token=1").await,
+            HookResult::Deny("rotated deny".to_string())
+        );
+        server.await.unwrap();
+
+        assert!(client.set_config_value("hook.on_play", "").unwrap());
+        assert_eq!(client.on_play("v", "a", "s", "").await, HookResult::Allow);
+        assert!(client
+            .set_config_value("hook.timeout_sec", "not-a-number")
+            .is_err());
+        assert!(client.set_config_value("hook.timeout_sec", "0").is_err());
+        assert_eq!(client.config_snapshot().timeout_sec, 5);
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub mod payload;
 pub mod ps;
 pub mod recorder;
 pub mod rtp;
+pub mod sdk;
 pub mod session;
 pub mod signal;
 pub mod stream_proxy;
@@ -41,6 +42,7 @@ pub use rtp::{
     RtpDataType, RtpFrameMuxer, RtpMuxerFactory, RtpPacketizer, RtpSendRequest, RtpSenderInfo,
     RtpSenderManager,
 };
+pub use sdk::{EmbeddedMediaKit, EmbeddedPublisher, EmbeddedSubscription, SourceSnapshot};
 pub use session::{SessionId, SessionManager};
 pub use stream_proxy::{ProxyCmd, ProxyEntry, StreamProxyControl};
 pub use stream_pusher::{PusherCmd, PusherEntry, StreamPusherControl};

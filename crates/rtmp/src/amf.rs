@@ -192,3 +192,38 @@ impl AmfDecoder {
         Ok(pairs)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mutation(seed: u64, max_len: usize) -> Vec<u8> {
+        let len = (seed as usize).wrapping_mul(73) % (max_len + 1);
+        let mut state = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fuzz_smoke_amf_decoder_never_panics() {
+        let valid = [0x02, 0, 3, b'f', b'o', b'o', 0x01, 0x01, 0x05];
+        for len in 0..=valid.len() {
+            let _ = AmfDecoder::decode(&valid[..len]);
+        }
+        for index in 0..valid.len() {
+            let mut mutated = valid;
+            mutated[index] ^= 0xff;
+            let _ = AmfDecoder::decode(&mutated);
+        }
+        for seed in 0..2_048 {
+            let data = mutation(seed, 1_024);
+            let _ = AmfDecoder::decode(&data);
+        }
+    }
+}

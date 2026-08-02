@@ -22,13 +22,14 @@ use zlmediakit_flv::FlvRecorder;
 use zlmediakit_hls::{HlsRecorder, TsLiveMuxer};
 use zlmediakit_http::{HttpServer, HttpServerConfig};
 use zlmediakit_mp4::recorder::Mp4Recorder;
+use zlmediakit_mp4::Mp4VodLibrary;
 use zlmediakit_rtmp::pull_client as rtmp_pull_client;
 use zlmediakit_rtmp::push_client as rtmp_push_client;
 use zlmediakit_rtmp::RtmpServer;
 use zlmediakit_rtsp::rtsp_pull_start;
 use zlmediakit_rtsp::RtspServer;
 use zlmediakit_srt::{Gb28181Server, RtpServerManager, SipServer, SrtServer, SrtServerConfig};
-use zlmediakit_webrtc::WebRtcServer;
+use zlmediakit_webrtc::{WebRtcServer, WebRtcTransportConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "zlmediakit")]
@@ -92,6 +93,9 @@ async fn main() -> Result<()> {
     if let Some(p) = config.http.port {
         config.http_port = p;
     }
+    if let Some(p) = config.webrtc.port {
+        config.webrtc_port = p;
+    }
 
     if let Some(port) = cli.rtmp_port {
         config.rtmp_port = port;
@@ -112,6 +116,11 @@ async fn main() -> Result<()> {
     // Keep the management API snapshot aligned with the effective startup
     // configuration, including config-file values and CLI port overrides.
     zlmediakit_core::config::sync_runtime_config(&config);
+
+    let listen_ip: std::net::IpAddr = config
+        .listen_ip
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid listen_ip {:?}: {error}", config.listen_ip))?;
 
     let event_bus = Arc::new(EventBus::new(1024));
     let source_manager = Arc::new(MediaSourceManager::new(Some(event_bus.clone())));
@@ -135,19 +144,32 @@ async fn main() -> Result<()> {
     let (proxy_control, proxy_active, proxy_cmd_rx) = StreamProxyControl::new();
     let proxy_control = Arc::new(proxy_control);
 
-    // Enable edge auto-pull when an origin URL is configured. A play request
-    // for a stream that is not available locally will transparently pull it
-    // from the origin server.
-    if let Some(origin_url) = &config.cluster.origin_url {
-        if !origin_url.is_empty() {
-            source_manager.set_origin_pull(
-                proxy_control.clone(),
-                origin_url.clone(),
-                config.cluster.origin_vhost.clone(),
-                config.cluster.origin_app.clone(),
-            );
-            info!("edge auto-pull enabled, origin={}", origin_url);
+    // Enable edge auto-pull with ordered origin failover. Keep the legacy
+    // single origin as the first candidate for backwards compatibility.
+    let mut origins = Vec::new();
+    if let Some(origin) = config
+        .cluster
+        .origin_url
+        .as_ref()
+        .filter(|origin| !origin.trim().is_empty())
+    {
+        origins.push(origin.trim().to_owned());
+    }
+    for origin in &config.cluster.origin_urls {
+        let origin = origin.trim();
+        if !origin.is_empty() && !origins.iter().any(|candidate| candidate == origin) {
+            origins.push(origin.to_owned());
         }
+    }
+    if !origins.is_empty() {
+        source_manager.set_origin_pulls(
+            proxy_control.clone(),
+            origins.clone(),
+            config.cluster.origin_vhost.clone(),
+            config.cluster.origin_app.clone(),
+            Duration::from_millis(config.cluster.origin_timeout_ms.max(1)),
+        );
+        info!("edge auto-pull enabled, origins={origins:?}");
     }
 
     let (pusher_control, pusher_active, pusher_cmd_rx) = StreamPusherControl::new();
@@ -178,6 +200,7 @@ async fn main() -> Result<()> {
     // moved into the recorder supervisor).
     let http_record_root = record_base.clone();
     let api_record_root = record_base.clone();
+    let vod_library = Arc::new(Mp4VodLibrary::new(&record_base));
     // Static file web root: only enabled when dir_root is true in config.
     // When `www_root` is empty/relative, fall back to the bundled `www/`
     // directory shipped with the source tree so `cargo run` works out of the
@@ -206,16 +229,18 @@ async fn main() -> Result<()> {
     let ssl_key = config.http.ssl_key.clone();
 
     if config.rtmp.enabled {
-        let addr = format!("0.0.0.0:{}", config.rtmp_port);
+        let addr = std::net::SocketAddr::new(listen_ip, config.rtmp_port).to_string();
         let sm = source_manager.clone();
         let eb = event_bus.clone();
         let rtmp_auth = auth.clone();
         let rtmp_hook = hook.clone();
         let rtmp_cert = config.rtmp.ssl_cert.clone();
         let rtmp_key = config.rtmp.ssl_key.clone();
+        let rtmp_vod = vod_library.clone();
         let handle = tokio::spawn(async move {
             match RtmpServer::new(&addr, sm, eb, rtmp_auth, rtmp_hook, rtmp_cert, rtmp_key).await {
                 Ok(server) => {
+                    let server = server.with_vod_library(rtmp_vod);
                     if let Err(e) = server.run().await {
                         error!("RTMP server error: {}", e);
                     }
@@ -227,13 +252,14 @@ async fn main() -> Result<()> {
     }
 
     if config.rtsp.enabled {
-        let addr = format!("0.0.0.0:{}", config.rtsp_port);
+        let addr = std::net::SocketAddr::new(listen_ip, config.rtsp_port).to_string();
         let sm = source_manager.clone();
         let eb = event_bus.clone();
         let rtsp_auth = auth.clone();
         let rtsp_cert = config.rtsp.ssl_cert.clone();
         let rtsp_key = config.rtsp.ssl_key.clone();
         let rtsp_hook = hook.clone();
+        let rtsp_vod = vod_library.clone();
         let handle = tokio::spawn(async move {
             match RtspServer::new(
                 &addr,
@@ -247,6 +273,7 @@ async fn main() -> Result<()> {
             .await
             {
                 Ok(server) => {
+                    let server = server.with_vod_library(rtsp_vod);
                     if let Err(e) = server.run().await {
                         error!("RTSP server error: {}", e);
                     }
@@ -261,7 +288,9 @@ async fn main() -> Result<()> {
     let mut gb28181_rtp: Option<Arc<RtpServerManager>> = None;
     let mut gb28181_sip: Option<Arc<SipServer>> = None;
     if config.gb28181.enabled {
-        match Gb28181Server::start(&config.gb28181, source_manager.clone()).await {
+        match Gb28181Server::start_with_bind_ip(&config.gb28181, source_manager.clone(), listen_ip)
+            .await
+        {
             Ok(srv) => {
                 gb28181_rtp = Some(srv.rtp.clone());
                 gb28181_sip = Some(srv.sip.clone());
@@ -286,7 +315,7 @@ async fn main() -> Result<()> {
         Some(Arc::new(zlmediakit_core::session::SessionManager::new()));
 
     if config.http.enabled {
-        let addr = format!("0.0.0.0:{}", config.http_port);
+        let addr = std::net::SocketAddr::new(listen_ip, config.http_port).to_string();
         let sm = source_manager.clone();
         let http_rtp_sender = rtp_sender.clone();
         let http_auth = auth.clone();
@@ -339,7 +368,7 @@ async fn main() -> Result<()> {
     // both /index/api/* and media playback). Bind it on its own port too so
     // the --api-port flag is honoured, unless it collides with http_port.
     if config.http.enabled && config.api_port != config.http_port {
-        let addr = format!("0.0.0.0:{}", config.api_port);
+        let addr = std::net::SocketAddr::new(listen_ip, config.api_port).to_string();
         let sm = source_manager.clone();
         let api_rtp_sender = rtp_sender.clone();
         let api_auth = auth.clone();
@@ -392,11 +421,33 @@ async fn main() -> Result<()> {
     // over WebRTC. It binds its own HTTP listener (WHEP is HTTP-based) so the
     // `http` protocol crate stays decoupled from the `webrtc` crate.
     if config.webrtc.enabled {
-        let addr = format!("0.0.0.0:{}", config.webrtc_port);
+        let addr = std::net::SocketAddr::new(listen_ip, config.webrtc_port).to_string();
         let sm = source_manager.clone();
         let ice_servers = config.webrtc.ice_servers.clone();
+        let ice_port = config.webrtc.ice_port.unwrap_or(config.webrtc_port);
+        let ice_bind_ip = config.webrtc.ice_bind_ip.clone();
+        let ice_lite = config.webrtc.ice_lite;
+        let external_ips = config.webrtc.external_ips.clone();
         let handle = tokio::spawn(async move {
-            match WebRtcServer::new(&addr, sm, ice_servers).await {
+            let ice_bind_addr = match ice_bind_ip.parse::<std::net::IpAddr>() {
+                Ok(ip) => std::net::SocketAddr::new(ip, ice_port),
+                Err(e) => {
+                    error!("Invalid WebRTC ice_bind_ip {ice_bind_ip:?}: {e}");
+                    return;
+                }
+            };
+            match WebRtcServer::new_with_transport(
+                &addr,
+                sm,
+                ice_servers,
+                WebRtcTransportConfig {
+                    udp_bind_addr: ice_bind_addr,
+                    ice_lite,
+                    external_ips,
+                },
+            )
+            .await
+            {
                 Ok(server) => {
                     if let Err(e) = server.run().await {
                         error!("WebRTC server error: {}", e);
@@ -414,7 +465,7 @@ async fn main() -> Result<()> {
     let mut stop_signals: Vec<Arc<AtomicBool>> = Vec::new();
 
     if config.srt.enabled {
-        let srt_addr = format!("0.0.0.0:{}", config.srt.port);
+        let srt_addr = std::net::SocketAddr::new(listen_ip, config.srt.port).to_string();
         let srt_sm = source_manager.clone();
         let srt_stop = Arc::new(AtomicBool::new(false));
         stop_signals.push(srt_stop.clone());
@@ -468,9 +519,28 @@ async fn main() -> Result<()> {
     {
         let sup_sm = source_manager.clone();
         let sup_active = proxy_active.clone();
+        let sup_ice_servers = config.webrtc.ice_servers.clone();
         info!("Stream proxy supervisor started");
         let handle = tokio::spawn(async move {
-            run_proxy_supervisor(proxy_cmd_rx, sup_sm, sup_active).await;
+            run_proxy_supervisor(proxy_cmd_rx, sup_sm, sup_active, sup_ice_servers).await;
+        });
+        handles.push(handle);
+    }
+
+    // Transient edge pulls stay alive while at least one persistent player is
+    // attached. The grace period absorbs short reconnects/channel switches.
+    {
+        let sup_event = event_bus.clone();
+        let sup_sm = source_manager.clone();
+        let sup_proxy = proxy_control.clone();
+        let sup_hook = hook.clone();
+        let no_reader_delay = Duration::from_secs(config.general.stream_none_reader_delay);
+        info!(
+            "On-demand pull lifecycle supervisor started (no-reader delay={}s)",
+            no_reader_delay.as_secs()
+        );
+        let handle = tokio::spawn(async move {
+            run_no_reader_supervisor(sup_event, sup_sm, sup_proxy, sup_hook, no_reader_delay).await;
         });
         handles.push(handle);
     }
@@ -502,9 +572,10 @@ async fn main() -> Result<()> {
         let sup_sm = source_manager.clone();
         let sup_eb = event_bus.clone();
         let sup_active = pusher_active.clone();
+        let sup_ice_servers = config.webrtc.ice_servers.clone();
         info!("Stream pusher supervisor started");
         let handle = tokio::spawn(async move {
-            run_pusher_supervisor(pusher_cmd_rx, sup_eb, sup_sm, sup_active).await;
+            run_pusher_supervisor(pusher_cmd_rx, sup_eb, sup_sm, sup_active, sup_ice_servers).await;
         });
         handles.push(handle);
     }
@@ -542,22 +613,33 @@ async fn main() -> Result<()> {
     let server_id = config.media_server_id.clone();
     hook.on_server_started(&server_id).await;
 
-    // Periodic traffic report hook (fail-open). Runs until the process exits.
-    if config.hook.on_flow_report.is_some() {
+    // Periodic traffic report hook (fail-open). The task always exists so an
+    // initially-disabled callback can be enabled at runtime. Config revisions
+    // wake the timer immediately, including interval changes.
+    {
         let flow_hook = hook.clone();
         let flow_sid = server_id.clone();
         let flow_sm = source_manager.clone();
         let flow_sessions = session_mgr.clone();
-        let interval = config.hook.flow_report_interval_sec.max(1);
+        let mut config_changes = flow_hook.subscribe_config_changes();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(interval)).await;
-                let (bytes_in, bytes_out) = flow_sm.total_traffic();
-                let readable = flow_sm.source_count();
-                let writable = flow_sessions.as_ref().map(|s| s.count()).unwrap_or(0);
-                flow_hook
-                    .on_flow_report(&flow_sid, bytes_in, bytes_out, readable, writable)
-                    .await;
+                let interval = flow_hook.config_snapshot().flow_report_interval_sec.max(1);
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(interval)) => {
+                        let (bytes_in, bytes_out) = flow_sm.total_traffic();
+                        let readable = flow_sm.source_count();
+                        let writable = flow_sessions.as_ref().map(|s| s.count()).unwrap_or(0);
+                        flow_hook
+                            .on_flow_report(&flow_sid, bytes_in, bytes_out, readable, writable)
+                            .await;
+                    }
+                    changed = config_changes.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
             }
         });
     }
@@ -807,6 +889,7 @@ async fn run_proxy_supervisor(
     mut cmd_rx: mpsc::UnboundedReceiver<ProxyCmd>,
     source_manager: Arc<MediaSourceManager>,
     active: ProxyTable,
+    ice_servers: Vec<zlmediakit_core::config::IceServer>,
 ) {
     while let Some(cmd) = cmd_rx.recv().await {
         let ProxyCmd {
@@ -820,17 +903,41 @@ async fn run_proxy_supervisor(
         let key = format!("{}/{}/{}", vhost, app, stream);
         let sm = source_manager.clone();
         let active = active.clone();
+        let ice_servers = ice_servers.clone();
+        let task_marker = stopped.clone();
         tokio::spawn(async move {
             info!("stream proxy task start: {} -> {}", url, key);
-            if url.starts_with("rtmp://") || url.starts_with("rtmps://") {
+            if url.starts_with("whep://") || url.starts_with("wheps://") {
+                if let Err(e) = zlmediakit_webrtc::pull_client::start(
+                    &url,
+                    &vhost,
+                    &app,
+                    &stream,
+                    sm.clone(),
+                    ice_servers,
+                    stop,
+                    stopped,
+                )
+                .await
+                {
+                    warn!("WHEP proxy task error {}: {}", key, e);
+                }
+            } else if url.starts_with("rtmp://") || url.starts_with("rtmps://") {
                 if let Err(e) =
-                    rtmp_pull_client::start(&url, &vhost, &app, &stream, sm, stop, stopped).await
+                    rtmp_pull_client::start(&url, &vhost, &app, &stream, sm.clone(), stop, stopped)
+                        .await
                 {
                     warn!("RTMP proxy task error {}: {}", key, e);
                 }
             } else if url.starts_with("http://") || url.starts_with("https://") {
                 if let Err(e) = zlmediakit_http::pull_client::start(
-                    &url, &vhost, &app, &stream, sm, stop, stopped,
+                    &url,
+                    &vhost,
+                    &app,
+                    &stream,
+                    sm.clone(),
+                    stop,
+                    stopped,
                 )
                 .await
                 {
@@ -838,7 +945,13 @@ async fn run_proxy_supervisor(
                 }
             } else if url.starts_with("srt://") {
                 if let Err(e) = zlmediakit_srt::pull_client::start(
-                    &url, &vhost, &app, &stream, sm, stop, stopped,
+                    &url,
+                    &vhost,
+                    &app,
+                    &stream,
+                    sm.clone(),
+                    stop,
+                    stopped,
                 )
                 .await
                 {
@@ -846,14 +959,86 @@ async fn run_proxy_supervisor(
                 }
             } else {
                 if let Err(e) =
-                    rtsp_pull_start(&url, &vhost, &app, &stream, sm, stop, stopped).await
+                    rtsp_pull_start(&url, &vhost, &app, &stream, sm.clone(), stop, stopped).await
                 {
                     warn!("stream proxy task error {}: {}", key, e);
                 }
             }
             info!("stream proxy task end: {}", key);
-            active.remove(&key);
+            if active
+                .remove_if(&key, |_, entry| entry.belongs_to(&task_marker))
+                .is_some()
+            {
+                sm.close_stream(&vhost, &app, &stream);
+            }
         });
+    }
+}
+
+/// Stops an on-demand edge pull after its final persistent player has been
+/// gone for the configured grace period. A returning player cancels the
+/// pending stop; persistent config/API proxies are deliberately unaffected.
+async fn run_no_reader_supervisor(
+    event_bus: Arc<EventBus>,
+    source_manager: Arc<MediaSourceManager>,
+    proxy: Arc<StreamProxyControl>,
+    hook: Arc<HookClient>,
+    delay: Duration,
+) {
+    let mut events = event_bus.subscribe();
+    let mut pending = std::collections::HashMap::<String, tokio::task::JoinHandle<()>>::new();
+
+    loop {
+        match events.recv().await {
+            Ok(Event::StreamPlay { source_id, .. }) => {
+                if let Some(task) = pending.remove(&source_id) {
+                    task.abort();
+                }
+            }
+            Ok(Event::NoReader { source_id }) => {
+                if let Some(task) = pending.remove(&source_id) {
+                    task.abort();
+                }
+                let Some((vhost, app, stream)) = split_source_id(&source_id) else {
+                    continue;
+                };
+                let sm = source_manager.clone();
+                let control = proxy.clone();
+                let hook = hook.clone();
+                let task_source_id = source_id.clone();
+                let task = tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let Some(source) = sm.get(&vhost, &app, &stream) else {
+                        return;
+                    };
+                    if source.subscriber_count().await != 0
+                        || !control.is_on_demand(&vhost, &app, &stream)
+                    {
+                        return;
+                    }
+
+                    let _ = hook.on_stream_none_reader(&vhost, &app, &stream, 0).await;
+
+                    let still_same_source = sm
+                        .get(&vhost, &app, &stream)
+                        .is_some_and(|current| Arc::ptr_eq(&current, &source));
+                    if still_same_source
+                        && source.subscriber_count().await == 0
+                        && control.is_on_demand(&vhost, &app, &stream)
+                        && control.remove(&vhost, &app, &stream)
+                    {
+                        sm.close_stream(&vhost, &app, &stream);
+                        info!("stopped idle on-demand pull: {task_source_id}");
+                    }
+                });
+                pending.insert(source_id, task);
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!("no-reader supervisor lagged by {skipped} events");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
     }
 }
 
@@ -865,6 +1050,7 @@ async fn run_pusher_supervisor(
     event_bus: Arc<EventBus>,
     source_manager: Arc<MediaSourceManager>,
     active: PusherTable,
+    ice_servers: Vec<zlmediakit_core::config::IceServer>,
 ) {
     use std::collections::HashMap;
     use tokio::sync::Notify;
@@ -882,7 +1068,12 @@ async fn run_pusher_supervisor(
                         let key = format!("{}/{}/{}", c.vhost, c.app, c.stream);
                         // Check if the stream is already live.
                         if source_manager.get(&c.vhost, &c.app, &c.stream).is_some() {
-                            spawn_push_task(c, source_manager.clone(), active.clone());
+                            spawn_push_task(
+                                c,
+                                source_manager.clone(),
+                                active.clone(),
+                                ice_servers.clone(),
+                            );
                         } else {
                             pending.insert(key, (c.dst_url, c.stop, c.stopped));
                         }
@@ -903,7 +1094,12 @@ async fn run_pusher_supervisor(
                                 stop,
                                 stopped,
                             };
-                            spawn_push_task(cmd, source_manager.clone(), active.clone());
+                            spawn_push_task(
+                                cmd,
+                                source_manager.clone(),
+                                active.clone(),
+                                ice_servers.clone(),
+                            );
                         }
                     }
                     Ok(Event::StreamUnPublish { .. }) => {}
@@ -916,14 +1112,31 @@ async fn run_pusher_supervisor(
     }
 }
 
-fn spawn_push_task(cmd: PusherCmd, source_manager: Arc<MediaSourceManager>, active: PusherTable) {
+fn spawn_push_task(
+    cmd: PusherCmd,
+    source_manager: Arc<MediaSourceManager>,
+    active: PusherTable,
+    ice_servers: Vec<zlmediakit_core::config::IceServer>,
+) {
     let key = format!("{}/{}/{}", cmd.vhost, cmd.app, cmd.stream);
     tokio::spawn(async move {
         info!(
             "Stream pusher: {}/{}/{} -> {}",
             cmd.vhost, cmd.app, cmd.stream, cmd.dst_url
         );
-        let result = if cmd.dst_url.starts_with("rtsp://") || cmd.dst_url.starts_with("rtsps://") {
+        let result = if cmd.dst_url.starts_with("whip://") || cmd.dst_url.starts_with("whips://") {
+            zlmediakit_webrtc::push_client::start(
+                &cmd.dst_url,
+                &cmd.vhost,
+                &cmd.app,
+                &cmd.stream,
+                source_manager,
+                ice_servers,
+                cmd.stop,
+                cmd.stopped,
+            )
+            .await
+        } else if cmd.dst_url.starts_with("rtsp://") || cmd.dst_url.starts_with("rtsps://") {
             zlmediakit_rtsp::rtsp_push_start(
                 &cmd.dst_url,
                 &cmd.vhost,
@@ -1034,66 +1247,257 @@ async fn run_ffmpeg_supervisor(
     }
 }
 
-/// Watches the EventBus for `StreamPublish` events and pushes the stream
-/// to configured cluster peers via RTMP push.
+struct ClusterRelayTask {
+    stop: Arc<Notify>,
+    stopped: Arc<AtomicBool>,
+}
+
+/// Watches stream lifecycle events, starts one relay per matching peer and
+/// keeps it connected with bounded exponential backoff until unpublish.
 async fn run_cluster_push_relay(
     event_bus: Arc<EventBus>,
     source_manager: Arc<MediaSourceManager>,
     peers: Vec<zlmediakit_core::config::ClusterPeerConfig>,
 ) {
     let mut rx = event_bus.subscribe();
+    let mut tasks = std::collections::HashMap::<String, ClusterRelayTask>::new();
     info!("Cluster push relay supervisor started");
 
     loop {
         match rx.recv().await {
             Ok(Event::StreamPublish {
-                vhost, app, stream, ..
+                source_id,
+                vhost,
+                app,
+                stream,
             }) => {
-                for peer in &peers {
-                    let _peer_vhost = if peer.vhost.is_empty() {
-                        &vhost
-                    } else {
-                        &peer.vhost
-                    };
-                    let peer_app = if peer.app.is_empty() {
-                        "live"
-                    } else {
-                        &peer.app
-                    };
-                    let push_url =
-                        format!("{}/{}/{}", peer.url.trim_end_matches('/'), peer_app, stream);
+                for (peer_index, peer) in peers.iter().enumerate() {
+                    if !cluster_peer_matches(peer, &vhost, &app) {
+                        continue;
+                    }
+                    let task_key = format!("{source_id}#{peer_index}");
+                    if tasks.contains_key(&task_key) {
+                        continue;
+                    }
+                    let push_url = render_cluster_push_url(&peer.url, &vhost, &app, &stream);
 
                     let sm = source_manager.clone();
                     let src_vhost = vhost.clone();
                     let src_app = app.clone();
                     let src_stream = stream.clone();
+                    let stop = Arc::new(Notify::new());
+                    let stopped = Arc::new(AtomicBool::new(false));
 
+                    let task_stop = stop.clone();
+                    let task_stopped = stopped.clone();
                     tokio::spawn(async move {
-                        info!("Cluster push: {}/{} -> {}", src_app, src_stream, push_url);
-                        let stop = Arc::new(tokio::sync::Notify::new());
-                        let stopped = Arc::new(AtomicBool::new(false));
-                        if let Err(e) = rtmp_push_client::start(
+                        run_cluster_relay_task(
                             &push_url,
                             &src_vhost,
                             &src_app,
                             &src_stream,
                             sm,
-                            stop,
-                            stopped,
+                            task_stop,
+                            task_stopped,
                         )
-                        .await
-                        {
-                            warn!(
-                                "Cluster push {}/{} -> {} failed: {}",
-                                src_app, src_stream, push_url, e
-                            );
-                        }
+                        .await;
                     });
+                    tasks.insert(task_key, ClusterRelayTask { stop, stopped });
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Ok(Event::StreamUnPublish { source_id, .. }) => {
+                let prefix = format!("{source_id}#");
+                let keys = tasks
+                    .keys()
+                    .filter(|key| key.starts_with(&prefix))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for key in keys {
+                    if let Some(task) = tasks.remove(&key) {
+                        task.stopped.store(true, Ordering::SeqCst);
+                        task.stop.notify_waiters();
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!("cluster relay supervisor lagged by {skipped} events");
+            }
             Err(_) => break,
             _ => {}
         }
+    }
+
+    for (_, task) in tasks {
+        task.stopped.store(true, Ordering::SeqCst);
+        task.stop.notify_waiters();
+    }
+}
+
+fn cluster_peer_matches(
+    peer: &zlmediakit_core::config::ClusterPeerConfig,
+    vhost: &str,
+    app: &str,
+) -> bool {
+    (peer.vhost.is_empty() || peer.vhost == vhost) && (peer.app.is_empty() || peer.app == app)
+}
+
+fn render_cluster_push_url(base: &str, vhost: &str, app: &str, stream: &str) -> String {
+    if base.contains("{vhost}") || base.contains("{app}") || base.contains("{stream}") {
+        base.replace("{vhost}", vhost)
+            .replace("{app}", app)
+            .replace("{stream}", stream)
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), stream)
+    }
+}
+
+async fn run_cluster_relay_task(
+    push_url: &str,
+    vhost: &str,
+    app: &str,
+    stream: &str,
+    source_manager: Arc<MediaSourceManager>,
+    stop: Arc<Notify>,
+    stopped: Arc<AtomicBool>,
+) {
+    let mut retry_delay = Duration::from_secs(1);
+    while !stopped.load(Ordering::SeqCst) && source_manager.get(vhost, app, stream).is_some() {
+        info!("Cluster push: {app}/{stream} -> {push_url}");
+        let attempt = tokio::select! {
+            _ = stop.notified() => {
+                stopped.store(true, Ordering::SeqCst);
+                break;
+            }
+            result = rtmp_push_client::start(
+                push_url,
+                vhost,
+                app,
+                stream,
+                source_manager.clone(),
+                stop.clone(),
+                stopped.clone(),
+            ) => result,
+        };
+        if stopped.load(Ordering::SeqCst) {
+            break;
+        }
+        match attempt {
+            Ok(()) => warn!("Cluster push {app}/{stream} -> {push_url} disconnected"),
+            Err(error) => warn!("Cluster push {app}/{stream} -> {push_url} failed: {error}"),
+        }
+        if source_manager.get(vhost, app, stream).is_none() {
+            break;
+        }
+        tokio::select! {
+            _ = stop.notified() => {
+                stopped.store(true, Ordering::SeqCst);
+                break;
+            }
+            _ = tokio::time::sleep(retry_delay) => {}
+        }
+        retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+    }
+    info!("Cluster push stopped: {app}/{stream} -> {push_url}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cluster_peer_filters_local_stream_and_renders_remote_url() {
+        let peer = zlmediakit_core::config::ClusterPeerConfig {
+            url: "rtmp://backup:1935/archive".to_string(),
+            vhost: "tenant-a".to_string(),
+            app: "live".to_string(),
+        };
+        assert!(cluster_peer_matches(&peer, "tenant-a", "live"));
+        assert!(!cluster_peer_matches(&peer, "tenant-b", "live"));
+        assert!(!cluster_peer_matches(&peer, "tenant-a", "camera"));
+        assert_eq!(
+            render_cluster_push_url(&peer.url, "tenant-a", "live", "front"),
+            "rtmp://backup:1935/archive/front"
+        );
+        assert_eq!(
+            render_cluster_push_url(
+                "rtmp://backup:1935/{vhost}/{app}/{stream}",
+                "tenant-a",
+                "live",
+                "front"
+            ),
+            "rtmp://backup:1935/tenant-a/live/front"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_relay_retry_wait_is_cancellable() {
+        let source_manager = Arc::new(MediaSourceManager::new(None));
+        source_manager.get_or_create("__defaultVhost__", "live", "camera");
+        let stop = Arc::new(Notify::new());
+        let stopped = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(run_cluster_relay_task(
+            "rtmp://127.0.0.1:1/live/camera",
+            "__defaultVhost__",
+            "live",
+            "camera",
+            source_manager,
+            stop.clone(),
+            stopped.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stopped.store(true, Ordering::SeqCst);
+        stop.notify_waiters();
+        tokio::time::timeout(Duration::from_millis(300), task)
+            .await
+            .expect("relay should stop during reconnect backoff")
+            .expect("relay task should not panic");
+    }
+
+    #[tokio::test]
+    async fn returning_reader_cancels_idle_edge_pull_shutdown() {
+        let event_bus = Arc::new(EventBus::new(32));
+        let source_manager = Arc::new(MediaSourceManager::new(Some(event_bus.clone())));
+        let (proxy, _active, _commands) = StreamProxyControl::new();
+        let proxy = Arc::new(proxy);
+        assert!(proxy.add_on_demand(
+            "rtmp://origin/live/camera",
+            "__defaultVhost__",
+            "live",
+            "camera"
+        ));
+        let source = source_manager.get_or_create("__defaultVhost__", "live", "camera");
+
+        let supervisor = tokio::spawn(run_no_reader_supervisor(
+            event_bus,
+            source_manager.clone(),
+            proxy.clone(),
+            HookClient::empty(),
+            Duration::from_millis(40),
+        ));
+        tokio::task::yield_now().await;
+
+        let first = source
+            .register_subscriber("http-flv:first".to_string())
+            .await;
+        first.close().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let second = source
+            .register_subscriber("ws-flv:second".to_string())
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(proxy.is_active("__defaultVhost__", "live", "camera"));
+        assert!(source_manager
+            .get("__defaultVhost__", "live", "camera")
+            .is_some());
+        assert_eq!(source.subscriber_count().await, 1);
+
+        second.close().await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!proxy.is_active("__defaultVhost__", "live", "camera"));
+        assert!(source_manager
+            .get("__defaultVhost__", "live", "camera")
+            .is_none());
+        supervisor.abort();
     }
 }

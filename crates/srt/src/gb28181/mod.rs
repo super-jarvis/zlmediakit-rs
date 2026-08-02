@@ -32,6 +32,19 @@ impl Gb28181Server {
         config: &Gb28181Config,
         manager: Arc<MediaSourceManager>,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::start_with_bind_ip(
+            config,
+            manager,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        )
+        .await
+    }
+
+    pub async fn start_with_bind_ip(
+        config: &Gb28181Config,
+        manager: Arc<MediaSourceManager>,
+        bind_ip: std::net::IpAddr,
+    ) -> anyhow::Result<Arc<Self>> {
         let sip_cfg = SipServerConfig {
             sip_port: config.sip_port,
             realm: config.realm.clone(),
@@ -40,7 +53,7 @@ impl Gb28181Server {
             media_port_base: config.media_port,
             vhost: "__defaultVhost__".to_string(),
         };
-        let sip = SipServer::new(sip_cfg, manager, config.media_port).await?;
+        let sip = SipServer::new_with_bind_ip(sip_cfg, manager, config.media_port, bind_ip).await?;
         let rtp = sip.rtp_manager();
         let sip_clone = sip.clone();
         tokio::spawn(async move {

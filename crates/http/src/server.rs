@@ -12,7 +12,7 @@ use zlmediakit_core::rtp::RtpSenderManager;
 use zlmediakit_core::session::SessionManager;
 use zlmediakit_core::stream_proxy::StreamProxyControl;
 use zlmediakit_core::stream_pusher::StreamPusherControl;
-use zlmediakit_core::transport::{load_tls_config, TlsAcceptor, TransportStream};
+use zlmediakit_core::transport::{load_tls_config, ReloadableTlsAcceptor, TransportStream};
 use zlmediakit_srt::{RtpServerManager, SipServer};
 use zlmediakit_transcode::TranscodeManager;
 
@@ -42,7 +42,7 @@ pub struct HttpServerConfig {
 
 pub struct HttpServer {
     listener: TcpListener,
-    tls: Option<TlsAcceptor>,
+    tls: Option<Arc<ReloadableTlsAcceptor>>,
     source_manager: Arc<MediaSourceManager>,
     rtp_sender: Arc<RtpSenderManager>,
     auth: Arc<StreamAuth>,

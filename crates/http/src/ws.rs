@@ -14,6 +14,7 @@ use zlmediakit_core::transport::TransportStream;
 use zlmediakit_flv::FlvMuxer;
 use zlmediakit_hls::TsLiveMuxer;
 use zlmediakit_mp4::fmp4::Fmp4Muxer;
+use zlmediakit_mp4::{Mp4VodLibrary, VodAsset, VodPacer};
 
 const MAGIC_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -155,26 +156,36 @@ impl WsFrame {
 
 pub struct WsSession {
     stream: TransportStream,
+    peer_addr: String,
     read_buf: BytesMut,
     source_manager: Arc<MediaSourceManager>,
     auth: Arc<StreamAuth>,
     hook: Arc<HookClient>,
+    vod: Option<Arc<Mp4VodLibrary>>,
 }
 
 impl WsSession {
     pub fn new(
         stream: TransportStream,
+        peer_addr: String,
         source_manager: Arc<MediaSourceManager>,
         auth: Arc<StreamAuth>,
         hook: Arc<HookClient>,
     ) -> Self {
         Self {
             stream,
+            peer_addr,
             read_buf: BytesMut::with_capacity(8192),
             source_manager,
             auth,
             hook,
+            vod: None,
         }
+    }
+
+    pub fn with_vod_library(mut self, vod: Arc<Mp4VodLibrary>) -> Self {
+        self.vod = Some(vod);
+        self
     }
 
     pub async fn run_flv(&mut self, path: &str) -> anyhow::Result<()> {
@@ -211,16 +222,33 @@ impl WsSession {
 
         let source = self
             .source_manager
-            .get("__defaultVhost__", &app, &stream_name);
+            .get_or_pull("__defaultVhost__", &app, &stream_name)
+            .await;
 
         let source = match source {
             Some(s) => s,
             None => {
+                let asset = match &self.vod {
+                    Some(library) => match library.open(&app, &stream_name).await {
+                        Ok(asset) => asset,
+                        Err(error) => {
+                            warn!("WS-FLV VOD open failed for {app}/{stream_name}: {error:#}");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                if let Some(asset) = asset {
+                    return self.run_vod_flv(asset, path).await;
+                }
                 let close = WsFrame::close(3004, "stream not found");
                 self.stream.write_all(&close.encode_server()).await?;
                 return Ok(());
             }
         };
+        let _subscriber = source
+            .register_subscriber(format!("ws-flv:{}", self.peer_addr))
+            .await;
 
         let mut muxer = FlvMuxer::new();
         let header = muxer.write_header();
@@ -308,6 +336,66 @@ impl WsSession {
         Ok(())
     }
 
+    async fn run_vod_flv(&mut self, asset: VodAsset, path: &str) -> anyhow::Result<()> {
+        let start_ms = query_seconds(path, "start")
+            .map(|seconds| (seconds * 1000.0) as u64)
+            .unwrap_or(0);
+        let duration_ms = query_seconds(path, "duration").map(|seconds| (seconds * 1000.0) as u64);
+        let playback = asset.playback(start_ms);
+        let info = asset.media_info();
+        let video = info.tracks.iter().find_map(|track| match track {
+            TrackInfo::Video(video) => Some(video),
+            _ => None,
+        });
+        let audio_rate = info
+            .tracks
+            .iter()
+            .find_map(|track| match track {
+                TrackInfo::Audio(audio) => Some(audio.sample_rate),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let Some(video) = video else {
+            let close = WsFrame::close(3004, "unsupported VOD tracks");
+            self.stream.write_all(&close.encode_server()).await?;
+            return Ok(());
+        };
+
+        let mut muxer = FlvMuxer::new();
+        for payload in [
+            muxer.write_header().to_vec(),
+            muxer
+                .write_metadata(
+                    video.width,
+                    video.height,
+                    video.fps,
+                    audio_rate,
+                    video.codec,
+                )
+                .to_vec(),
+        ] {
+            self.stream
+                .write_all(&WsFrame::binary(payload).encode_server())
+                .await?;
+        }
+        let pacer = VodPacer::new();
+        for frame in playback.frames {
+            if !frame.config_frame {
+                if duration_ms.is_some_and(|limit| u64::from(frame.timestamp) > limit) {
+                    break;
+                }
+                pacer.wait(frame.timestamp).await;
+            }
+            let tag = muxer.write_tag(&frame)?;
+            self.stream
+                .write_all(&WsFrame::binary(tag.to_vec()).encode_server())
+                .await?;
+        }
+        let close = WsFrame::close(1000, "VOD complete");
+        self.stream.write_all(&close.encode_server()).await?;
+        Ok(())
+    }
+
     /// WebSocket MPEG-TS playback (`/app/stream.live.ts` over WebSocket).
     pub async fn run_ts(&mut self, path: &str) -> anyhow::Result<()> {
         let (app, resource, sign) = parse_path_sign(path);
@@ -342,7 +430,8 @@ impl WsSession {
 
         let source = match self
             .source_manager
-            .get("__defaultVhost__", &app, &stream_name)
+            .get_or_pull("__defaultVhost__", &app, &stream_name)
+            .await
         {
             Some(s) => s,
             None => {
@@ -351,6 +440,9 @@ impl WsSession {
                 return Ok(());
             }
         };
+        let _subscriber = source
+            .register_subscriber(format!("ws-ts:{}", self.peer_addr))
+            .await;
 
         let mut muxer = TsLiveMuxer::new();
 
@@ -471,7 +563,8 @@ impl WsSession {
 
         let source = match self
             .source_manager
-            .get("__defaultVhost__", &app, &stream_name)
+            .get_or_pull("__defaultVhost__", &app, &stream_name)
+            .await
         {
             Some(s) => s,
             None => {
@@ -480,6 +573,9 @@ impl WsSession {
                 return Ok(());
             }
         };
+        let _subscriber = source
+            .register_subscriber(format!("ws-fmp4:{}", self.peer_addr))
+            .await;
 
         let mut muxer = Fmp4Muxer::new(90_000);
 
@@ -598,6 +694,17 @@ impl WsSession {
             }
         }
     }
+}
+
+fn query_seconds(path: &str, key: &str) -> Option<f64> {
+    path.split_once('?')
+        .map(|(_, query)| query)
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(name, _)| *name == key)
+        .and_then(|(_, value)| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 fn parse_path_sign(path: &str) -> (String, String, String) {
@@ -762,5 +869,31 @@ mod tests {
     fn parse_path_sign_sign_with_other_params() {
         let (_, _, sign) = parse_path_sign("/a/b?foo=1&sign=tok&bar=2");
         assert_eq!(sign, "tok");
+    }
+
+    #[test]
+    fn fuzz_smoke_websocket_decoder_never_panics() {
+        let valid = WsFrame::binary(b"websocket-payload".to_vec()).encode_server();
+        for len in 0..valid.len() {
+            let _ = WsFrame::decode(&valid[..len]);
+        }
+        for index in 0..valid.len() {
+            let mut mutated = valid.clone();
+            mutated[index] ^= 0xff;
+            let _ = WsFrame::decode(&mutated);
+        }
+        for seed in 0..2_048u64 {
+            let len = (seed as usize).wrapping_mul(29) % 1_025;
+            let mut state = seed.wrapping_add(0x517c_c1b7_2722_0a95);
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                })
+                .collect();
+            let _ = WsFrame::decode(&data);
+        }
     }
 }

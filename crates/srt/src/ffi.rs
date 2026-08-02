@@ -1,12 +1,15 @@
 //! Minimal FFI bindings to libsrt.
 //!
-//! Links directly against `libsrt-gnutls.so`.
+//! Links directly against libsrt. Debian/Ubuntu name the GnuTLS flavour
+//! `srt-gnutls`, while Homebrew/vcpkg expose the portable `srt` name.
 //! The numeric values mirror `SRT_SOCKOPT` and `SRT_SOCKSTATUS` from
 //! libsrt 1.5.x. Keep them in sync with the public `srt.h` ABI.
 
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::net::SocketAddr;
 use std::sync::OnceLock;
+
+use socket2::SockAddr;
 
 // ── constants ────────────────────────────────────────────────────────
 
@@ -45,7 +48,8 @@ pub const SRT_ETIMEOUT: c_int = 6003;
 
 // ── FFI function declarations ────────────────────────────────────────
 
-#[link(name = "srt-gnutls")]
+#[cfg_attr(target_os = "linux", link(name = "srt-gnutls"))]
+#[cfg_attr(not(target_os = "linux"), link(name = "srt"))]
 extern "C" {
     pub fn srt_startup() -> c_int;
     pub fn srt_cleanup() -> c_int;
@@ -54,17 +58,24 @@ extern "C" {
     pub fn srt_create_socket() -> c_int;
 
     /// Bind a socket to an address. Returns SRT error code.
-    pub fn srt_bind(u: c_int, name: *const libc::sockaddr, namelen: c_int) -> c_int;
+    pub fn srt_bind(u: c_int, name: *const c_void, namelen: c_int) -> c_int;
 
     /// Connect a caller or a bound rendezvous socket to a peer.
-    pub fn srt_connect(u: c_int, name: *const libc::sockaddr, namelen: c_int) -> c_int;
+    pub fn srt_connect(u: c_int, name: *const c_void, namelen: c_int) -> c_int;
+    pub fn srt_rendezvous(
+        u: c_int,
+        local_name: *const c_void,
+        local_namelen: c_int,
+        remote_name: *const c_void,
+        remote_namelen: c_int,
+    ) -> c_int;
 
     /// Set socket to listening mode (max `backlog` pending connections).
     pub fn srt_listen(u: c_int, backlog: c_int) -> c_int;
 
     /// Accept an incoming SRT connection. Returns a new socket fd or SRT_ERROR.
     /// `addr` and `addrlen` receive the peer address (can be NULL).
-    pub fn srt_accept(u: c_int, addr: *mut libc::sockaddr, addrlen: *mut c_int) -> c_int;
+    pub fn srt_accept(u: c_int, addr: *mut c_void, addrlen: *mut c_int) -> c_int;
 
     /// Receive data. `len` is buffer size. Returns bytes received or SRT_ERROR.
     pub fn srt_recv(u: c_int, buf: *mut c_void, len: c_int) -> c_int;
@@ -202,28 +213,13 @@ pub fn set_sockflag_str(sock: c_int, opt: c_int, val: &str) -> anyhow::Result<()
     Ok(())
 }
 
-/// Converts a `SocketAddr` to a libc sockaddr_in for SRT bind.
-pub fn socket_addr_to_sockaddr(
-    addr: &SocketAddr,
-) -> anyhow::Result<(libc::sockaddr_in, libc::socklen_t)> {
-    match addr {
-        SocketAddr::V4(v4) => {
-            let octets = v4.ip().octets();
-            let sin = libc::sockaddr_in {
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: v4.port().to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes(octets),
-                },
-                sin_zero: [0u8; 8],
-            };
-            Ok((
-                sin,
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            ))
-        }
-        _ => anyhow::bail!("SRT only supports IPv4 in this implementation"),
-    }
+/// Converts a Rust socket address to socket2's platform-native sockaddr.
+///
+/// `SockAddr` owns the correctly laid-out Unix/BSD/Winsock storage. The FFI
+/// boundary intentionally accepts an opaque pointer because libsrt consumes
+/// the same native C `sockaddr` bytes on every supported platform.
+pub fn socket_addr_to_sockaddr(addr: &SocketAddr) -> SockAddr {
+    SockAddr::from(*addr)
 }
 
 /// Retrieves the stream ID from an SRT socket (set by the caller via

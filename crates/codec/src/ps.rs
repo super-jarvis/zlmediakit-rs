@@ -653,4 +653,33 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].data.as_ref(), payload.as_slice());
     }
+
+    #[test]
+    fn fuzz_smoke_ps_demuxer_never_panics_and_stays_bounded() {
+        let payload = vec![0, 0, 0, 1, 0x65, 1, 2, 3, 4];
+        let mut valid = PACK_HEADER.to_vec();
+        valid.extend_from_slice(&build_pes(0xE0, (8 + payload.len()) as u16, &payload));
+        valid.extend_from_slice(&PACK_HEADER);
+
+        for index in 0..valid.len() {
+            let mut mutated = valid.clone();
+            mutated[index] ^= 0xff;
+            let mut demuxer = PsDemuxer::new();
+            for chunk in mutated.chunks(7) {
+                demuxer.push(chunk);
+                for _ in 0..4 {
+                    if demuxer.next_pes().is_none() {
+                        break;
+                    }
+                }
+            }
+            assert!(demuxer.pending() <= 4 * 1024 * 1024);
+        }
+        for len in 0..valid.len() {
+            let mut demuxer = PsDemuxer::new();
+            demuxer.push(&valid[..len]);
+            while demuxer.next_pes().is_some() {}
+            assert!(demuxer.pending() <= 4 * 1024 * 1024);
+        }
+    }
 }

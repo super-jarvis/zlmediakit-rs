@@ -3034,17 +3034,20 @@ dependencies = [
  "md-5 0.11.0",
  "parking_lot",
  "rand 0.10.2",
+ "rcgen",
  "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "socket2 0.6.5",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tokio-rustls",
  "toml",
  "tracing",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -3133,12 +3136,14 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tokio-rustls",
  "tracing",
  "zlmediakit-codec",
  "zlmediakit-core",
+ "zlmediakit-mp4",
 ]
 
 [[package]]
@@ -3154,6 +3159,7 @@ dependencies = [
  "rand 0.10.2",
  "rcgen",
  "rustls",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tokio-rustls",
@@ -3161,6 +3167,7 @@ dependencies = [
  "webpki-roots",
  "zlmediakit-codec",
  "zlmediakit-core",
+ "zlmediakit-mp4",
 ]
 
 [[package]]
@@ -3197,9 +3204,9 @@ dependencies = [
  "anyhow",
  "bytes",
  "dashmap",
- "libc",
  "md5",
  "serde",
+ "socket2 0.6.5",
  "tokio",
  "tracing",
  "zlmediakit-codec",
@@ -3232,13 +3239,17 @@ dependencies = [
  "fdk-aac",
  "interceptor",
  "opus",
+ "rtcp",
  "rustls",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "uuid",
+ "webpki-roots",
  "webrtc",
+ "webrtc-ice",
  "zlmediakit-core",
 ]
 

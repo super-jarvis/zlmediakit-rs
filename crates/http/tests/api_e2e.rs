@@ -70,6 +70,7 @@ fn avcc_config() -> Vec<u8> {
 
 struct TestServer {
     mgr: Arc<MediaSourceManager>,
+    hook: Arc<HookClient>,
     port: u16,
 }
 
@@ -106,7 +107,7 @@ impl TestServer {
                 ),
             ),
             auth,
-            hook,
+            hook: hook.clone(),
             recorder,
             proxy,
             pusher: Default::default(),
@@ -128,7 +129,7 @@ impl TestServer {
         });
 
         tokio::time::sleep(Duration::from_millis(200)).await;
-        TestServer { mgr, port }
+        TestServer { mgr, hook, port }
     }
 
     async fn get(&self, path: &str) -> (u16, Vec<u8>) {
@@ -415,6 +416,7 @@ async fn web_admin_assets_expose_authenticated_management_modules() {
         "getDeviceInfo",
         "stopSip",
         "getTranscode",
+        "reloadCertificate",
     ] {
         assert!(js.contains(marker), "missing admin JS marker: {marker}");
     }
@@ -472,6 +474,37 @@ async fn http_api_requires_configured_secret_and_redacts_it() {
         secret_port,
     )
     .await;
+    assert_eq!(code, 200);
+
+    const ROTATED: &str = "management-rotated-secret";
+    let rotate_path = format!("/index/api/setServerConfig?api.secret={ROTATED}");
+    let (code, body) =
+        http_get_with_headers(&rotate_path, secret_port, &[("X-API-Secret", SECRET)]).await;
+    assert_eq!(code, 200);
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["changed"], 1);
+    assert_eq!(response["restartRequired"], serde_json::json!([]));
+
+    let (code, _) = http_get_with_headers(
+        "/index/api/getApiList",
+        secret_port,
+        &[("X-API-Secret", SECRET)],
+    )
+    .await;
+    assert_eq!(code, 401, "old secret must stop working immediately");
+    let (code, _) = http_get_with_headers(
+        "/index/api/getApiList",
+        secret_port,
+        &[("X-API-Secret", ROTATED)],
+    )
+    .await;
+    assert_eq!(code, 200, "rotated secret must work immediately");
+
+    // Restore the per-server secret so the test leaves the runtime snapshot in
+    // its original state as well.
+    let restore_path = format!("/index/api/setServerConfig?api.secret={SECRET}");
+    let (code, _) =
+        http_get_with_headers(&restore_path, secret_port, &[("X-API-Secret", ROTATED)]).await;
     assert_eq!(code, 200);
 }
 
@@ -618,6 +651,12 @@ async fn http_api_get_api_list() {
     assert!(data.iter().any(|v| v == "/index/api/getAllSession"));
     assert!(data.iter().any(|v| v == "/index/api/kick_sessions"));
     assert!(data.iter().any(|v| v == "/index/api/close_streams"));
+    assert!(data.iter().any(|v| v == "/index/api/reloadCertificate"));
+
+    let (code, body) = srv.get("/index/api/reloadCertificate").await;
+    assert_eq!(code, 200);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], 0);
 }
 
 #[tokio::test]
@@ -656,6 +695,16 @@ async fn http_api_set_server_config() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["code"], 0);
     assert!(json["changed"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(
+        json["restartRequired"],
+        serde_json::json!(["general.flowThreshold"])
+    );
+
+    let (code, body) = srv.get("/index/api/setServerConfig?not.a.real.key=1").await;
+    assert_eq!(code, 200);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["changed"], 0);
+    assert_eq!(json["rejected"], serde_json::json!(["not.a.real.key"]));
 
     let (code, body) = srv.get("/index/api/getServerConfig").await;
     assert_eq!(code, 200);
@@ -664,6 +713,59 @@ async fn http_api_set_server_config() {
     assert!(entries
         .iter()
         .any(|e| e["key"] == "general.flowThreshold" && e["value"] == "2048"));
+
+    let hook_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hook_addr = hook_listener.local_addr().unwrap();
+    let hook_server = tokio::spawn(async move {
+        let (mut stream, _) = hook_listener.accept().await.unwrap();
+        let mut request = [0u8; 2048];
+        let read = stream.read(&mut request).await.unwrap();
+        assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST /play HTTP/1.0"));
+        let body = r#"{"code":-1,"msg":"api rotated hook"}"#;
+        let response = format!(
+            "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let hook_url = format!("http://{hook_addr}/play");
+    let (code, body) = srv
+        .get(&format!(
+            "/index/api/setServerConfig?hook.on_play={hook_url}"
+        ))
+        .await;
+    assert_eq!(code, 200);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["changed"], 1);
+    assert_eq!(json["restartRequired"], serde_json::json!([]));
+    assert_eq!(json["rejected"], serde_json::json!([]));
+    assert_eq!(
+        srv.hook.on_play("v", "a", "s", "").await,
+        zlmediakit_core::hook::HookResult::Deny("api rotated hook".to_string())
+    );
+    hook_server.await.unwrap();
+
+    let timeout_before = srv.hook.config_snapshot().timeout_sec;
+    let (code, body) = srv
+        .get("/index/api/setServerConfig?hook.timeout_sec=invalid")
+        .await;
+    assert_eq!(code, 200);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["changed"], 0);
+    assert_eq!(json["rejected"], serde_json::json!(["hook.timeout_sec"]));
+    assert_eq!(srv.hook.config_snapshot().timeout_sec, timeout_before);
+
+    let (code, body) = srv.get("/index/api/setServerConfig?hook.on_play=").await;
+    assert_eq!(code, 200);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["changed"], 1);
+    assert_eq!(json["restartRequired"], serde_json::json!([]));
+    assert_eq!(
+        srv.hook.on_play("v", "a", "s", "").await,
+        zlmediakit_core::hook::HookResult::Allow
+    );
 }
 
 #[tokio::test]

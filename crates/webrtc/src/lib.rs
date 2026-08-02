@@ -18,6 +18,8 @@
 pub mod datachannel;
 pub mod engine;
 pub mod h264_rtp;
+pub mod pull_client;
+pub mod push_client;
 pub mod server;
 pub mod whep;
 pub mod whip;
@@ -25,7 +27,7 @@ pub mod whip;
 #[cfg(feature = "transcode")]
 pub mod transcode;
 
-pub use server::WebRtcServer;
+pub use server::{WebRtcServer, WebRtcTransportConfig};
 pub use whep::{whep_play, WhepSession};
 pub use whip::{whip_publish, WhipSession};
 

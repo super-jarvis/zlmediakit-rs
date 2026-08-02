@@ -108,6 +108,27 @@
 - Release：`release-plz/action@v0.5` 收到无效输入 `GITHUB_TOKEN`；该 action 当前合法输入包含 `token`，workflow 使用了错误键名。
 - 所有 workflow 还有 Node.js 20 action 被 runner 强制运行于 Node.js 24 的弃用警告，但目前这些不是失败原因。
 
+## 系统化验证审计（2026-08-02）
+
+- 代理和推流 supervisor 原本用 `contains_key` 后 `insert`，两个并发请求可同时通过检查并重复启动；发送 command 失败时还会留下虚假的 active 条目。改用 `DashMap::entry` 原子占位，并以任务 marker 精确回滚，已用 16 线程竞争和 receiver-drop 回归覆盖。
+- 媒体图的 broadcast channel 是有界实时通道；性能基线若只测 producer 会把调度延迟误判为系统吞吐。新增基线用每 128 帧 ACK 保证 4 个订阅者均完整消费，再统计 50,000 源帧和 200,000 次实际投递。
+- FLV header 的 `data_offset` 原先可越过当前 buffer 直接 `advance` panic；未知 tag 通过递归跳过，长恶意链可导致栈溢出。现已改为 header 边界校验和迭代跳过，20,000 个未知 tag 回归可正常解析后继视频 tag。
+- MP4 sample table 的 input-declared entry count 原先直接用于 `Vec::with_capacity` 和嵌套循环，单字节变异即可造成明显资源放大。`stts/stsz/stsc/stco/co64/stss` 现按 box 长度校验，样本数量与文件数据上限交叉约束；同一 fuzz-smoke 从超过 60 秒降至约 0.02 秒。
+- fMP4 `trun.sample_count` 具有同类风险，尤其 flags 不携带逐样本字段时循环次数不受 trun 长度限制。现按 flags 计算表宽，或按默认 sample size 与可用媒体数据约束，并对样本偏移做 checked arithmetic。
+- 当前解析器 fuzz-smoke 覆盖 AMF、FLV、MPEG-PS、MP4 和 WebSocket 的随机、截断和结构化变异输入；这是快速确定性回归，不替代后续 cargo-fuzz 持续语料库。
+- SRT Rendezvous 的旧测试在双方刚连接后只发送一个很短消息并固定等待 500ms；在 live/TSBPD 启动期该消息可能被丢弃，随后 sender 先关闭又令 receiver 报无效 socket。新测试改用 `srt_rendezvous` 专用 API、双 loopback IP/同端口拓扑，并持续发送生产等价的 1316-byte TS 批次直到接收 ACK；10 次连续复跑及 workspace 并行套件稳定通过。
+- 系统门禁应拆分长链命令保留诊断：本轮组合命令在全目标测试已通过后无错误文本退出，单独 release 构建、性能基线和前端语法检查均成功，确认不是代码失败。
+
+## 2026-08-03 外部 CI 状态复核
+
+- GitHub 公共 API 显示远端 `master` 仍停在 `ea37fcba`（2026-08-01）：旧 CI 成功、Docker Publish 成功、Release 在 `release-plz/action@v0.5` 步骤失败；当前本地 `master` 比远端 ahead 3，且新的 `.github/workflows/cross-platform.yml` 尚未跟踪，所以远端没有任何 Linux/macOS/Windows 新矩阵结果。
+- 本地旧 `ci.yml`/`release.yml` 已作为历史文件位于 `.github/workflows_bak/`，其中 action 已升级到 `checkout@v6`/`cache@v5` 且 release-plz 参数已改为 `token`；它们不会被 GitHub Actions 加载，因此远端旧 Release 失败不会在本地现状自动重现。
+- 新 cross-platform workflow 当前只在推送 `master/main` 或面向二者的 PR 时触发。若要在不直接改远端主分支的情况下取得真实 runner 证据，应允许任意分支 push，再从 `codex/` 验证分支触发。
+- 当前 SRT 地址转换仍直接返回 `libc::sockaddr_storage` 并引用 `libc::sockaddr_in/in6/socklen_t/AF_INET`。这已处理 BSD 的 `sin_len`，但 `libc` 在 Windows Rust target 不暴露同一套 Winsock 类型，因此新 workflow 的 Windows `cargo check --all-targets` 很可能仍会在类型检查阶段失败；“check 不链接 libsrt”不足以绕过源码类型不兼容。
+- workspace 已声明 `socket2 = 0.6`，而 `zlmediakit-srt` 仍单独只依赖 `libc`。优先方案是复用 `socket2::SockAddr` 的跨平台 ABI 指针/长度，避免自行维护 Unix 与 Winsock 的 sockaddr 布局。
+- `socket2 0.6.5` 的 `SockAddr` 自带跨平台 native storage、`as_ptr()` 与 `len()`，并实现 `From<SocketAddr>`；SRT FFI 的 bind/connect/rendezvous 只需 opaque address pointer 和 C `int` 长度，因此可以完全移除 SRT crate 对 Unix `libc::sockaddr_*` 的源码依赖。
+- 可持续 libFuzzer 不需要暴露新的内部 API：`FlvDemuxer::{feed,parse_header,parse_tag}`、`PsDemuxer::{push,next_pes,pending}` 与 `Mp4Demuxer::from_bytes` 都是公开入口。独立 `fuzz/` package 可覆盖三类高风险媒体解析器，既复用真实产品接口，又不把 test-only parser 复制进 harness。
+
 ## 本地环境与 SRT 平台问题
 
 - 可用 WSL2 发行版为 `Ubuntu-26.04`，当前正在运行；另有卸载中的旧 `Ubuntu` 和运行中的 `docker-desktop`。
@@ -188,5 +209,35 @@
 - SRT 原 FFI 常量来自错误的枚举序号，且把 libsrt 1.5 的三参数 `srt_recvmsg` 错声明为五参数；live 模式还错误调用 stream API。现已按本机公开 `srt.h` 对齐 ABI，并用真实 Caller/Listener/Rendezvous 网络测试固定行为。
 - SRT Listener 的非阻塞 `RCVSYN=false` 会被 accepted socket 继承，旧处理器把首个“暂无数据”当断线关闭；accepted socket 现在切回 200ms 有界同步接收，并对 async/timeout 重试，既能响应停止又不会抢先断开。
 - TS 解复用器原 PAT program loop 少跳过 5 字节、PMT program_info_length 多跳过 1 字节，导致 PMT/AAC PID 不生效；现按标准字段偏移解析，并保存 PMT stream_type 作为视频 codec，避免 H.264 P 帧被启发式误判成 H.265。
+- 原 MP4 muxer 计算 `stts` 时把“当前时间戳减前一个时间戳”的结果写到了当前 sample；但 `stts` 表示当前 sample 到下一 sample 的持续时间，因此非固定帧率时间轴会整体漂移。现按后继时间戳计算当前 sample，末 sample 复用上一 cadence，并由非零 seek 网络测试固定。
+- MP4 点播不应为每个协议各自解析文件。共享 `Mp4VodLibrary` 现在负责 `record` 应用映射、percent decode 后的路径校验、轨道元数据和关键帧切片；协议层只处理各自控制语义及输出封装。
+- 点播地址统一为相对录制路径：RTMP `record/<path>.mp4`、RTSP `/record/<path>.mp4`、HTTP/WS `/record/<path>.mp4.flv`。RTSP seek 使用秒制 NPT，HTTP/WS 参数使用秒，RTMP AMF `play.start` 使用毫秒。
+- 原边缘回源把配置中的上游 `origin_vhost` 错当成本地发布 vhost，非默认 vhost 永远等不到请求的媒体源；现已分离上游 URL 参数与本地目标 vhost，并以同流 single-flight 串行尝试多个候选。
+- `MediaSource` 原有订阅 API 未被主要播放协议调用，因此 `NoReader` 事件在真实播放器上不会发生；现以 RAII 守卫覆盖所有持久 HTTP/WS、RTMP、RTSP 播放出口，且只有自动回源条目标记为 `on_demand`，避免误停手工常驻代理。
+- 代理 supervisor 原来按 stream key 无条件删除 active entry，旧连接延迟退出会误删刚重建的新代理；现使用任务专属 `AtomicBool` Arc 身份执行条件删除。
+- 原集群中继没有处理 `StreamUnPublish`、没有重连、没有按 peer vhost/app 过滤，并把已含 app 的 `peer.url` 再拼一次 app；现已修正 URL 语义并实现可取消的指数退避重连。
+- 原 WHEP 仅从本地已存在 MediaSource 播放，未参与边缘回源、未登记真实 reader，也没有 PeerConnection 状态清理；WHIP 同样不会在断线/DELETE 后移除发布源。两类会话现均形成完整生命周期。
+- webrtc-rs 0.12 的发送侧可可靠启用 RTX、NACK/PLI、TWCC 与读取 REMB，但其 `SettingEngine` 中 ICE-TCP mux 仍是注释 TODO；本项目已实现共享 UDP mux，不能把 TCP candidate 伪装成已支持。
+- webrtc-rs 0.12 的 WHIP H.265 depacketizer不能可靠重组分片访问单元，因此接收侧只开放 H.264/VP8/VP9/Opus；WHEP 发送侧可输出 H.265/AV1，但最终可播仍受浏览器/客户端编解码支持影响。
+- `TrackRemote::rid/ssrc/id/stream_id` 足以保留 WHIP simulcast 层身份；core 通过独立 `TrackDescriptor` 保存这些协议元数据，不污染通用容器 `TrackInfo`。WHEP 当前支持按 RID 显式选层，不宣称生成新的 `a=simulcast` 多编码输出。
+- WHEP/WHIP 的普通 trickle candidate 可直接映射到 `RTCPeerConnection::add_ice_candidate`；仅包含新 `ice-ufrag` 的 fragment 并不足以执行完整 ICE restart，后者需要重建远端描述/凭证状态，不能与已完成的 PATCH candidate 支持混为一谈。
+- webrtc-rs 0.12 实际提供 `RTCPeerConnection::restart_ice`、`RTCOfferOptions::ice_restart` 和 `gathering_complete_promise`。服务端可在 PATCH 同时收到新 ufrag/pwd 时替换当前 remote offer 的 ICE 凭据、清除旧 generation candidates、添加新 candidates、重启本地 gathering 并返回新的标准 SDP fragment；真实 E2E 证明媒体在该重协商后继续传输。
+- WHIP 服务端与 WHEP 原生拉流客户端本质上共用远端 RTP 接收管线；把 `on_track`、轨道描述和 H.264/VP8/VP9/Opus 解包抽为共享入口后，可避免两条入口的 MediaFrame 语义漂移。
+- 原生 WebRTC 远端客户端使用显式 `whep(s)://` 与 `whip(s)://` scheme，避免普通 `http(s)://` 媒体代理误判；信令内部仍映射到 HTTP(S)，支持公共 CA、IPv6 bracket authority、重定向和相对 Location，并复用 `[webrtc].ice_servers`。
+- 原 `setServerConfig` 会把任意键写入全局 HashMap，并仅改变 `getServerConfig` 的展示；所有协议持有的 `StreamAuth` 和监听器完全不变。现先对安全敏感的 `api.secret` 做真实共享热轮换，其余配置在接线前明确报告需重启，未知键拒绝。
+- API secret 热轮换必须是服务实例内共享状态，不能让并行测试和多个 HttpServer 读取进程全局 secret；因此运行值放在每个 `StreamAuth` 的共享 RwLock 中，全局 runtime config 只承担管理快照与持久化候选值。
+- 原 `HookClient` 把启动时 `HookConfig` 直接存为不可变值，28 处调用都读取同一旧快照；此外 URL 解析会剥掉 `https://` 后仍向 80 端口发送明文。现在每次调用复制共享配置快照，HTTPS 使用 rustls/WebPKI 校验，动态更新不会跨异步等待持锁。
+- `on_flow_report` 原来只有启动时已配置 URL 才创建任务，且周期被永久捕获；仅更新 HookClient 仍无法从关闭状态启用。使用 watch 修订通道后，调度任务常驻但空配置不发请求，URL/周期变化会立即唤醒并重新计时。
+- 三个 TLS 服务原来在构造器中固定克隆 `TlsAcceptor`，替换磁盘证书不会影响新连接。`ArcSwap<rustls::ServerConfig>` 适合作为握手边界：每个 accept 取得当前 Arc，交换只影响后续握手，现有会话自然保留旧配置。
+- TLS reload 必须先完整读取证书链、私钥并让 rustls 校验证书/密钥匹配，再执行原子 swap；若先替换路径或部分状态，损坏证书会让监听器失去最后一份可用配置。当前实现对失败保持 last-known-good。
+- 监听地址不能用 `"{ip}:{port}"` 拼接，否则 `::` 会生成非法的 `:::port`；全局 `listen_ip` 统一解析为 `IpAddr` 后通过 `SocketAddr::new` 交给各协议，协议自己的 UDP/TCP 主动端也必须保留地址族。
+- libsrt 的 bind/connect 接口接收通用 `sockaddr`，原先固定 `sockaddr_in` 既阻断 IPv6，也让调用长度不正确。改用 `sockaddr_storage` 后真实 `::1` Caller→Listener 可传输；结构体零初始化再赋值还避开了 BSD/macOS libc 额外长度字段的源码兼容问题。
+- RTSP 拉推流已有 bracket-aware IPv6 authority；RTMP 拉推流原先各自用 `rfind(':')` 拆地址，会把 IPv6 尾段误当端口。两者现在复用同一个解析器，并保留 `rtmp://[::1]:port/app/stream` 的正确 Host/地址语义。
+- server crate 目前只有二进制入口，把嵌入能力建立在其中会迫使宿主复制整个启动编排。生产协议本来就围绕 core 的 `MediaSourceManager` 互通，因此稳定 SDK 应放在 core：对 manager 做生命周期安全的 publisher/subscription/snapshot 门面，同时保留 manager getter 供宿主按需装配 listener。
+- 跨平台 CI 需要区分“源码/类型兼容”与“本机系统库集成”：macOS/Windows 的 `cargo check --all-targets` 能捕获 libc 结构、条件编译和 API 差异，但不会证明 libsrt 可链接运行；后者当前由 Linux 真实测试覆盖，macOS/Windows native SRT build/run 仍需后续 runner 验证。
+- 系统化验证审计发现，当前仓库没有 `#[ignore]` 长稳测试、压力测试、fuzz harness 或 benchmark；现有网络 E2E 主要证明单链路正确性，不能作为异常输入不 panic、并发媒体图无泄漏或性能无明显退化的证据。
+- 生命周期已有的强证据集中在 RTP stop、GB SIP stop、WHEP/WHIP DELETE、边缘无人观看取消和 cluster retry 可取消；`run_proxy_supervisor`/`run_pusher_supervisor` 的失败后状态清理与快速同 key 重建仍应补并发测试，避免只验证成功链路。
+- 模糊测试应优先覆盖无状态或增量二进制解析边界（AMF、FLV、PS/TS、MP4 box、WebSocket frame、SDP/ICE fragment），并设置输入长度上限；网络协议完整状态机留给故障注入测试，避免 fuzz target 被 I/O 与超时主导。
+- FLV demuxer 的 `parse_header` 原先直接信任输入中的 32-bit `header_size` 并调用 `BytesMut::advance`，声明长度大于已收数据会 panic；`parse_tag` 又用递归跳过 PreviousTagSize、空 payload 和未知 tag，足够长的合法边界输入可造成栈溢出。两处都必须在 fuzz 基线前改成长度检查与迭代消费。
 
 ---
