@@ -1,6 +1,6 @@
 //! RTSP RECORD client for actively pushing a local MediaSource upstream.
 
-use crate::client_transport::{connect, ClientStream};
+use crate::client_transport::{authorization_header, connect, ClientStream};
 use crate::parser::{RtspParser, RtspResponse};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::{Buf, BytesMut};
@@ -9,7 +9,6 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tracing::info;
-use zlmediakit_core::auth::md5_hex;
 use zlmediakit_core::media_frame::{CodecId, FrameType, TrackInfo};
 use zlmediakit_core::payload::aac_audio_specific_config;
 use zlmediakit_core::rtp::RtpPacketizer;
@@ -142,39 +141,6 @@ fn header<'a>(response: &'a RtspResponse, name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-fn digest_authorization(
-    challenge: &str,
-    username: &str,
-    password: &str,
-    method: &str,
-    uri: &str,
-) -> Result<String> {
-    let parameters = challenge
-        .trim()
-        .strip_prefix("Digest ")
-        .unwrap_or(challenge);
-    let mut realm = None;
-    let mut nonce = None;
-    for field in parameters.split(',') {
-        if let Some((name, value)) = field.trim().split_once('=') {
-            let value = value.trim().trim_matches('"');
-            match name.trim().to_ascii_lowercase().as_str() {
-                "realm" => realm = Some(value.to_string()),
-                "nonce" => nonce = Some(value.to_string()),
-                _ => {}
-            }
-        }
-    }
-    let realm = realm.ok_or_else(|| anyhow!("RTSP Digest challenge is missing realm"))?;
-    let nonce = nonce.ok_or_else(|| anyhow!("RTSP Digest challenge is missing nonce"))?;
-    let ha1 = md5_hex(&format!("{username}:{realm}:{password}"));
-    let ha2 = md5_hex(&format!("{method}:{uri}"));
-    let response = md5_hex(&format!("{ha1}:{nonce}:{ha2}"));
-    Ok(format!(
-        "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response}\""
-    ))
-}
-
 fn make_sdp(tracks: &[TrackInfo], audio_config: Option<&[u8]>) -> Result<String> {
     let mut sdp =
         "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=zlmediakit-rs\r\nt=0 0\r\na=sendonly\r\n".to_string();
@@ -267,7 +233,7 @@ pub async fn start(
             .ok_or_else(|| anyhow!("RTSP upstream requires credentials"))?;
         let password = target.password.as_deref().unwrap_or_default();
         let authorization =
-            digest_authorization(challenge, username, password, "ANNOUNCE", &target.uri)?;
+            authorization_header(challenge, username, password, "ANNOUNCE", &target.uri)?;
         send_request(
             &mut socket,
             "ANNOUNCE",

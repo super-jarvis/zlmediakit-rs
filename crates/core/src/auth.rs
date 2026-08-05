@@ -1,3 +1,5 @@
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use md5::Md5;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -158,6 +160,41 @@ impl StreamAuth {
         // Even when qop is absent, compare against the uri the server saw.
         let _ = hdr_uri;
         response == &expected
+    }
+
+    /// Validates a `Basic` `Authorization` header (RFC 7617).
+    ///
+    /// The header value must be `Basic base64(username:password)`. The claimed
+    /// `username`'s password is resolved like Digest auth: the per-user table
+    /// when the username is known, otherwise the shared `secret`. Returns
+    /// `true` when the decoded credentials match the expected password.
+    pub fn check_basic(&self, header: &str) -> bool {
+        let header = header.trim();
+        if !header.to_ascii_lowercase().starts_with("basic ") {
+            return false;
+        }
+        let encoded = header["Basic ".len()..].trim();
+        let decoded = match BASE64.decode(encoded) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        let decoded = match String::from_utf8(decoded) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let (username, password) = match decoded.split_once(':') {
+            Some(pair) => pair,
+            None => return false,
+        };
+        let expected = self.digest_password(username);
+        if expected.len() != password.len() {
+            return false;
+        }
+        let mut diff: u8 = 0;
+        for (a, b) in expected.bytes().zip(password.bytes()) {
+            diff |= a ^ b;
+        }
+        diff == 0
     }
 }
 

@@ -222,5 +222,17 @@
 - 2026-08-03 继续长期目标并通过规划技能恢复上下文；GitHub 公共 API 复核确认远端仍是 `ea37fcba`，旧 CI/Docker 成功、旧 Release 的 release-plz step 失败，而本地 cross-platform workflow 尚未跟踪、从未被真实 runner 执行。
 - 图谱审计确认跨平台 workflow 的 Windows check 仍缺少强证据：SRT FFI 地址转换直接使用 Windows target 不提供的 Unix `libc::sockaddr_*` 类型；下一步改为 workspace 已有的 `socket2::SockAddr` 跨平台表示。
 - SRT FFI 地址层已改为 `socket2::SockAddr` + opaque C pointer，移除 Unix `libc::sockaddr_*` 依赖；Linux 下 SRT 35 单元测试、Caller 拉/推 E2E、全目标 check 和严格 Clippy 全部通过。
+- 2026-08-05 继续长期目标；补 RTSP 客户端 Basic 上游鉴权：`client_transport` 新增共享 `basic_authorization`/`digest_authorization`/`authorization_header`，拉流在 DESCRIBE 401 后按 WWW-Authenticate scheme 重试，推流在 ANNOUNCE 401 后同规则重试，两者都解析 `user:pass@host` 凭据。新增 `rtsp_basic_auth` E2E：mock 上游验证拉流 Basic 认证收帧、推流 Basic 认证转发 RTP、错误口令返回 401 并报错；rtsp crate 全测试与严格 Clippy 通过。
+- 本轮 WSL 门禁注意：`cargo fmt --all` 在 WSL 会把 Windows CRLF 工作树整体转成 LF 造成 98 文件假 diff；已 `git checkout -- .` 恢复全部，仅重新套用目标改动，并用 Windows 原生 Git 验证 diff 仅含 4 个目标文件 + 1 个新测试文件。
+- 补齐原生 HLS 拉流的 AES-128 与 EXT-X-BYTERANGE：`playlist_entries` 现解析 `EXT-X-KEY`（METHOD=NONE/AES-128、URI、IV）、`EXT-X-BYTERANGE:length[@offset]` 和 `EXT-X-MEDIA-SEQUENCE`；`open_response` 支持可选 Range 请求头。
+- `pull_hls` 按 tag IV 或媒体序列号回退 IV 用 AES-128-CBC+PKCS7 解密 segment，key 按 URI 缓存；BYTERANGE 支持显式 offset 与省略 offset 的链式续读，并按 (URL, range) 去重避免同资源多段误跳。新增 4 个测试：AES-128 拉流解密、BYTERANGE 拉流、加密+range 清单解析、AES roundtrip；http crate 26 测试全过，workspace 全量、fmt、严格 Clippy、`git diff --check` 均通过。
+- 补 RTSP 服务端 Basic 401 挑战（第②缺口）：core `StreamAuth` 新增 `check_basic`（RFC 7617，base64(user:pass) 解码后按用户名查用户表、未知用户名回退共享 secret 的常量时间比较，core 新增 workspace `base64` 依赖）；session `is_authenticated` 现可识别 `Authorization: Basic` 头（无需 realm 即可校验），`auth_reject` 的 `WWW-Authenticate` 改为同时宣告 Basic 与 Digest 两种挑战（Basic 在前）。
+- 新增 `rtsp_server_basic_auth` E2E（3 用例）：无凭据 DESCRIBE 得 401+Basic 挑战、正确口令放行（404/200 而非 401）、错误口令 401、未知用户名回退 secret 放行、无用户表时 secret 为唯一凭据；`rtsp_digest_auth` 中两处 `starts_with("Digest")` 断言改为 `contains("digest")` 以匹配双挑战格式。rtsp/core 全测试、workspace 全量、fmt、严格 Clippy、`git diff --check` 均通过。
+- 第②缺口收尾：门禁全绿（rtsp 含 3 Basic 服务端 + 3 Digest + 3 客户端 Basic 等 22 网络用例，core 10 Digest 单测，workspace 全量测试通过）；Windows Git diff 仅含 core/auth、rtsp/session、rtsp_digest_auth、core/rtsp Cargo.toml、README、progress/findings 与新测试文件。
+- 第③缺口 SRT macOS/Windows 原生构建验证：用户明确不在 Windows 安装 Rust 工具链（占内存），改为 WSL 内交叉 `cargo check`。WSL 已有工具链默认走清华镜像，且已装工具链的 `multirust-channel-manifest.toml` 内嵌镜像绝对 URL，`RUSTUP_DIST_SERVER` 环境变量无效；改为从 USTC 镜像手动下载对应版本 `rust-std-1.96.0-x86_64-pc-windows-{msvc,gnu}` 与 `aarch64-apple-darwin` 并解压进工具链 `lib/rustlib/`。
+- Windows MSVC 目标交叉检查被传递依赖 `ring` 的 C 构建卡住（需 MSVC `lib.exe`/cl，Linux 无此工具链）；改用 Windows GNU 目标（`x86_64-pc-windows-gnu`）在 WSL 装 `gcc-mingw-w64-x86-64` 让 ring 的 C 代码用 mingw gcc 编译。
+- Windows GNU 交叉检查结果：`cargo check -p zlmediakit-srt --target x86_64-pc-windows-gnu`、`--all-targets` 以及 `cargo check --workspace --target x86_64-pc-windows-gnu` 全部通过——SRT FFI 无 `libc::sockaddr_*` 等 Unix-only 类型（上一轮已改 `socket2::SockAddr`+opaque 指针），整依赖图（含 ring、rustls、tokio、webrtc）在 Windows 目标上类型检查干净。
+- macOS 目标（`aarch64-apple-darwin`）交叉检查被 ring 的 C 构建卡住（需 Apple clang/SDK，Linux 无法提供）；该目标由 CI `cross-platform.yml` 的 `platform-check` 在 `macos-latest` 原生 runner 覆盖，本地 WSL 仅验证到类型检查边界。
+- 第③缺口结论：无需改动任何源码（SRT 跨平台 FFI 上一轮已就绪），本地新增 Windows-GNU 交叉检查复现 CI 的 Windows `cargo check --workspace --all-targets` 门禁；已清理临时 std 包与 `/tmp` 下载文件、删除误生成的 `nul` 文件。三个候选缺口（HLS AES-128/BYTERANGE、RTSP 服务端 Basic、SRT 跨平台构建验证）全部收尾。
 
 ---

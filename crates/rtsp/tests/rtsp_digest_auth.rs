@@ -181,8 +181,8 @@ async fn rtsp_digest_auth_flow() {
     assert_eq!(code1, 401, "unauthenticated DESCRIBE must be 401");
     let www = header_value(&resp1, "WWW-Authenticate").expect("must carry WWW-Authenticate");
     assert!(
-        www.starts_with("Digest"),
-        "must be a Digest challenge: {}",
+        www.to_ascii_lowercase().contains("digest"),
+        "must advertise a Digest challenge: {}",
         www
     );
     let (chal_realm, nonce) = extract_digest(&resp1);
@@ -323,8 +323,8 @@ async fn rtsp_digest_fallback_default_realm() {
     assert_eq!(code1, 401, "anonymous DESCRIBE must be rejected with 401");
     let www = header_value(&resp1, "WWW-Authenticate").expect("must carry a Digest challenge");
     assert!(
-        www.starts_with("Digest"),
-        "must be a Digest challenge: {}",
+        www.to_ascii_lowercase().contains("digest"),
+        "must advertise a Digest challenge: {}",
         www
     );
     let (chal_realm, nonce) = extract_digest(&resp1);

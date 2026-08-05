@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -6,12 +8,69 @@ use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
+use zlmediakit_core::auth::md5_hex;
 
 pub(crate) trait ClientIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> ClientIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 pub(crate) type ClientStream = Box<dyn ClientIo>;
+
+/// Build an `Authorization: Basic base64(user:password)` header value.
+pub(crate) fn basic_authorization(username: &str, password: &str) -> String {
+    let token = BASE64.encode(format!("{username}:{password}"));
+    format!("Basic {token}")
+}
+
+/// Build an `Authorization: Digest ...` header value from an RTSP challenge.
+pub(crate) fn digest_authorization(
+    challenge: &str,
+    username: &str,
+    password: &str,
+    method: &str,
+    uri: &str,
+) -> Result<String> {
+    let parameters = challenge
+        .trim()
+        .strip_prefix("Digest ")
+        .unwrap_or(challenge);
+    let mut realm = None;
+    let mut nonce = None;
+    for field in parameters.split(',') {
+        if let Some((name, value)) = field.trim().split_once('=') {
+            let value = value.trim().trim_matches('"');
+            match name.trim().to_ascii_lowercase().as_str() {
+                "realm" => realm = Some(value.to_string()),
+                "nonce" => nonce = Some(value.to_string()),
+                _ => {}
+            }
+        }
+    }
+    let realm = realm.ok_or_else(|| anyhow!("RTSP Digest challenge is missing realm"))?;
+    let nonce = nonce.ok_or_else(|| anyhow!("RTSP Digest challenge is missing nonce"))?;
+    let ha1 = md5_hex(&format!("{username}:{realm}:{password}"));
+    let ha2 = md5_hex(&format!("{method}:{uri}"));
+    let response = md5_hex(&format!("{ha1}:{nonce}:{ha2}"));
+    Ok(format!(
+        "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response}\""
+    ))
+}
+
+/// Choose the correct Authorization scheme from a `WWW-Authenticate` challenge.
+/// Both Digest and Basic are supported; anything else is an explicit error.
+pub(crate) fn authorization_header(
+    challenge: &str,
+    username: &str,
+    password: &str,
+    method: &str,
+    uri: &str,
+) -> Result<String> {
+    if challenge.trim().to_ascii_lowercase().starts_with("basic") {
+        Ok(basic_authorization(username, password))
+    } else {
+        digest_authorization(challenge, username, password, method, uri)
+    }
+}
 
 pub(crate) async fn connect(host: &str, port: u16, secure: bool) -> Result<ClientStream> {
     let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect((host, port)))

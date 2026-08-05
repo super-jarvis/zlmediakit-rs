@@ -168,6 +168,25 @@
 - WSL 上 `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo build --release` 全部成功；release 产物已生成。
 - 三份 workflow 均通过 PyYAML 语法解析，`git diff --check` 通过。
 - 产品改动为 3 个文件：`ci.yml`、`release.yml`、`Dockerfile`；另有本技能要求生成的 3 个未跟踪工作记录文件。
+## 2026-08-05 RTSP 客户端鉴权缺口
+
+- RTSP 拉流代理原先在 DESCRIBE 401 时直接失败；推流客户端只有 Digest。两者都缺少 Basic 上游认证，这是 ZLMediaKit 常见代理/推流部署（设备或 CDN 常配 Basic）无法联通的断链。
+- `client_transport.rs` 现集中提供 Basic 与 Digest 的 `WWW-Authenticate` 挑战解析并自动选择 scheme；后续其他协议客户端需要 HTTP Basic 时可复用同一入口。
+- 认证重试使用标准一次挑战语义：首个请求不带 Authorization，401 后按 challenge scheme 重试一次；凭据来自 URL `user:pass@host`。错误口令会保留上游 401 语义返回错误，不静默降级。
+- WSL 运行 `cargo fmt --all` 会把 Windows 工作树 CRLF 文件批量转成 LF，使 98 个未修改文件整体进入 diff；恢复方式是 `git checkout -- .` 后只重放目标改动，diff 校验使用 Windows 原生 Git（`git diff --check` 通过）。
+- 本轮原生 HLS 拉流缺口：`EXT-X-KEY:METHOD=AES-128` 与 `EXT-X-BYTERANGE` 此前被忽略（segment 直接喂 demuxer），加密或分段清单会解码失败；补充 `aes`/`cbc`/`hex` 依赖后按 RFC 8216 实现。
+- 解密语义：IV 优先取 tag 显式 IV（`0x` 前缀 hex），否则用媒体序列号大端 128-bit 回退；key 按解析后的 URI 缓存，避免同清单重复拉取。`decrypt_padded_mut::<Pkcs7>` 要求输入为 16 字节整数倍，与 HLS segment 的 PKCS7 填充契约一致。
+- BYTERANGE 细节：省略 offset 的段按“同资源前一 range 结束处”续读（`range_ends` 链），显式 offset 直接使用；去重键从 URL 升级为 `(URL, range)`，否则同一资源多段（各带不同 range）会被误判为重复而跳过。
+- 测试服务器按请求路径路由（`serve_routes`），避免依赖客户端请求顺序；AES 段在 segment 连接之前先取 key，若用固定顺序 serve 会因连接次序不同把 segment 当 key 返回。
+- RTSP 服务端此前只会校验 Digest `Authorization` 并只签发 Digest 挑战，Basic 凭据会被当匿名拒绝、Basic-only 客户端无法接入；现 core `StreamAuth::check_basic` 按用户名查用户表、未知用户名回退共享 secret，与 Digest 的 `digest_password` 语义一致。
+- 服务端 `WWW-Authenticate` 改为同时宣告 Basic 与 Digest（Basic 在前）：`authorization_header` 客户端按前缀识别，因此本项目客户端会优先走 Basic；既有 Digest-only 客户端仍可解析其中的 Digest 部分。
+- Basic 校验不依赖 realm（RFC 7617 凭据直接内嵌于 header），故 `is_authenticated` 中 Basic 分支在 realm 尚未协商时也可校验；Digest 分支仍要求 realm 已就绪。
+- 两个既有 Digest E2E 断言原为 `starts_with("Digest")`，与双挑战格式冲突，改为 `contains("digest")`；未改变 Digest 协商、nonce 提取与响应校验逻辑。
+- SRT 跨平台构建：WSL 内交叉 `cargo check` 复现 CI Windows 门禁。已装工具链的 `multirust-channel-manifest.toml` 内嵌清华镜像绝对 URL，`RUSTUP_DIST_SERVER` 被忽略；需从其他镜像（USTC）手动下载同版本 std 并解压进 `lib/rustlib/`。
+- Windows MSVC 目标无法在 Linux 交叉检查：传递依赖 `ring` 的 C 构建需要 MSVC `lib.exe`/cl；改用 Windows GNU 目标 + `gcc-mingw-w64` 让 ring 用 gcc 编译。SRT 及整个 workspace（含 webrtc、rustls、tokio）在 `x86_64-pc-windows-gnu` 上 `cargo check --all-targets` 通过，证明 SRT FFI 无 Unix-only 类型。
+- macOS 目标同理被 ring 的 C 构建（需 Apple clang/SDK）卡在交叉检查边界；真实覆盖由 CI `platform-check` 在 `macos-latest` 原生 runner 完成，本地无法替代。
+- 第③缺口无需改源码：SRT FFI 上一轮已从 `libc::sockaddr_*` 改为 `socket2::SockAddr`+opaque 指针，Windows-GNU 整依赖图类型检查即为其强证据。
+
 # 2026-08-02 ZLMediaKit 开源能力对齐发现
 
 - 当前项目的主流 H.264/H.265/AAC 直播链路已经闭环，但通用 RTP sender 是最靠前的架构断点；现有 `startRtp` 是 GB28181 SIP INVITE，不等价于 ZLM `startSendRtp`。

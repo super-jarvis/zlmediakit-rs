@@ -3027,6 +3027,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "base64 0.23.0",
  "bytes",
  "chrono",
  "dashmap",
@@ -3083,13 +3084,16 @@ dependencies = [
 name = "zlmediakit-http"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "anyhow",
  "async-trait",
  "base64 0.23.0",
  "bytes",
+ "cbc",
  "chrono",
  "dashmap",
  "futures",
+ "hex",
  "once_cell",
  "rustls",
  "serde",

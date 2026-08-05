@@ -1,6 +1,7 @@
-use crate::client_transport::{connect, ClientStream};
+use crate::client_transport::{authorization_header, connect, ClientStream};
 use crate::parser::{RtspParser, RtspResponse};
 use crate::session::{parse_sdp, RtpDepacketizer};
+use anyhow::bail;
 use bytes::{Buf, BytesMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -49,8 +50,36 @@ pub async fn start(
     )
     .await?;
     let resp = read_response(&mut stream, &mut buffer).await?;
+    let mut resp = resp;
+    if resp.status_code == 401 {
+        let challenge = resp
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("WWW-Authenticate"))
+            .map(|(_, value)| value.as_str())
+            .ok_or_else(|| anyhow::anyhow!("RTSP 401 response is missing WWW-Authenticate"))?;
+        let username = target
+            .username
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("RTSP upstream requires credentials"))?;
+        let password = target.password.as_deref().unwrap_or_default();
+        let authorization =
+            authorization_header(challenge, username, password, "DESCRIBE", &target.path)?;
+        send_request(
+            &mut stream,
+            "DESCRIBE",
+            &target.path,
+            &mut cseq,
+            &[
+                ("Accept", "application/sdp"),
+                ("Authorization", &authorization),
+            ],
+        )
+        .await?;
+        resp = read_response(&mut stream, &mut buffer).await?;
+    }
     if resp.status_code != 200 {
-        anyhow::bail!("DESCRIBE failed with status {}", resp.status_code);
+        bail!("DESCRIBE failed with status {}", resp.status_code);
     }
     let sdp = parse_sdp(&resp.body);
     let has_audio = String::from_utf8_lossy(&resp.body).contains("m=audio");
@@ -195,6 +224,8 @@ struct PullUrl {
     port: u16,
     path: String,
     secure: bool,
+    username: Option<String>,
+    password: Option<String>,
 }
 
 fn parse_rtsp_url(url: &str) -> anyhow::Result<PullUrl> {
@@ -205,9 +236,18 @@ fn parse_rtsp_url(url: &str) -> anyhow::Result<PullUrl> {
     } else {
         anyhow::bail!("not an RTSP URL: {url}");
     };
-    let (authority, path) = rest
+    let (authority_with_auth, path) = rest
         .find('/')
         .map_or((rest, "/"), |index| (&rest[..index], &rest[index..]));
+    let (credentials, authority) = authority_with_auth
+        .rsplit_once('@')
+        .map_or((None, authority_with_auth), |(credentials, authority)| {
+            (Some(credentials), authority)
+        });
+    let (username, password) = credentials.map_or((None, None), |credentials| {
+        let (username, password) = credentials.split_once(':').unwrap_or((credentials, ""));
+        (Some(username.to_string()), Some(password.to_string()))
+    });
     let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
         let end = bracketed
             .find(']')
@@ -232,6 +272,8 @@ fn parse_rtsp_url(url: &str) -> anyhow::Result<PullUrl> {
         port,
         path: path.to_string(),
         secure,
+        username,
+        password,
     })
 }
 

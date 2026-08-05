@@ -230,7 +230,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-async fn open_response(url: &str) -> Result<HttpResponse> {
+async fn open_response(url: &str, range: Option<(u64, u64)>) -> Result<HttpResponse> {
     let mut current = url.to_string();
     for _ in 0..=5 {
         let parsed = HttpUrl::parse(&current)?;
@@ -260,8 +260,12 @@ async fn open_response(url: &str) -> Result<HttpResponse> {
             Box::new(tcp_stream)
         };
         let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: zlmediakit-rs/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-            parsed.path, parsed.authority
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: zlmediakit-rs/0.1\r\nAccept: */*\r\nConnection: close\r\n{}\r\n",
+            parsed.path,
+            parsed.authority,
+            range.map_or_else(String::new, |(start, end)| {
+                format!("Range: bytes={start}-{end}\r\n")
+            })
         );
         stream.write_all(request.as_bytes()).await?;
 
@@ -340,7 +344,7 @@ pub async fn start(
     stopped: Arc<AtomicBool>,
 ) -> Result<()> {
     info!("HTTP pull: {url} -> {vhost}/{app}/{stream_name}");
-    let response = open_response(url).await?;
+    let response = open_response(url, None).await?;
     debug!(status = response.status, "HTTP pull response opened");
     let content_type = response
         .headers
@@ -476,11 +480,73 @@ async fn pull_ts(
     Ok(())
 }
 
+#[derive(Clone)]
+struct KeyInfo {
+    uri: String,
+    iv: Option<[u8; 16]>,
+}
+
+struct SegmentEntry {
+    uri: String,
+    byterange: Option<(u64, Option<u64>)>,
+    key: Option<KeyInfo>,
+    sequence: u64,
+}
+
 struct PlaylistEntries {
-    segments: Vec<String>,
+    segments: Vec<SegmentEntry>,
     variant: Option<String>,
     end_list: bool,
-    init_map: Option<String>,
+    init_map: Option<(String, Option<KeyInfo>)>,
+}
+
+/// Parses an `NAME=VALUE` attribute list, unquoting values.
+fn hls_attributes(tag: &str) -> Vec<(String, String)> {
+    tag.split(',')
+        .filter_map(|pair| {
+            let (name, value) = pair.split_once('=')?;
+            Some((
+                name.trim().to_ascii_uppercase(),
+                value.trim().trim_matches('"').to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// Parses an `#EXT-X-KEY` tag. `METHOD=NONE` yields `Ok(None)`; `AES-128`
+/// yields the key URI and optional IV. Other encryption methods are rejected.
+fn parse_key_tag(attributes: &str) -> Result<Option<KeyInfo>> {
+    let attrs = hls_attributes(attributes);
+    let method = attrs
+        .iter()
+        .find(|(name, _)| name == "METHOD")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or("NONE");
+    match method {
+        "NONE" => Ok(None),
+        "AES-128" => {
+            let uri = attrs
+                .iter()
+                .find(|(name, _)| name == "URI")
+                .map(|(_, value)| value.clone())
+                .ok_or_else(|| anyhow!("AES-128 EXT-X-KEY is missing URI"))?;
+            let iv = match attrs.iter().find(|(name, _)| name == "IV") {
+                Some((_, hex_value)) => {
+                    let decoded =
+                        hex::decode(hex_value.trim_start_matches("0x")).context("invalid IV")?;
+                    if decoded.len() != 16 {
+                        bail!("AES-128 IV must be exactly 16 bytes");
+                    }
+                    let mut bytes = [0u8; 16];
+                    bytes.copy_from_slice(&decoded);
+                    Some(bytes)
+                }
+                None => None,
+            };
+            Ok(Some(KeyInfo { uri, iv }))
+        }
+        other => bail!("unsupported HLS encryption method: {other}"),
+    }
 }
 
 fn playlist_entries(data: &[u8]) -> Result<PlaylistEntries> {
@@ -489,23 +555,41 @@ fn playlist_entries(data: &[u8]) -> Result<PlaylistEntries> {
     let mut variant = None;
     let mut expect_variant = false;
     let mut init_map = None;
+    let mut media_sequence = 0u64;
+    let mut current_key: Option<KeyInfo> = None;
+    let mut pending_byterange: Option<(u64, Option<u64>)> = None;
     for line in text.lines().map(str::trim) {
         if line.starts_with("#EXT-X-STREAM-INF:") {
             expect_variant = true;
         } else if let Some(attributes) = line.strip_prefix("#EXT-X-MAP:") {
-            init_map = attributes.split(',').find_map(|attribute| {
-                attribute
-                    .trim()
-                    .strip_prefix("URI=")
-                    .map(|value| value.trim_matches('"').to_string())
-            });
+            let uri = hls_attributes(attributes)
+                .iter()
+                .find(|(name, _)| name == "URI")
+                .map(|(_, value)| value.clone())
+                .ok_or_else(|| anyhow!("EXT-X-MAP is missing URI"))?;
+            init_map = Some((uri, current_key.clone()));
+        } else if let Some(attributes) = line.strip_prefix("#EXT-X-KEY:") {
+            current_key = parse_key_tag(attributes)?;
+        } else if let Some(value) = line.strip_prefix("#EXT-X-BYTERANGE:") {
+            pending_byterange = Some(parse_byterange(value)?);
+        } else if let Some(value) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            media_sequence = value
+                .trim()
+                .parse()
+                .context("invalid EXT-X-MEDIA-SEQUENCE")?;
         } else if line.is_empty() || line.starts_with('#') {
             continue;
         } else if expect_variant && variant.is_none() {
             variant = Some(line.to_string());
             expect_variant = false;
         } else {
-            segments.push(line.to_string());
+            segments.push(SegmentEntry {
+                uri: line.to_string(),
+                byterange: pending_byterange.take(),
+                key: current_key.clone(),
+                sequence: media_sequence,
+            });
+            media_sequence += 1;
         }
     }
     Ok(PlaylistEntries {
@@ -514,6 +598,28 @@ fn playlist_entries(data: &[u8]) -> Result<PlaylistEntries> {
         end_list: text.lines().any(|line| line.trim() == "#EXT-X-ENDLIST"),
         init_map,
     })
+}
+
+/// Parses an `#EXT-X-BYTERANGE` value of the form `<length>[@<offset>]`.
+fn parse_byterange(value: &str) -> Result<(u64, Option<u64>)> {
+    let (length, offset) = match value.split_once('@') {
+        Some((length, offset)) => (length, Some(offset)),
+        None => (value, None),
+    };
+    let length = length
+        .trim()
+        .parse()
+        .context("invalid EXT-X-BYTERANGE length")?;
+    let offset = match offset {
+        Some(offset) => Some(
+            offset
+                .trim()
+                .parse()
+                .context("invalid EXT-X-BYTERANGE offset")?,
+        ),
+        None => None,
+    };
+    Ok((length, offset))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -534,13 +640,14 @@ async fn pull_hls(
     let mut fmp4_demuxer = None;
     let mut current_map_url = None;
     let mut next_response = Some(initial_response);
+    let mut key_cache: HashMap<String, [u8; 16]> = HashMap::new();
     loop {
         if stopped.load(Ordering::SeqCst) {
             break;
         }
         let response = match next_response.take() {
             Some(response) => response,
-            None => open_response(&playlist_url).await?,
+            None => open_response(&playlist_url, None).await?,
         };
         let base = response.url.clone();
         playlist_url = base.as_url();
@@ -550,11 +657,15 @@ async fn pull_hls(
             playlist_url = base.resolve(&variant)?;
             continue;
         }
-        if let Some(init_map) = entries.init_map {
+        if let Some((init_map, key)) = entries.init_map {
             let map_url = base.resolve(&init_map)?;
             if current_map_url.as_deref() != Some(map_url.as_str()) {
-                let response = open_response(&map_url).await?;
+                let response = open_response(&map_url, None).await?;
                 let data = response.body.read_to_end(MAX_SEGMENT_SIZE).await?;
+                let data = match key {
+                    Some(key) => decrypt_segment(&mut key_cache, &base, &key, &data, 0).await?,
+                    None => data,
+                };
                 let parsed = Fmp4Demuxer::from_init_segment(&data)?;
                 source.info.write().await.tracks = parsed.track_info();
                 for frame in parsed.config_frames() {
@@ -564,13 +675,53 @@ async fn pull_hls(
                 fmp4_demuxer = Some(parsed);
             }
         }
+        let mut range_ends: HashMap<String, u64> = HashMap::new();
         for segment in entries.segments {
-            let segment_url = base.resolve(&segment)?;
-            if !seen.insert(segment_url.clone()) {
+            let segment_url = base.resolve(&segment.uri)?;
+            let range = match segment.byterange {
+                Some((length, offset)) => {
+                    let start = match offset {
+                        Some(start) => start,
+                        None => range_ends.get(&segment_url).copied().ok_or_else(|| {
+                            anyhow!("EXT-X-BYTERANGE without offset has no preceding range")
+                        })?,
+                    };
+                    range_ends.insert(segment_url.clone(), start + length);
+                    Some((start, length))
+                }
+                None => {
+                    range_ends.remove(&segment_url);
+                    None
+                }
+            };
+            let dedup_key = (segment_url.clone(), range);
+            if !seen.insert(dedup_key) {
                 continue;
             }
-            let response = open_response(&segment_url).await?;
-            let data = response.body.read_to_end(MAX_SEGMENT_SIZE).await?;
+            let data = match range {
+                Some((start, length)) => {
+                    let response =
+                        open_response(&segment_url, Some((start, start + length - 1))).await?;
+                    let data = response.body.read_to_end(MAX_SEGMENT_SIZE).await?;
+                    if data.len() != length as usize {
+                        bail!(
+                            "EXT-X-BYTERANGE requested {length} bytes but got {}",
+                            data.len()
+                        );
+                    }
+                    data
+                }
+                None => {
+                    let response = open_response(&segment_url, None).await?;
+                    response.body.read_to_end(MAX_SEGMENT_SIZE).await?
+                }
+            };
+            let data = match &segment.key {
+                Some(key) => {
+                    decrypt_segment(&mut key_cache, &base, key, &data, segment.sequence).await?
+                }
+                None => data,
+            };
             if let Some(fmp4) = &fmp4_demuxer {
                 for frame in fmp4.demux_fragment(&data)? {
                     source.publish_and_cache(frame).await;
@@ -592,6 +743,51 @@ async fn pull_hls(
     }
     demuxer.flush(&source).await;
     Ok(())
+}
+
+/// Fetches the AES-128 key for a segment (cached by URI) and decrypts the
+/// segment data with AES-128-CBC using the tag's IV, falling back to the
+/// media sequence number as the IV.
+async fn decrypt_segment(
+    key_cache: &mut HashMap<String, [u8; 16]>,
+    base: &HttpUrl,
+    key: &KeyInfo,
+    data: &[u8],
+    sequence: u64,
+) -> Result<Vec<u8>> {
+    let key_url = base.resolve(&key.uri)?;
+    let key_bytes = if let Some(key) = key_cache.get(&key_url) {
+        *key
+    } else {
+        let response = open_response(&key_url, None).await?;
+        let key_data = response.body.read_to_end(MAX_SEGMENT_SIZE).await?;
+        let key_bytes: [u8; 16] = key_data
+            .try_into()
+            .map_err(|_| anyhow!("HLS AES-128 key is not exactly 16 bytes"))?;
+        key_cache.insert(key_url, key_bytes);
+        key_bytes
+    };
+    let iv = match key.iv {
+        Some(iv) => iv,
+        None => {
+            let mut iv = [0u8; 16];
+            iv[8..16].copy_from_slice(&sequence.to_be_bytes());
+            iv
+        }
+    };
+    aes128_cbc_decrypt(&key_bytes, &iv, data)
+}
+
+/// Decrypts data with AES-128-CBC using PKCS7 padding.
+fn aes128_cbc_decrypt(key: &[u8; 16], iv: &[u8; 16], data: &[u8]) -> Result<Vec<u8>> {
+    use aes::cipher::{BlockDecryptMut, KeyIvInit};
+    let cipher = cbc::Decryptor::<aes::Aes128>::new_from_slices(key, iv)
+        .map_err(|_| anyhow!("invalid AES-128 key or IV length"))?;
+    let mut buffer = data.to_vec();
+    let decrypted = cipher
+        .decrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buffer)
+        .map_err(|_| anyhow!("HLS segment AES-128-CBC decryption failed"))?;
+    Ok(decrypted.to_vec())
 }
 
 #[cfg(test)]
@@ -885,5 +1081,195 @@ mod tests {
                 && frame.payload_format == zlmediakit_core::PayloadFormat::Avcc
         }));
         assert_rtp_relay(manager, "hls_fmp4", 0x5060_7080).await;
+    }
+
+    #[test]
+    fn parses_encrypted_byterange_playlist() {
+        let playlist = b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:7\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://keys.example.org/a.bin\",IV=0x9c7db8778570d05c3177c349fd9236aa\n#EXT-X-BYTERANGE:1050337@764316\n#EXTINF:1.0,\nseq.ts\n#EXT-X-BYTERANGE:1050337\n#EXTINF:1.0,\nseq.ts\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:1.0,\nplain.ts\n#EXT-X-ENDLIST\n";
+        let entries = playlist_entries(playlist).unwrap();
+        assert_eq!(entries.segments.len(), 3);
+        let first = &entries.segments[0];
+        assert_eq!(first.uri, "seq.ts");
+        assert_eq!(first.sequence, 7);
+        assert_eq!(first.byterange, Some((1_050_337, Some(764_316))));
+        let key = first.key.as_ref().unwrap();
+        assert_eq!(key.uri, "https://keys.example.org/a.bin");
+        assert_eq!(
+            key.iv,
+            Some([
+                0x9c, 0x7d, 0xb8, 0x77, 0x85, 0x70, 0xd0, 0x5c, 0x31, 0x77, 0xc3, 0x49, 0xfd, 0x92,
+                0x36, 0xaa
+            ])
+        );
+        let second = &entries.segments[1];
+        assert_eq!(second.sequence, 8);
+        assert_eq!(second.byterange, Some((1_050_337, None)));
+        assert!(second.key.is_some());
+        let third = &entries.segments[2];
+        assert_eq!(third.uri, "plain.ts");
+        assert_eq!(third.sequence, 9);
+        assert!(third.key.is_none());
+        assert_eq!(third.byterange, None);
+        assert!(entries.end_list);
+    }
+
+    #[test]
+    fn aes128_cbc_roundtrip() {
+        let key = *b"0123456789abcdef";
+        let iv = *b"1234567890abcdef";
+        let plaintext = b"encrypted HLS segment data........";
+        let encrypted = aes128_cbc_encrypt(&key, &iv, plaintext);
+        let decrypted = aes128_cbc_decrypt(&key, &iv, &encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    fn aes128_cbc_encrypt(key: &[u8; 16], iv: &[u8; 16], data: &[u8]) -> Vec<u8> {
+        use aes::cipher::{BlockEncryptMut, KeyIvInit};
+        let cipher = cbc::Encryptor::<aes::Aes128>::new_from_slices(key, iv).unwrap();
+        let padded_len = (data.len() / 16 + 1) * 16;
+        let mut buffer = vec![0u8; padded_len];
+        buffer[..data.len()].copy_from_slice(data);
+        let _ = cipher
+            .encrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buffer, data.len())
+            .unwrap();
+        buffer
+    }
+
+    /// Serves a resource that honors `Range: bytes=start-end` requests with a
+    /// 206 response containing only the requested slice.
+    async fn serve_byte_range(listener: &TcpListener, data: &[u8]) {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 2048];
+        let _ = socket.read(&mut request).await.unwrap();
+        let request = String::from_utf8_lossy(&request);
+        let range = request
+            .lines()
+            .find_map(|line| line.strip_prefix("Range: bytes="))
+            .expect("request did not include a Range header");
+        let (start, end) = range.trim().split_once('-').expect("invalid Range header");
+        let start: usize = start.parse().unwrap();
+        let end: usize = end.parse().unwrap();
+        let body = &data[start..=end];
+        let header = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp2t\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\n\r\n",
+            data.len(),
+            body.len()
+        );
+        socket.write_all(header.as_bytes()).await.unwrap();
+        socket.write_all(body).await.unwrap();
+    }
+
+    /// Serves responses from a fixed routing table keyed by request path,
+    /// mirroring a real HLS origin that resolves playlist, key and segment
+    /// resources regardless of the order the client requests them.
+    async fn serve_routes(listener: &TcpListener, routes: &[(&str, &str, &[u8])]) {
+        for _ in 0..routes.len() {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request);
+            let path = request
+                .split_whitespace()
+                .nth(1)
+                .expect("request is missing a path");
+            let (_, content_type, body) = routes
+                .iter()
+                .find(|(route, _, _)| *route == path)
+                .expect("no route registered for request path");
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn hls_aes128_pull_fetches_key_and_decrypts_segment() {
+        let ts = test_ts_stream();
+        let key: [u8; 16] = *b"0123456789abcdef";
+        let iv: [u8; 16] = *b"1234567890abcdef";
+        let encrypted = aes128_cbc_encrypt(&key, &iv, &ts);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let iv_hex = hex::encode(iv);
+        let playlist = format!(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:5\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x{iv_hex}\n#EXTINF:1.0,\nsegment.ts\n#EXT-X-ENDLIST\n"
+        )
+        .into_bytes();
+        tokio::spawn(async move {
+            serve_routes(
+                &listener,
+                &[
+                    (
+                        "/live/index.m3u8",
+                        "application/vnd.apple.mpegurl",
+                        &playlist,
+                    ),
+                    ("/live/key.bin", "application/octet-stream", &key),
+                    ("/live/segment.ts", "video/mp2t", &encrypted),
+                ],
+            )
+            .await;
+        });
+        let manager = Arc::new(MediaSourceManager::new(None));
+        start(
+            &format!("http://127.0.0.1:{port}/live/index.m3u8"),
+            "__defaultVhost__",
+            "live",
+            "hls_aes128",
+            manager.clone(),
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        let source = manager
+            .get("__defaultVhost__", "live", "hls_aes128")
+            .expect("HLS AES-128 pull did not create a source");
+        assert!(source
+            .get_latest_gop_frames()
+            .await
+            .iter()
+            .any(|frame| frame.codec == CodecId::H264));
+    }
+
+    #[tokio::test]
+    async fn hls_byterange_pull_requests_explicit_ranges() {
+        let ts = test_ts_stream();
+        let split = ts.len() / 2;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let playlist = format!(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-BYTERANGE:{split}@0\n#EXTINF:1.0,\nsegment.ts\n#EXT-X-BYTERANGE:{}@{split}\n#EXTINF:1.0,\nsegment.ts\n#EXT-X-ENDLIST\n",
+            ts.len() - split
+        )
+        .into_bytes();
+        tokio::spawn(async move {
+            serve_once(&listener, "application/vnd.apple.mpegurl", &playlist).await;
+            serve_byte_range(&listener, &ts).await;
+            serve_byte_range(&listener, &ts).await;
+        });
+        let manager = Arc::new(MediaSourceManager::new(None));
+        start(
+            &format!("http://127.0.0.1:{port}/live/index.m3u8"),
+            "__defaultVhost__",
+            "live",
+            "hls_byterange",
+            manager.clone(),
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        let source = manager
+            .get("__defaultVhost__", "live", "hls_byterange")
+            .expect("HLS BYTERANGE pull did not create a source");
+        assert!(source
+            .get_latest_gop_frames()
+            .await
+            .iter()
+            .any(|frame| frame.codec == CodecId::H264));
     }
 }

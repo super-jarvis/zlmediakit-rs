@@ -742,8 +742,8 @@ impl RtspSession {
 
     /// Returns `true` when the request is authorized for `action`
     /// (`"play"` or `"pub"`). It first tries the legacy `sign` query
-    /// parameter, then a `Digest` `Authorization` header when a realm has
-    /// already been negotiated via `on_rtsp_realm`.
+    /// parameter, then a `Digest` or `Basic` `Authorization` header when a
+    /// realm has already been negotiated via `on_rtsp_realm`.
     async fn is_authenticated(&self, request: &RtspRequest, action: &str) -> bool {
         if self.auth.check(
             "__defaultVhost__",
@@ -755,15 +755,20 @@ impl RtspSession {
             return true;
         }
 
-        if let Some(realm) = &self.realm {
-            if let Some((_, header)) = request
-                .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("Authorization"))
-            {
+        let header = request
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Authorization"))
+            .map(|(_, v)| v.clone());
+        if let Some(header) = header {
+            // Basic auth (RFC 7617) does not need a realm to validate.
+            if header.to_ascii_lowercase().starts_with("basic ") {
+                return self.auth.check_basic(&header);
+            }
+            if let Some(realm) = &self.realm {
                 return self
                     .auth
-                    .check_digest(realm, &request.method, &request.uri, header);
+                    .check_digest(realm, &request.method, &request.uri, &header);
             }
         }
         false
@@ -771,9 +776,9 @@ impl RtspSession {
 
     /// Builds the 401 response for an unauthorized request. When a hook is
     /// configured and `on_rtsp_realm` yields a realm, the response carries a
-    /// `WWW-Authenticate: Digest` challenge so the client can retry with a
-    /// Digest `Authorization` header. The negotiated realm is cached on the
-    /// session for subsequent requests.
+    /// `WWW-Authenticate` challenge advertising both `Digest` and `Basic`
+    /// (RFC 7235) so the client can retry with either scheme. The negotiated
+    /// realm is cached on the session for subsequent requests.
     async fn auth_reject(&mut self, request: &RtspRequest) -> RtspResponse {
         if self.realm.is_none() {
             if let Some(hook) = &self.hook {
@@ -807,7 +812,10 @@ impl RtspSession {
         if let Some(realm) = &self.realm {
             response = response.with_header(
                 "WWW-Authenticate",
-                &format!("Digest realm=\"{}\", nonce=\"{}\"", realm, self.nonce),
+                &format!(
+                    "Basic realm=\"{}\", Digest realm=\"{}\", nonce=\"{}\"",
+                    realm, realm, self.nonce
+                ),
             );
         }
         let _ = request;

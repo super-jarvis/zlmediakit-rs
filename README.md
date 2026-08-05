@@ -15,7 +15,7 @@
 | 协议 | 推流 | 拉流 | 说明 |
 |------|:----:|:----:|------|
 | **RTMP(S)** | ✅ | ✅ | RTMP/RTMPS 推拉流 |
-| **RTSP** | ✅ | ✅ | TCP interleaved + UDP；RTSPS 公共 CA 校验；RECORD 推流支持 Digest |
+| **RTSP** | ✅ | ✅ | TCP interleaved + UDP；RTSPS 公共 CA 校验；RECORD 推流与拉流支持 Digest/Basic 上游鉴权；服务端签发 Basic/Digest 挑战并校验凭据 |
 | **HTTP-FLV** | - | ✅ | HTTP 传输 FLV |
 | **WebSocket-FLV** | - | ✅ | WebSocket 传输 FLV |
 | **HLS (TS)** | - | ✅ | MPEG-TS 分片 + m3u8 |
@@ -25,7 +25,7 @@
 | **SRT** | ✅ | ✅ | Listener/Caller/Rendezvous，MPEG-TS 输入输出，可选延迟、streamid 与 AES passphrase |
 | **GB28181** | ✅ | ✅（对讲） | UDP/TCP active/passive RTP 接收；自动识别 PS/TS/ES，支持乱序恢复及 H.264/H.265/AAC/G.711/MP2/MP3；SIP 点播与 G.711A/U 语音对讲 |
 | **RTP ES/PS/TS 转推** | ✅ | - | `startSendRtp`/`startSendRtpPassive`/`stopSendRtp`/`listRtpSender`；UDP、TCP active/passive 与断线重连；`type=0/1/2`，默认 GB28181 PS-RTP |
-| **原生 HTTP 拉流** | ✅ | ✅ | HTTP/HTTPS-FLV、HTTP/HTTPS-TS、HLS MPEG-TS/CMAF；支持跳转、chunked、主/媒体清单和系统 CA 校验，接入统一拉流代理与协议互转 |
+| **原生 HTTP 拉流** | ✅ | ✅ | HTTP/HTTPS-FLV、HTTP/HTTPS-TS、HLS MPEG-TS/CMAF；支持跳转、chunked、主/媒体清单、AES-128 加密与 EXT-X-BYTERANGE 分段，系统 CA 校验，接入统一拉流代理与协议互转 |
 | **VOD 点播** | - | ✅ | MP4 经 HTTP/WS-FLV、RTMP、RTSP 回放；关键帧 seek、实时节奏、HTTP Range 与 35 种 MIME 类型 |
 
 ### 编解码与协议互转边界
